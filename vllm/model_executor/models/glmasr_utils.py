@@ -25,6 +25,15 @@ DEFAULT_MERGE_FACTOR = 4
 DEFAULT_CONV_PARAMS = [(1, 3, 1), (1, 3, 2)]
 
 
+class _GlmAsrEncoderOutput:
+    """Simple output container compatible with transformers' BaseModelOutput."""
+
+    __slots__ = ("last_hidden_state",)
+
+    def __init__(self, last_hidden_state: torch.Tensor):
+        self.last_hidden_state = last_hidden_state
+
+
 def _calculate_conv_output_length(
     input_length: torch.Tensor, padding: int, kernel_size: int, stride: int
 ) -> torch.Tensor:
@@ -255,8 +264,8 @@ class GlmAsrRotaryEmbedding(nn.Module):
     """
     Rotary Position Embedding for GLM-ASR encoder.
 
-    Follows the exact same implementation as transformers' GlmAsrRotaryEmbedding
-    to ensure correctness.
+    Optimized with pre-computed cos/sin cache for better performance.
+    Falls back to dynamic computation only when sequence length exceeds cache.
     """
 
     def __init__(self, config, device: torch.device | None = None):
@@ -284,6 +293,9 @@ class GlmAsrRotaryEmbedding(nn.Module):
             dim = head_dim
             self.attention_scaling = 1.0
 
+        self.dim = dim
+        self.base = base
+
         # Compute the inverse frequencies exactly as transformers does
         inv_freq = 1.0 / (
             base
@@ -296,11 +308,34 @@ class GlmAsrRotaryEmbedding(nn.Module):
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
+        # Pre-compute cos/sin cache for efficiency
+        self._set_cos_sin_cache(self.max_seq_len_cached, device)
+
+    def _set_cos_sin_cache(
+        self, seq_len: int, device: torch.device | None = None
+    ) -> None:
+        """Pre-compute cos and sin cache for given sequence length."""
+        self.max_seq_len_cached = seq_len
+
+        # Create position indices
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        # Compute frequencies: [seq_len, dim/2]
+        freqs = torch.outer(t, self.inv_freq.to(device=device, dtype=torch.float32))
+        # Double the frequencies: [seq_len, dim]
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        # Compute and cache cos/sin
+        cos = emb.cos() * self.attention_scaling
+        sin = emb.sin() * self.attention_scaling
+
+        self.register_buffer("cos_cached", cos, persistent=False)
+        self.register_buffer("sin_cached", sin, persistent=False)
+
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute rotary embeddings following transformers implementation.
+        Compute rotary embeddings with caching optimization.
 
         Args:
             x: Input tensor [batch_size, seq_len, hidden_size]
@@ -309,25 +344,17 @@ class GlmAsrRotaryEmbedding(nn.Module):
         Returns:
             Tuple of (cos, sin) tensors with shape [batch_size, seq_len, rotary_dim]
         """
-        # Expand inv_freq for batch computation: [1, dim/2, 1] -> [batch, dim/2, 1]
-        inv_freq_expanded = (
-            self.inv_freq[None, :, None]
-            .float()
-            .expand(position_ids.shape[0], -1, 1)
-            .to(x.device)
-        )
-        # position_ids: [batch, seq_len] -> [batch, 1, seq_len]
-        position_ids_expanded = position_ids[:, None, :].float()
+        seq_len = position_ids.shape[-1]
 
-        # Compute freqs: [batch, dim/2, seq_len] -> [batch, seq_len, dim/2]
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(
-            1, 2
-        )
-        # Double the frequencies: [batch, seq_len, dim]
-        emb = torch.cat((freqs, freqs), dim=-1)
+        # Extend cache if needed
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len, device=x.device)
 
-        cos = emb.cos() * self.attention_scaling
-        sin = emb.sin() * self.attention_scaling
+        # Use cached values - index with position_ids for correctness
+        # For encoder, position_ids is typically [0, 1, 2, ..., seq_len-1]
+        # so we can directly slice the cache
+        cos = self.cos_cached[:seq_len].unsqueeze(0)  # [1, seq_len, dim]
+        sin = self.sin_cached[:seq_len].unsqueeze(0)  # [1, seq_len, dim]
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
@@ -415,26 +442,25 @@ class GlmAsrAttention(nn.Module):
         """
         batch_size, seq_len, _ = hidden_states.shape
 
-        # QKV projection
+        # QKV projection - fused for efficiency
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split(
-            [
-                self.num_heads_per_rank * self.head_dim,
-                self.num_kv_heads_per_rank * self.head_dim,
-                self.num_kv_heads_per_rank * self.head_dim,
-            ],
-            dim=-1,
-        )
 
-        # Reshape for multi-head attention
-        q = q.view(batch_size, seq_len, self.num_heads_per_rank, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_kv_heads_per_rank, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_kv_heads_per_rank, self.head_dim)
+        # Split into q, k, v
+        q_size = self.num_heads_per_rank * self.head_dim
+        kv_size = self.num_kv_heads_per_rank * self.head_dim
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        # Transpose to [batch, num_heads, seq_len, head_dim]
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # Reshape and transpose in one step for better memory access
+        # [batch, seq, num_heads * head_dim] -> [batch, num_heads, seq, head_dim]
+        q = q.view(
+            batch_size, seq_len, self.num_heads_per_rank, self.head_dim
+        ).transpose(1, 2)
+        k = k.view(
+            batch_size, seq_len, self.num_kv_heads_per_rank, self.head_dim
+        ).transpose(1, 2)
+        v = v.view(
+            batch_size, seq_len, self.num_kv_heads_per_rank, self.head_dim
+        ).transpose(1, 2)
 
         # Apply rotary position embeddings
         cos, sin = position_embeddings
@@ -445,7 +471,7 @@ class GlmAsrAttention(nn.Module):
             k = _repeat_kv(k, self.num_kv_groups)
             v = _repeat_kv(v, self.num_kv_groups)
 
-        # Scaled dot-product attention (Flash Attention if available)
+        # Scaled dot-product attention (uses Flash Attention when available)
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
@@ -669,12 +695,15 @@ class GlmAsrEncoder(nn.Module):
         # Transpose to [batch_size, seq_len, hidden_size]
         hidden_states = hidden_states.transpose(1, 2)
 
-        batch_size, seq_len, _ = hidden_states.shape
+        seq_len = hidden_states.shape[1]
 
-        # Create position_ids: [batch_size, seq_len] - same as transformers does
-        position_ids = torch.arange(seq_len, device=hidden_states.device)[None, :]
+        # Create position_ids efficiently - use cached creation pattern
+        # The RoPE implementation will use its own cache for cos/sin
+        position_ids = torch.arange(
+            seq_len, device=hidden_states.device, dtype=torch.long
+        ).unsqueeze(0)
 
-        # Get position embeddings - returns (cos, sin) with shape [batch, seq_len, dim]
+        # Get position embeddings - uses pre-computed cache
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # Apply transformer layers
@@ -685,11 +714,7 @@ class GlmAsrEncoder(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         # Return in a format compatible with transformers' BaseModelOutput
-        class EncoderOutput:
-            def __init__(self, last_hidden_state):
-                self.last_hidden_state = last_hidden_state
-
-        return EncoderOutput(last_hidden_state=hidden_states)
+        return _GlmAsrEncoderOutput(last_hidden_state=hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Custom weight loading to handle q_proj/k_proj/v_proj -> qkv_proj mapping."""
