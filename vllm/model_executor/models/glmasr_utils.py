@@ -197,6 +197,7 @@ def _apply_rotary_pos_emb(
     """
     Apply rotary position embeddings to query and key tensors.
 
+    Follows transformers' apply_rotary_pos_emb exactly.
     Supports partial rotary where only the first rotary_dim of head_dim is rotated.
 
     Args:
@@ -205,39 +206,45 @@ def _apply_rotary_pos_emb(
         cos: [batch, seq_len, rotary_dim]
         sin: [batch, seq_len, rotary_dim]
     """
-    cos = cos.unsqueeze(1)  # [bs, 1, seq_len, rotary_dim]
-    sin = sin.unsqueeze(1)  # [bs, 1, seq_len, rotary_dim]
+    # unsqueeze_dim=1 to add head dimension: [batch, 1, seq_len, rotary_dim]
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
 
     # Get the rotary dimension from cos/sin
     rotary_dim = cos.shape[-1]
 
     # Split into rotary and pass-through parts
-    q_rot = q[..., :rotary_dim]
-    q_pass = q[..., rotary_dim:]
-    k_rot = k[..., :rotary_dim]
-    k_pass = k[..., rotary_dim:]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
-    # Apply rotary embeddings to the rotary part
-    q_rot_embed = (q_rot * cos) + (_rotate_half(q_rot) * sin)
-    k_rot_embed = (k_rot * cos) + (_rotate_half(k_rot) * sin)
+    # Apply rotary embeddings on the first half or full tensor
+    q_embed = (q_rot * cos) + (_rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (_rotate_half(k_rot) * sin)
 
-    # Concatenate back
-    q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
-    k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
+    # Concatenate back to full shape
+    q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    k_embed = torch.cat([k_embed, k_pass], dim=-1)
 
     return q_embed, k_embed
 
 
 class GlmAsrRotaryEmbedding(nn.Module):
-    """Optimized Rotary Position Embedding for GLM-ASR encoder."""
+    """
+    Rotary Position Embedding for GLM-ASR encoder.
+
+    Follows the exact same implementation as transformers' GlmAsrRotaryEmbedding
+    to ensure correctness.
+    """
 
     def __init__(self, config, device: torch.device | None = None):
         super().__init__()
         self.config = config
         self.max_seq_len_cached = config.max_position_embeddings
 
-        # Compute inverse frequencies
-        head_dim = config.hidden_size // config.num_attention_heads
+        # Compute inverse frequencies following transformers implementation
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
 
         # Handle rope_parameters if present (for compatibility with transformers config)
         if hasattr(config, "rope_parameters") and config.rope_parameters:
@@ -246,46 +253,60 @@ class GlmAsrRotaryEmbedding(nn.Module):
                 "partial_rotary_factor", 1.0
             )
             dim = int(head_dim * partial_rotary_factor)
+            self.attention_scaling = config.rope_parameters.get(
+                "attention_scaling", 1.0
+            )
         else:
             base = getattr(config, "rope_theta", 10000.0)
             dim = head_dim
+            self.attention_scaling = 1.0
 
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        # Compute the inverse frequencies exactly as transformers does
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.int64).to(
+                    device=device, dtype=torch.float
+                )
+                / dim
+            )
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # Pre-compute cos and sin for common sequence lengths
-        self._set_cos_sin_cache(config.max_position_embeddings, device)
-
-    def _set_cos_sin_cache(self, seq_len: int, device: torch.device | None = None):
-        """Pre-compute cos and sin cache for efficiency."""
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
-
     def forward(
-        self, x: torch.Tensor, seq_len: int | None = None
+        self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
+        Compute rotary embeddings following transformers implementation.
+
         Args:
-            x: Input tensor [batch_size, num_heads, seq_len, head_dim]
-            seq_len: Sequence length (optional, inferred from x if not provided)
+            x: Input tensor [batch_size, seq_len, hidden_size]
+            position_ids: Position indices [batch_size, seq_len]
 
         Returns:
-            Tuple of (cos, sin) tensors for rotary embeddings
+            Tuple of (cos, sin) tensors with shape [batch_size, seq_len, rotary_dim]
         """
-        if seq_len is None:
-            seq_len = x.shape[-2]
-
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len, device=x.device)
-
-        return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        # Expand inv_freq for batch computation: [1, dim/2, 1] -> [batch, dim/2, 1]
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None]
+            .float()
+            .expand(position_ids.shape[0], -1, 1)
+            .to(x.device)
         )
+        # position_ids: [batch, seq_len] -> [batch, 1, seq_len]
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        # Compute freqs: [batch, dim/2, seq_len] -> [batch, seq_len, dim/2]
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(
+            1, 2
+        )
+        # Double the frequencies: [batch, seq_len, dim]
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        cos = emb.cos() * self.attention_scaling
+        sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -627,8 +648,11 @@ class GlmAsrEncoder(nn.Module):
 
         batch_size, seq_len, _ = hidden_states.shape
 
-        # Get position embeddings
-        position_embeddings = self.rotary_emb(hidden_states, seq_len)
+        # Create position_ids: [batch_size, seq_len] - same as transformers does
+        position_ids = torch.arange(seq_len, device=hidden_states.device)[None, :]
+
+        # Get position embeddings - returns (cos, sin) with shape [batch, seq_len, dim]
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # Apply transformer layers
         for encoder_layer in self.layers:
