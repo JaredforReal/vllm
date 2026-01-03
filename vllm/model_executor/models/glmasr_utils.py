@@ -194,12 +194,37 @@ def _apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary position embeddings to query and key tensors."""
-    cos = cos.unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin.unsqueeze(1)  # [bs, 1, seq_len, dim]
+    """
+    Apply rotary position embeddings to query and key tensors.
 
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    Supports partial rotary where only the first rotary_dim of head_dim is rotated.
+
+    Args:
+        q: [batch, num_heads, seq_len, head_dim]
+        k: [batch, num_kv_heads, seq_len, head_dim]
+        cos: [batch, seq_len, rotary_dim]
+        sin: [batch, seq_len, rotary_dim]
+    """
+    cos = cos.unsqueeze(1)  # [bs, 1, seq_len, rotary_dim]
+    sin = sin.unsqueeze(1)  # [bs, 1, seq_len, rotary_dim]
+
+    # Get the rotary dimension from cos/sin
+    rotary_dim = cos.shape[-1]
+
+    # Split into rotary and pass-through parts
+    q_rot = q[..., :rotary_dim]
+    q_pass = q[..., rotary_dim:]
+    k_rot = k[..., :rotary_dim]
+    k_pass = k[..., rotary_dim:]
+
+    # Apply rotary embeddings to the rotary part
+    q_rot_embed = (q_rot * cos) + (_rotate_half(q_rot) * sin)
+    k_rot_embed = (k_rot * cos) + (_rotate_half(k_rot) * sin)
+
+    # Concatenate back
+    q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
+    k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
+
     return q_embed, k_embed
 
 
