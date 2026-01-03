@@ -450,7 +450,7 @@ class GlmAsrAttention(nn.Module):
         kv_size = self.num_kv_heads_per_rank * self.head_dim
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        # Reshape and transpose in one step for better memory access
+        # Reshape and transpose
         # [batch, seq, num_heads * head_dim] -> [batch, num_heads, seq, head_dim]
         q = q.view(
             batch_size, seq_len, self.num_heads_per_rank, self.head_dim
@@ -458,9 +458,12 @@ class GlmAsrAttention(nn.Module):
         k = k.view(
             batch_size, seq_len, self.num_kv_heads_per_rank, self.head_dim
         ).transpose(1, 2)
-        v = v.view(
-            batch_size, seq_len, self.num_kv_heads_per_rank, self.head_dim
-        ).transpose(1, 2)
+        # v doesn't go through RoPE, so make it contiguous now for SDPA
+        v = (
+            v.view(batch_size, seq_len, self.num_kv_heads_per_rank, self.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
 
         # Apply rotary position embeddings
         cos, sin = position_embeddings
@@ -470,6 +473,12 @@ class GlmAsrAttention(nn.Module):
         if self.num_kv_groups > 1:
             k = _repeat_kv(k, self.num_kv_groups)
             v = _repeat_kv(v, self.num_kv_groups)
+
+        # Ensure contiguous for optimal SDPA/Flash Attention performance
+        # Non-contiguous tensors can cause fallback to slower implementations
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
 
         # Scaled dot-product attention (uses Flash Attention when available)
         attn_output = torch.nn.functional.scaled_dot_product_attention(
@@ -656,6 +665,14 @@ class GlmAsrEncoder(nn.Module):
         # Rotary position embeddings
         self.rotary_emb = GlmAsrRotaryEmbedding(config)
 
+        # Pre-register position_ids buffer for efficiency
+        # This avoids creating a new tensor on every forward pass
+        self.register_buffer(
+            "position_ids",
+            torch.arange(config.max_position_embeddings, dtype=torch.long).unsqueeze(0),
+            persistent=False,
+        )
+
     def _get_feat_extract_output_lengths(
         self, input_lengths: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -697,11 +714,8 @@ class GlmAsrEncoder(nn.Module):
 
         seq_len = hidden_states.shape[1]
 
-        # Create position_ids efficiently - use cached creation pattern
-        # The RoPE implementation will use its own cache for cos/sin
-        position_ids = torch.arange(
-            seq_len, device=hidden_states.device, dtype=torch.long
-        ).unsqueeze(0)
+        # Use pre-registered position_ids buffer (slice to actual seq_len)
+        position_ids = self.position_ids[:, :seq_len]
 
         # Get position embeddings - uses pre-computed cache
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
