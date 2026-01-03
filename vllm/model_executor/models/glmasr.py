@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from transformers import BatchFeature
-from transformers.models.glmasr import GlmAsrConfig, GlmAsrEncoder, GlmAsrProcessor
+from transformers.models.glmasr import GlmAsrConfig, GlmAsrProcessor
 from transformers.models.whisper import WhisperFeatureExtractor
 
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
@@ -57,6 +57,7 @@ from .glmasr_utils import (
     DEFAULT_CONV_PARAMS,
     DEFAULT_MAX_AUDIO_LEN_S,
     DEFAULT_MERGE_FACTOR,
+    GlmAsrEncoder,
     _flatten_audio_features_by_length,
     _get_audio_output_lengths_for_tower,
     _get_num_features_for_item,
@@ -352,7 +353,12 @@ class GlmAsrForConditionalGeneration(
         self.config = config
         self.multimodal_config = multimodal_config
 
-        self.audio_tower = GlmAsrEncoder(config.audio_config)
+        # Use optimized vLLM native encoder
+        self.audio_tower = GlmAsrEncoder(
+            config.audio_config,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "audio_tower"),
+        )
         self.multi_modal_projector = GlmAsrMultiModalProjector(
             config,
             quant_config=quant_config,
