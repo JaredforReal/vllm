@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias, cast
 
@@ -35,6 +37,7 @@ from vllm.multimodal.parse import (
     MultiModalDataParser,
 )
 from vllm.multimodal.processing import (
+    BaseMultiModalProcessor,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
@@ -47,7 +50,6 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .audioflamingo3 import (
     AudioFlamingo3MultiModalDataParser,
-    AudioFlamingo3MultiModalProcessor,
     AudioFlamingo3ProcessingInfo,
 )
 from .audioflamingo3 import (
@@ -73,6 +75,8 @@ from .interfaces import (
 )
 from .utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
 from .whisper import ISO639_1_SUPPORTED_LANGS
+
+logger = logging.getLogger(__name__)
 
 
 class GlmAsrFeatureInputs(TensorSchema):
@@ -204,7 +208,13 @@ class GlmAsrMultiModalDataParser(AudioFlamingo3MultiModalDataParser):
         return super()._parse_audio_data(data)
 
 
-class GlmAsrMultiModalProcessor(AudioFlamingo3MultiModalProcessor):
+class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"]):
+    """
+    GLM-ASR processor that inherits directly from BaseMultiModalProcessor
+    for better performance and cleaner implementation.
+    Includes detailed timing profiling to identify bottlenecks.
+    """
+
     def _get_data_parser(self) -> MultiModalDataParser:
         feature_extractor = self.info.get_feature_extractor()
         return GlmAsrMultiModalDataParser(target_sr=feature_extractor.sampling_rate)
@@ -236,6 +246,12 @@ class GlmAsrMultiModalProcessor(AudioFlamingo3MultiModalProcessor):
         mm_kwargs: Mapping[str, Any],
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
+        """
+        Call HF processor with detailed timing profiling.
+        Optimized for GPU-accelerated mel spectrogram extraction.
+        """
+        t_start = time.perf_counter()
+
         # Normalize input: handle deprecated key and list conversion.
         if "audios" in mm_data:
             mm_data["audio"] = mm_data.pop("audios")
@@ -249,39 +265,60 @@ class GlmAsrMultiModalProcessor(AudioFlamingo3MultiModalProcessor):
             prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
             return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
 
-        # Get processor for chunk counts calculation
+        t_normalize = time.perf_counter()
+
+        # Get processor and feature extractor
         processor = self.info.get_hf_processor(**mm_kwargs)
+        feature_extractor = processor.feature_extractor
+        sampling_rate = feature_extractor.sampling_rate
+
+        t_get_processor = time.perf_counter()
 
         # Enable GPU-accelerated mel spectrogram extraction
         # WhisperFeatureExtractor supports device parameter for STFT computation
-        mm_kwargs = dict(**mm_kwargs, device="cuda")
-
-        # DEBUG: Log to verify device parameter is being passed
-        import logging
-
-        logger = logging.getLogger(__name__)
-        logger.warning(
-            "GlmAsrMultiModalProcessor: mm_kwargs includes device=%s",
-            mm_kwargs.get("device"),
+        audio_kwargs = mm_kwargs.get("audio_kwargs", {})
+        audio_kwargs = dict(**audio_kwargs, device="cuda")
+        mm_kwargs = dict(
+            **mm_kwargs,
+            audio_kwargs=audio_kwargs,
+            sampling_rate=sampling_rate,
         )
 
-        # Call parent method (it will handle sampling_rate)
-        outputs = super()._call_hf_processor(
-            prompt=prompt,
-            mm_data=mm_data,
-            mm_kwargs=mm_kwargs,
-            tok_kwargs=tok_kwargs,
+        t_prepare_kwargs = time.perf_counter()
+
+        # Call the HF processor directly (not through parent)
+        outputs = self.info.ctx.call_hf_processor(
+            processor,
+            dict(text=prompt, **mm_data),
+            dict(**mm_kwargs, **tok_kwargs),
         )
+
+        t_hf_processor = time.perf_counter()
 
         # Postprocess: rename mask and add chunk counts.
         if "input_features_mask" in outputs:
             outputs["feature_attention_mask"] = outputs.pop("input_features_mask")
 
-        # Override chunk counts calculation with GLM-ASR specific logic
+        # Calculate chunk counts with GLM-ASR specific logic
         chunk_counts = self._calculate_chunk_counts(
-            audio_list, processor.feature_extractor, processor
+            audio_list, feature_extractor, processor
         )
         outputs["chunk_counts"] = torch.tensor(chunk_counts, dtype=torch.long)
+
+        t_postprocess = time.perf_counter()
+
+        # Log detailed timing breakdown
+        logger.warning(
+            "[GlmAsrProcessor Profiling] "
+            "normalize=%.3fms, get_processor=%.3fms, prepare_kwargs=%.3fms, "
+            "hf_processor=%.3fms, postprocess=%.3fms, TOTAL=%.3fms",
+            (t_normalize - t_start) * 1000,
+            (t_get_processor - t_normalize) * 1000,
+            (t_prepare_kwargs - t_get_processor) * 1000,
+            (t_hf_processor - t_prepare_kwargs) * 1000,
+            (t_postprocess - t_hf_processor) * 1000,
+            (t_postprocess - t_start) * 1000,
+        )
 
         return outputs
 

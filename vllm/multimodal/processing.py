@@ -1111,20 +1111,6 @@ class InputProcessingContext:
             allow_var_kwargs=True,
         )
 
-        # DEBUG: Log to check if device parameter is being filtered out
-        if "device" in merged_kwargs and "device" not in allowed_kwargs:
-            logger.warning(
-                "call_hf_processor: 'device' parameter was FILTERED OUT! "
-                "merged_kwargs had device=%s, but allowed_kwargs=%s",
-                merged_kwargs.get("device"),
-                list(allowed_kwargs.keys()),
-            )
-        elif "device" in allowed_kwargs:
-            logger.warning(
-                "call_hf_processor: 'device' parameter PASSED through: device=%s",
-                allowed_kwargs.get("device"),
-            )
-
         try:
             output = hf_processor(**data, **allowed_kwargs, return_tensors="pt")
         except Exception as exc:
