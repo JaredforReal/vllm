@@ -831,6 +831,8 @@ class GlmAsrForConditionalGeneration(
     def _process_audio_input(
         self, audio_input: GlmAsrInputs
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        t_start = time.perf_counter()
+
         if audio_input["type"] == "audio_embeds":
             return tuple(audio_input["audio_embeds"])
 
@@ -848,33 +850,34 @@ class GlmAsrForConditionalGeneration(
 
         # Convert input_features to model dtype (e.g., bfloat16) to match model weights
         input_features = input_features.to(dtype=self.audio_tower.conv1.weight.dtype)
+        t_prepare = time.perf_counter()
 
         # audio_tower returns [batch_size, seq_len, hidden_size] where hidden_size=1280
         audio_hidden_states = self.audio_tower(input_features).last_hidden_state
+        t_encoder = time.perf_counter()
 
         # GLM-ASR merges consecutive frames: 4 frames with hidden_size=1280
         # -> 1 frame with intermediate_size=5120
-        # merge_ratio = intermediate_size / hidden_size = 5120 / 1280 = 4
         hidden_size = self.config.audio_config.hidden_size
         intermediate_size = self.config.audio_config.intermediate_size
-        merge_ratio = intermediate_size // hidden_size  # Typically 4
+        merge_ratio = intermediate_size // hidden_size
 
         # Truncate sequence length to be divisible by merge_ratio
-        # This handles variable-length audio where seq_len may not be divisible
         seq_len = audio_hidden_states.shape[1]
         seq_len_truncated = (seq_len // merge_ratio) * merge_ratio
         if seq_len_truncated < seq_len:
             audio_hidden_states = audio_hidden_states[:, :seq_len_truncated, :]
 
-        # Reshape to merge consecutive frames: [batch, seq_len, hidden_size]
-        # -> [batch, seq_len/4, intermediate_size]
+        # Reshape to merge consecutive frames
         audio_hidden_states = audio_hidden_states.reshape(
             num_chunks,
             -1,
             intermediate_size,
         )
+        t_reshape = time.perf_counter()
 
         audio_features = self.multi_modal_projector(audio_hidden_states)
+        t_projector = time.perf_counter()
 
         merge_factor = getattr(self.config, "merge_factor", DEFAULT_MERGE_FACTOR)
         conv_params = getattr(self.config, "conv_params", DEFAULT_CONV_PARAMS)
@@ -893,7 +896,26 @@ class GlmAsrForConditionalGeneration(
         chunk_embeddings = torch.split(
             masked_audio_features, audio_output_lengths.flatten().tolist()
         )
-        return _group_audio_embeddings(chunk_embeddings, chunk_counts)
+        result = _group_audio_embeddings(chunk_embeddings, chunk_counts)
+        t_postprocess = time.perf_counter()
+
+        logger.warning(
+            "[GlmAsrModel Audio Processing] "
+            "chunks=%d, seq_len=%d->%d | "
+            "prepare=%.3fms, encoder=%.3fms, reshape=%.3fms, "
+            "projector=%.3fms, postprocess=%.3fms | TOTAL=%.3fms",
+            num_chunks,
+            seq_len,
+            seq_len_truncated,
+            (t_prepare - t_start) * 1000,
+            (t_encoder - t_prepare) * 1000,
+            (t_reshape - t_encoder) * 1000,
+            (t_projector - t_reshape) * 1000,
+            (t_postprocess - t_projector) * 1000,
+            (t_postprocess - t_start) * 1000,
+        )
+
+        return result
 
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
