@@ -193,242 +193,6 @@ class GlmAsrDummyInputsBuilder(BaseDummyInputsBuilder[GlmAsrProcessingInfo]):
         }
 
 
-# Cache for GPU mel spectrogram transform and mel filters
-_GPU_MEL_TRANSFORM_CACHE: dict[tuple, Any] = {}
-_MEL_FILTERS_CACHE: dict[tuple, np.ndarray] = {}
-
-
-def _get_gpu_mel_transform(
-    sampling_rate: int,
-    n_fft: int,
-    hop_length: int,
-    n_mels: int,
-    device: torch.device,
-) -> Any:
-    """Get cached GPU mel spectrogram transform."""
-    key = (sampling_rate, n_fft, hop_length, n_mels, str(device))
-    if key not in _GPU_MEL_TRANSFORM_CACHE:
-        import torchaudio.transforms as T  # type: ignore
-
-        transform = T.MelSpectrogram(
-            sample_rate=sampling_rate,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            n_mels=n_mels,
-            f_min=0.0,
-            f_max=8000.0,
-            norm="slaney",
-            mel_scale="slaney",
-        ).to(device)
-
-        # Warmup CUDA kernel with dummy data
-        dummy = torch.randn(1, 16000, device=device)
-        _ = transform(dummy)
-        torch.cuda.synchronize()
-
-        _GPU_MEL_TRANSFORM_CACHE[key] = transform
-        logger.info("Created and warmed up GPU MelSpectrogram transform")
-
-    return _GPU_MEL_TRANSFORM_CACHE[key]
-
-
-def extract_mel_features_gpu(
-    audio_arrays: list[np.ndarray],
-    feature_extractor: WhisperFeatureExtractor,
-) -> BatchFeature:
-    """
-    GPU-accelerated mel spectrogram extraction using torchaudio.
-
-    Uses cached MelSpectrogram transform to avoid repeated kernel compilation.
-    Pre-warms CUDA kernels on first call for consistent performance.
-
-    Args:
-        audio_arrays: List of audio arrays (numpy) at target sampling rate
-        feature_extractor: WhisperFeatureExtractor for configuration
-
-    Returns:
-        BatchFeature with input_features and input_features_mask
-    """
-    device = torch.device("cuda")
-
-    # Get config from feature extractor
-    n_fft = feature_extractor.n_fft
-    hop_length = feature_extractor.hop_length
-    n_mels = feature_extractor.feature_size
-    sampling_rate = feature_extractor.sampling_rate
-
-    # Get cached transform (creates and warms up on first call)
-    mel_transform = _get_gpu_mel_transform(
-        sampling_rate, n_fft, hop_length, n_mels, device
-    )
-
-    all_features = []
-    all_masks = []
-
-    for audio in audio_arrays:
-        # Convert to tensor and move to GPU in one step
-        if isinstance(audio, np.ndarray):
-            waveform = torch.from_numpy(audio).float()
-        else:
-            waveform = torch.tensor(audio, dtype=torch.float32)
-
-        # Pin memory for faster CPU->GPU transfer
-        waveform = waveform.pin_memory().to(device, non_blocking=True)
-
-        # Add batch dimension
-        if waveform.ndim == 1:
-            waveform = waveform.unsqueeze(0)
-
-        # Compute mel spectrogram on GPU (kernel already warmed up)
-        mel_spec = mel_transform(waveform)  # (1, n_mels, T)
-
-        # Log mel (same as Whisper) - all on GPU
-        mel_spec = torch.clamp(mel_spec, min=1e-10)
-        mel_spec = torch.log10(mel_spec)
-
-        # Normalize
-        mel_spec = torch.maximum(mel_spec, mel_spec.max() - 8.0)
-        mel_spec = (mel_spec + 4.0) / 4.0
-
-        # Create mask
-        seq_len = mel_spec.shape[-1]
-        mask = torch.ones(seq_len, dtype=torch.long, device=device)
-
-        all_features.append(mel_spec.squeeze(0))  # (n_mels, T)
-        all_masks.append(mask)
-
-    # Synchronize before returning
-    torch.cuda.synchronize()
-
-    # Stack into batch
-    input_features = torch.stack(all_features)  # (B, n_mels, T)
-    input_features_mask = torch.stack(all_masks)  # (B, T)
-
-    return BatchFeature(
-        {
-            "input_features": input_features,
-            "input_features_mask": input_features_mask,
-        }
-    )
-
-
-def extract_mel_features_optimized_cpu(
-    audio_arrays: list[np.ndarray],
-    feature_extractor: WhisperFeatureExtractor,
-) -> BatchFeature:
-    """
-    Optimized CPU mel spectrogram extraction using scipy's vectorized STFT.
-
-    This uses scipy.signal.stft which is implemented in C and much faster
-    than Python loops. Typically 5-10x faster than a naive Python implementation.
-
-    Args:
-        audio_arrays: List of audio arrays (numpy) at target sampling rate
-        feature_extractor: WhisperFeatureExtractor for configuration
-
-    Returns:
-        BatchFeature with input_features and input_features_mask
-    """
-    from scipy.signal import stft  # type: ignore
-
-    # Get config from feature extractor
-    n_fft = feature_extractor.n_fft
-    hop_length = feature_extractor.hop_length
-    n_mels = feature_extractor.feature_size
-    sampling_rate = feature_extractor.sampling_rate
-
-    # Build mel filterbank (cached)
-    mel_filters = _get_mel_filters_cached(sampling_rate, n_fft, n_mels)
-
-    all_features = []
-    all_masks = []
-
-    for audio in audio_arrays:
-        # Ensure float32
-        if audio.dtype != np.float32:
-            audio = audio.astype(np.float32)
-
-        # Pad audio like Whisper does
-        audio_padded = np.pad(audio, (n_fft // 2, n_fft // 2), mode="reflect")
-
-        # Use scipy's optimized STFT (C implementation, very fast)
-        _, _, stft_matrix = stft(
-            audio_padded,
-            fs=sampling_rate,
-            window="hann",
-            nperseg=n_fft,
-            noverlap=n_fft - hop_length,
-            nfft=n_fft,
-            boundary=None,  # We already padded
-            padded=False,
-        )
-        # stft_matrix shape: (n_fft//2 + 1, n_frames)
-
-        # Power spectrogram
-        power_spec = np.abs(stft_matrix) ** 2
-
-        # Apply mel filterbank (matrix multiply, very fast)
-        mel_spec = mel_filters @ power_spec  # (n_mels, n_frames)
-
-        # Log mel
-        mel_spec = np.log10(np.maximum(mel_spec, 1e-10))
-
-        # Normalize (same as Whisper)
-        mel_spec = np.maximum(mel_spec, mel_spec.max() - 8.0)
-        mel_spec = (mel_spec + 4.0) / 4.0
-
-        # Convert to torch tensor
-        mel_tensor = torch.from_numpy(
-            mel_spec.T.astype(np.float32)
-        )  # (n_frames, n_mels)
-
-        # Create mask (all 1s)
-        mask = torch.ones(mel_tensor.shape[0], dtype=torch.long)
-
-        all_features.append(mel_tensor)
-        all_masks.append(mask)
-
-    # Stack into batch format matching HF output
-    input_features = torch.stack(
-        [f.unsqueeze(0) for f in all_features]
-    )  # (B, 1, T, n_mels)
-    input_features = input_features.squeeze(1).transpose(1, 2)  # (B, n_mels, T)
-
-    input_features_mask = torch.stack(all_masks)  # (B, T)
-
-    return BatchFeature(
-        {
-            "input_features": input_features,
-            "input_features_mask": input_features_mask,
-        }
-    )
-
-
-def _get_mel_filters_cached(
-    sampling_rate: int,
-    n_fft: int,
-    n_mels: int,
-) -> np.ndarray:
-    """Get mel filterbank with caching."""
-    key = (sampling_rate, n_fft, n_mels)
-    if key not in _MEL_FILTERS_CACHE:
-        import librosa  # type: ignore
-
-        # Build mel filterbank using librosa (same as Whisper)
-        mel_filters = librosa.filters.mel(
-            sr=sampling_rate,
-            n_fft=n_fft,
-            n_mels=n_mels,
-            fmin=0.0,
-            fmax=8000.0,
-            norm="slaney",
-            htk=False,
-        )
-        _MEL_FILTERS_CACHE[key] = mel_filters.astype(np.float32)
-
-    return _MEL_FILTERS_CACHE[key]
-
-
 class GlmAsrMultiModalDataParser(AudioFlamingo3MultiModalDataParser):
     def _parse_audio_data(
         self,
@@ -483,8 +247,7 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         """
-        Call HF processor with detailed timing profiling.
-        Optimized for GPU-accelerated mel spectrogram extraction.
+        Process audio data using HF WhisperFeatureExtractor.
         """
         t_start = time.perf_counter()
 
@@ -501,67 +264,33 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
             prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
             return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
 
-        t_normalize = time.perf_counter()
-
         # Get processor and feature extractor
         processor = self.info.get_hf_processor(**mm_kwargs)
         feature_extractor = processor.feature_extractor
         sampling_rate = feature_extractor.sampling_rate
 
-        t_get_processor = time.perf_counter()
-
-        # Enable GPU-accelerated mel spectrogram extraction
-        # WhisperFeatureExtractor supports device parameter for STFT computation
-        audio_kwargs = mm_kwargs.get("audio_kwargs", {})
-        audio_kwargs = dict(**audio_kwargs, device="cuda")
-        mm_kwargs = dict(
-            **mm_kwargs,
-            audio_kwargs=audio_kwargs,
-            sampling_rate=sampling_rate,
-        )
-
-        t_prepare_kwargs = time.perf_counter()
-
-        # Use HF WhisperFeatureExtractor on CPU (proven stable, ~266ms)
-        # Note: Custom GPU implementations have dtype compatibility issues
+        # Extract mel features using HF WhisperFeatureExtractor
         t_extract_start = time.perf_counter()
-
         audio_features = feature_extractor(
             audio_list,
             sampling_rate=sampling_rate,
             return_tensors="pt",
+            return_attention_mask=True,
         )
-        t_extract_method = "hf_cpu"
-
         t_extract_end = time.perf_counter()
 
-        logger.warning(
-            "[Mel Extraction] method=%s, time=%.3fms",
-            t_extract_method,
-            (t_extract_end - t_extract_start) * 1000,
-        )
-
         # Tokenize the text prompt
-        t_tokenize_start = time.perf_counter()
         tokenizer = self.info.get_tokenizer()
         tokenized = tokenizer(prompt, return_tensors="pt", **tok_kwargs)
-        t_tokenize_end = time.perf_counter()
 
         # Merge outputs
         outputs = BatchFeature({**audio_features, **tokenized})
 
-        t_hf_processor = time.perf_counter()
-
-        # Log fine-grained timing
-        logger.warning(
-            "[HF Processor Internal] feature_extraction=%.3fms, tokenization=%.3fms",
-            (t_extract_end - t_extract_start) * 1000,
-            (t_tokenize_end - t_tokenize_start) * 1000,
-        )
-
-        # Postprocess: rename mask and add chunk counts.
-        if "input_features_mask" in outputs:
-            outputs["feature_attention_mask"] = outputs.pop("input_features_mask")
+        # Rename attention_mask to feature_attention_mask
+        # WhisperFeatureExtractor returns 'attention_mask'
+        # we need 'feature_attention_mask'
+        if "attention_mask" in outputs:
+            outputs["feature_attention_mask"] = outputs.pop("attention_mask")
 
         # Calculate chunk counts with GLM-ASR specific logic
         chunk_counts = self._calculate_chunk_counts(
@@ -569,19 +298,13 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
         )
         outputs["chunk_counts"] = torch.tensor(chunk_counts, dtype=torch.long)
 
-        t_postprocess = time.perf_counter()
+        t_end = time.perf_counter()
 
-        # Log detailed timing breakdown
-        logger.warning(
-            "[GlmAsrProcessor Profiling] "
-            "normalize=%.3fms, get_processor=%.3fms, prepare_kwargs=%.3fms, "
-            "[feature_extract+tokenize]=%.3fms, postprocess=%.3fms, TOTAL=%.3fms",
-            (t_normalize - t_start) * 1000,
-            (t_get_processor - t_normalize) * 1000,
-            (t_prepare_kwargs - t_get_processor) * 1000,
-            (t_hf_processor - t_prepare_kwargs) * 1000,
-            (t_postprocess - t_hf_processor) * 1000,
-            (t_postprocess - t_start) * 1000,
+        # Log timing for profiling (debug level for production)
+        logger.debug(
+            "[GlmAsrProcessor] feature_extraction=%.1fms, total=%.1fms",
+            (t_extract_end - t_extract_start) * 1000,
+            (t_end - t_start) * 1000,
         )
 
         return outputs
