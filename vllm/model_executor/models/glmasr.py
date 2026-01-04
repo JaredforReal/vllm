@@ -239,6 +239,7 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
             chunk_counts.append(min(n_chunks, max_windows))
         return chunk_counts
 
+    # @torch.compile(fullgraph=True)
     def _call_hf_processor(
         self,
         prompt: str,
@@ -296,14 +297,28 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
 
         # Extract audio features using WhisperFeatureExtractor
         # The device parameter enables GPU-accelerated STFT/mel spectrogram
+        # Enable padding and return_attention_mask to get feature_attention_mask
         audio_features = feature_extractor(
             audio_list,
             sampling_rate=sampling_rate,
             return_tensors="pt",
+            padding=True,
+            return_attention_mask=True,
             **audio_kwargs,
         )
 
         t_extract_end = time.perf_counter()
+
+        # Rename audio attention_mask to feature_attention_mask BEFORE merging
+        # to avoid conflict with tokenizer's attention_mask
+        if "attention_mask" in audio_features:
+            audio_features["feature_attention_mask"] = audio_features.pop(
+                "attention_mask"
+            )
+        elif "input_features_mask" in audio_features:
+            audio_features["feature_attention_mask"] = audio_features.pop(
+                "input_features_mask"
+            )
 
         # Tokenize the text prompt
         t_tokenize_start = time.perf_counter()
@@ -311,7 +326,8 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
         tokenized = tokenizer(prompt, return_tensors="pt", **tok_kwargs)
         t_tokenize_end = time.perf_counter()
 
-        # Merge outputs
+        # Merge outputs (audio_features first, then tokenized)
+        # Note: tokenized may have its own attention_mask for text, which is separate
         outputs = BatchFeature({**audio_features, **tokenized})
 
         t_hf_processor = time.perf_counter()
@@ -322,10 +338,6 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
             (t_extract_end - t_extract_start) * 1000,
             (t_tokenize_end - t_tokenize_start) * 1000,
         )
-
-        # Postprocess: rename mask and add chunk counts.
-        if "input_features_mask" in outputs:
-            outputs["feature_attention_mask"] = outputs.pop("input_features_mask")
 
         # Calculate chunk counts with GLM-ASR specific logic
         chunk_counts = self._calculate_chunk_counts(
