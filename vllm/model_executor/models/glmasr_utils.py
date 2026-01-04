@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
+import time
 from collections.abc import Iterable, Sequence
 from typing import cast
 
@@ -17,6 +19,8 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_AUDIO_LEN_S = 655
 DEFAULT_MERGE_FACTOR = 4
@@ -705,27 +709,66 @@ class GlmAsrEncoder(nn.Module):
             [batch_size, seq_len', hidden_size] where seq_len' is
             the sequence length after convolutions
         """
+        t_start = time.perf_counter()
+        batch_size, n_mels, seq_len = input_features.shape
+
         # Apply convolutional layers with GELU activation
+        t_conv1_start = time.perf_counter()
         hidden_states = torch.nn.functional.gelu(self.conv1(input_features))
+        t_conv1 = time.perf_counter()
+
         hidden_states = torch.nn.functional.gelu(self.conv2(hidden_states))
+        t_conv2 = time.perf_counter()
 
         # Transpose to [batch_size, seq_len, hidden_size]
         hidden_states = hidden_states.transpose(1, 2)
-
-        seq_len = hidden_states.shape[1]
+        output_seq_len = hidden_states.shape[1]
 
         # Use pre-registered position_ids buffer (slice to actual seq_len)
-        position_ids = self.position_ids[:, :seq_len]
+        position_ids = self.position_ids[:, :output_seq_len]
 
         # Get position embeddings - uses pre-computed cache
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        t_rope = time.perf_counter()
 
         # Apply transformer layers
+        layer_times = []
         for encoder_layer in self.layers:
+            t_layer_start = time.perf_counter()
             hidden_states = encoder_layer(hidden_states, position_embeddings)
+            layer_times.append((time.perf_counter() - t_layer_start) * 1000)
+
+        t_layers = time.perf_counter()
 
         # Final layer norm
         hidden_states = self.norm(hidden_states)
+        t_norm = time.perf_counter()
+
+        # Log profiling info
+        total_time = (t_norm - t_start) * 1000
+        conv1_time = (t_conv1 - t_conv1_start) * 1000
+        conv2_time = (t_conv2 - t_conv1) * 1000
+        rope_time = (t_rope - t_conv2) * 1000
+        layers_time = (t_layers - t_rope) * 1000
+        norm_time = (t_norm - t_layers) * 1000
+
+        logger.warning(
+            "[GlmAsrEncoder Profiling] "
+            "batch=%d, seq_len=%d->%d | "
+            "conv1=%.3fms, conv2=%.3fms, rope=%.3fms, "
+            "layers=%.3fms (avg=%.3fms), norm=%.3fms | "
+            "TOTAL=%.3fms",
+            batch_size,
+            seq_len,
+            output_seq_len,
+            conv1_time,
+            conv2_time,
+            rope_time,
+            layers_time,
+            sum(layer_times) / len(layer_times) if layer_times else 0,
+            norm_time,
+            total_time,
+        )
 
         # Return in a format compatible with transformers' BaseModelOutput
         return _GlmAsrEncoderOutput(last_hidden_state=hidden_states)
