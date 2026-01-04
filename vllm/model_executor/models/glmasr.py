@@ -7,6 +7,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias, cast
 
 import numpy as np
+import regex as re
 import torch
 import torch.nn as nn
 from transformers import BatchFeature
@@ -249,7 +250,7 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
     ) -> BatchFeature:
         """
         Call HF processor with detailed timing profiling.
-        Uses the full GlmAsrProcessor to properly handle audio chunking.
+        Manually breaks down the GlmAsrProcessor steps to identify bottlenecks.
         """
         t_start = time.perf_counter()
 
@@ -268,126 +269,154 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
 
         t_normalize = time.perf_counter()
 
-        # Get processor
+        # Get processor and feature_extractor
         processor = self.info.get_hf_processor(**mm_kwargs)
+        feature_extractor = processor.feature_extractor
+        tokenizer = processor.tokenizer
 
         t_get_processor = time.perf_counter()
 
-        # Manually decompose processor call for detailed profiling
-        tokenizer = processor.tokenizer
-        feature_extractor = processor.feature_extractor
-
-        # Step 1: Tokenize text
-        t_tokenize_start = time.perf_counter()
-        text_inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding=True,
-            **mm_kwargs,
-        )
-        t_tokenize_end = time.perf_counter()
-
-        # Step 2: Audio feature extraction with chunking
-        # GlmAsrProcessor internally handles:
-        # - Audio chunking into 30-second windows
-        # - Feature extraction with WhisperFeatureExtractor
-        # - Proper attention mask generation
-        t_audio_start = time.perf_counter()
-
-        # Extract audio features using processor's method
-        # This includes chunking logic from GlmAsrProcessor
-        max_audio_len = getattr(processor, "max_audio_len", DEFAULT_MAX_AUDIO_LEN_S)
+        # ===== Step 1: Audio chunking =====
+        # Replicate GlmAsrProcessor's chunking logic
         sampling_rate = feature_extractor.sampling_rate
         chunk_length = feature_extractor.chunk_length
+        max_audio_len = getattr(processor, "max_audio_len", DEFAULT_MAX_AUDIO_LEN_S)
+        window_size = int(sampling_rate * chunk_length)
+        max_windows = int(max_audio_len // chunk_length)
 
-        # Process each audio file
-        all_input_features = []
-        all_feature_masks = []
+        per_sample_windows: list[int] = []
+        flat_chunks: list[np.ndarray] = []
 
-        t_chunk_start = time.perf_counter()
-        all_chunks = []
-        for audio in audio_list:
-            # Chunk audio if needed
-            if isinstance(audio, list):
-                audio = np.array(audio)
+        for audio_el in audio_list:
+            # Convert to numpy if needed
+            if isinstance(audio_el, torch.Tensor):
+                audio_el = audio_el.numpy()
+            elif isinstance(audio_el, list):
+                audio_el = np.array(audio_el, dtype=np.float32)
 
-            n_samples = len(audio)
-            chunk_size = int(sampling_rate * chunk_length)
-            max_samples = int(sampling_rate * max_audio_len)
+            n_samples = int(audio_el.shape[0])
+            n_win = max(1, (n_samples + window_size - 1) // window_size)
+            if n_win > max_windows:
+                n_win = max_windows
 
-            # Split into chunks
-            chunks = []
-            for i in range(0, min(n_samples, max_samples), chunk_size):
-                chunk = audio[i : i + chunk_size]
-                if len(chunk) > 0:
-                    chunks.append(chunk)
+            per_sample_windows.append(n_win)
+            time_cap = min(n_samples, n_win * window_size)
 
-            if not chunks:
-                chunks = [audio[:chunk_size]]
+            for i in range(n_win):
+                start = i * window_size
+                end = min((i + 1) * window_size, time_cap)
+                flat_chunks.append(audio_el[start:end])
 
-            all_chunks.extend(chunks)
-        t_chunk_end = time.perf_counter()
+        t_chunking = time.perf_counter()
 
-        # Extract features for all chunks
-        t_feature_extract_start = time.perf_counter()
-        for chunk in all_chunks:
-            features = feature_extractor(
-                chunk,
-                sampling_rate=sampling_rate,
-                return_tensors="pt",
-                padding=True,
-                return_attention_mask=True,
-            )
-            all_input_features.append(features["input_features"])
-            if "attention_mask" in features:
-                all_feature_masks.append(features["attention_mask"])
-        t_feature_extract_end = time.perf_counter()
-
-        t_audio_end = time.perf_counter()
-
-        # Step 3: Concatenate and prepare outputs
-        t_concat_start = time.perf_counter()
-        outputs = BatchFeature(text_inputs)
-        if all_input_features:
-            outputs["input_features"] = torch.cat(all_input_features, dim=0)
-        if all_feature_masks:
-            outputs["feature_attention_mask"] = torch.cat(all_feature_masks, dim=0)
-        t_concat_end = time.perf_counter()
-
-        # Rename mask keys for consistency
-        if "input_features_mask" in outputs:
-            outputs["feature_attention_mask"] = outputs.pop("input_features_mask")
-        elif "attention_mask" in outputs and "input_features" in outputs:
-            # Only rename if this is an audio attention mask
-            # (shape matches input_features)
-            attention_mask = outputs["attention_mask"]
-            input_features = outputs["input_features"]
-            if attention_mask.shape[0] == input_features.shape[0]:
-                outputs["feature_attention_mask"] = outputs.pop("attention_mask")
-
-        # Calculate chunk counts with GLM-ASR specific logic
-        feature_extractor = processor.feature_extractor
-        chunk_counts = self._calculate_chunk_counts(
-            audio_list, feature_extractor, processor
+        # ===== Step 2: Feature extraction (WhisperFeatureExtractor) =====
+        # This is likely the bottleneck - mel spectrogram computation
+        audio_inputs = feature_extractor(
+            flat_chunks,
+            sampling_rate=sampling_rate,
+            return_tensors="pt",
+            padding=True,
+            return_attention_mask=True,
         )
+
+        t_feature_extract = time.perf_counter()
+
+        # ===== Step 3: Process attention mask =====
+        padding_mask = audio_inputs.pop("attention_mask")
+        input_features_mask = padding_mask
+
+        t_mask_process = time.perf_counter()
+
+        # ===== Step 4: Compute audio token lengths =====
+        # Sum padding_mask along last dim for each chunk, then group by sample
+        chunk_lengths = padding_mask.sum(-1)  # [num_chunks]
+        audio_lengths = torch.stack(
+            [
+                chunk_lengths[
+                    sum(per_sample_windows[:i]) : sum(per_sample_windows[: i + 1])
+                ].sum()
+                for i in range(len(per_sample_windows))
+            ]
+        )
+
+        # Apply convolution formula to get token counts
+        merge_factor = 4
+        for padding, kernel_size, stride in [(1, 3, 1), (1, 3, 2)]:
+            audio_lengths = (
+                audio_lengths + 2 * padding - (kernel_size - 1) - 1
+            ) // stride + 1
+        audio_tokens_lengths = (audio_lengths - merge_factor) // merge_factor + 1
+
+        t_token_length = time.perf_counter()
+
+        # ===== Step 5: Expand audio tokens in text =====
+        audio_token = getattr(processor, "audio_token", "<|pad|>")
+        text_list = [prompt]  # Single text for now
+
+        for i, audio_length in enumerate(audio_tokens_lengths):
+            if i < len(text_list):
+                expanded = re.sub(
+                    re.escape(audio_token),
+                    audio_token * int(audio_length),
+                    text_list[i],
+                )
+                text_list[i] = expanded
+
+        t_expand_tokens = time.perf_counter()
+
+        # ===== Step 6: Tokenize text =====
+        text_inputs = tokenizer(
+            text_list,
+            return_tensors="pt",
+            padding=True,
+            **tok_kwargs,
+        )
+
+        t_tokenize = time.perf_counter()
+
+        # ===== Step 7: Combine outputs =====
+        outputs = BatchFeature(
+            data={
+                **text_inputs,
+                "input_features": audio_inputs["input_features"],
+                "feature_attention_mask": input_features_mask,
+            },
+            tensor_type="pt",
+        )
+
+        # Calculate chunk counts
+        chunk_counts = per_sample_windows
         outputs["chunk_counts"] = torch.tensor(chunk_counts, dtype=torch.long)
 
         t_postprocess = time.perf_counter()
 
-        # Log detailed timing breakdown with sub-steps
+        # Log detailed timing breakdown
+        total_audio_samples = sum(
+            len(a) if isinstance(a, (list, np.ndarray)) else a.shape[0]
+            for a in audio_list
+        )
+        total_audio_seconds = total_audio_samples / sampling_rate
+        num_chunks = len(flat_chunks)
+
         logger.warning(
             "[GlmAsrProcessor Profiling] "
+            "audio=%.2fs, chunks=%d | "
             "normalize=%.3fms, get_processor=%.3fms, "
-            "tokenize=%.3fms, audio_chunk=%.3fms, feature_extract=%.3fms, "
-            "audio_total=%.3fms, concat=%.3fms, postprocess=%.3fms, TOTAL=%.3fms",
+            "chunking=%.3fms, feature_extract=%.3fms, "
+            "mask_process=%.3fms, token_length=%.3fms, "
+            "expand_tokens=%.3fms, tokenize=%.3fms, "
+            "postprocess=%.3fms | TOTAL=%.3fms",
+            total_audio_seconds,
+            num_chunks,
             (t_normalize - t_start) * 1000,
             (t_get_processor - t_normalize) * 1000,
-            (t_tokenize_end - t_tokenize_start) * 1000,
-            (t_chunk_end - t_chunk_start) * 1000,
-            (t_feature_extract_end - t_feature_extract_start) * 1000,
-            (t_audio_end - t_audio_start) * 1000,
-            (t_concat_end - t_concat_start) * 1000,
-            (t_postprocess - t_concat_end) * 1000,
+            (t_chunking - t_get_processor) * 1000,
+            (t_feature_extract - t_chunking) * 1000,
+            (t_mask_process - t_feature_extract) * 1000,
+            (t_token_length - t_mask_process) * 1000,
+            (t_expand_tokens - t_token_length) * 1000,
+            (t_tokenize - t_expand_tokens) * 1000,
+            (t_postprocess - t_tokenize) * 1000,
             (t_postprocess - t_start) * 1000,
         )
 
