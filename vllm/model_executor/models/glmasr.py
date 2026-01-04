@@ -485,12 +485,24 @@ class GlmAsrForConditionalGeneration(
 
         # GLM-ASR merges consecutive frames: 4 frames with hidden_size=1280
         # -> 1 frame with intermediate_size=5120
-        # Following HuggingFace reference: directly reshape to intermediate_size
-        # The reshape automatically handles the frame merging
+        # merge_ratio = intermediate_size / hidden_size = 5120 / 1280 = 4
+        hidden_size = self.config.audio_config.hidden_size
+        intermediate_size = self.config.audio_config.intermediate_size
+        merge_ratio = intermediate_size // hidden_size  # Typically 4
+
+        # Truncate sequence length to be divisible by merge_ratio
+        # This handles variable-length audio where seq_len may not be divisible
+        seq_len = audio_hidden_states.shape[1]
+        seq_len_truncated = (seq_len // merge_ratio) * merge_ratio
+        if seq_len_truncated < seq_len:
+            audio_hidden_states = audio_hidden_states[:, :seq_len_truncated, :]
+
+        # Reshape to merge consecutive frames: [batch, seq_len, hidden_size]
+        # -> [batch, seq_len/4, intermediate_size]
         audio_hidden_states = audio_hidden_states.reshape(
             num_chunks,
             -1,
-            self.config.audio_config.intermediate_size,
+            intermediate_size,
         )
 
         audio_features = self.multi_modal_projector(audio_hidden_states)
