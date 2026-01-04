@@ -2149,6 +2149,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             tokenization_kwargs=tokenization_kwargs,
             mm_uuids=mm_uuids,
         )
+        torch.cuda.synchronize()
         t_hf_processor = time.perf_counter()
 
         # NOTE: tokenization_kwargs are not required to init processor

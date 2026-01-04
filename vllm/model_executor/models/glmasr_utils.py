@@ -715,9 +715,11 @@ class GlmAsrEncoder(nn.Module):
         # Apply convolutional layers with GELU activation
         t_conv1_start = time.perf_counter()
         hidden_states = torch.nn.functional.gelu(self.conv1(input_features))
+        torch.cuda.synchronize()
         t_conv1 = time.perf_counter()
 
         hidden_states = torch.nn.functional.gelu(self.conv2(hidden_states))
+        torch.cuda.synchronize()
         t_conv2 = time.perf_counter()
 
         # Transpose to [batch_size, seq_len, hidden_size]
@@ -729,16 +731,19 @@ class GlmAsrEncoder(nn.Module):
 
         # Get position embeddings - uses pre-computed cache
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        torch.cuda.synchronize()
         t_rope = time.perf_counter()
 
         # Apply transformer layers
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(hidden_states, position_embeddings)
 
+        torch.cuda.synchronize()
         t_layers = time.perf_counter()
 
         # Final layer norm
         hidden_states = self.norm(hidden_states)
+        torch.cuda.synchronize()
         t_norm = time.perf_counter()
 
         # Log profiling info
@@ -750,7 +755,7 @@ class GlmAsrEncoder(nn.Module):
         norm_time = (t_norm - t_layers) * 1000
 
         logger.warning(
-            "[GlmAsrEncoder] "
+            "[Encoder] "
             "batch=%d, seq_len=%d->%d | "
             "conv1=%.3fms, conv2=%.3fms, rope=%.3fms, "
             "layers=%.3fms, norm=%.3fms | "

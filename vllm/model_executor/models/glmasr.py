@@ -671,7 +671,7 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
         num_chunks = len(flat_chunks)
 
         logger.warning(
-            "[GlmAsrProcessor GPU] "
+            "[Processor] "
             "audio=%.2fs, chunks=%d, device=%s | "
             "normalize=%.3fms, get_processor=%.3fms, "
             "chunking=%.3fms, feature_extract=%.3fms, "
@@ -850,10 +850,12 @@ class GlmAsrForConditionalGeneration(
 
         # Convert input_features to model dtype (e.g., bfloat16) to match model weights
         input_features = input_features.to(dtype=self.audio_tower.conv1.weight.dtype)
+        torch.cuda.synchronize()
         t_prepare = time.perf_counter()
 
         # audio_tower returns [batch_size, seq_len, hidden_size] where hidden_size=1280
         audio_hidden_states = self.audio_tower(input_features).last_hidden_state
+        torch.cuda.synchronize()
         t_encoder = time.perf_counter()
 
         # GLM-ASR merges consecutive frames: 4 frames with hidden_size=1280
@@ -874,9 +876,11 @@ class GlmAsrForConditionalGeneration(
             -1,
             intermediate_size,
         )
+        torch.cuda.synchronize()
         t_reshape = time.perf_counter()
 
         audio_features = self.multi_modal_projector(audio_hidden_states)
+        torch.cuda.synchronize()
         t_projector = time.perf_counter()
 
         merge_factor = getattr(self.config, "merge_factor", DEFAULT_MERGE_FACTOR)
@@ -900,7 +904,7 @@ class GlmAsrForConditionalGeneration(
         t_postprocess = time.perf_counter()
 
         logger.warning(
-            "[GlmAsrModel Audio Processing] "
+            "[AudioProcessing] "
             "chunks=%d, seq_len=%d->%d | "
             "prepare=%.3fms, encoder=%.3fms, reshape=%.3fms, "
             "projector=%.3fms, postprocess=%.3fms | TOTAL=%.3fms",
@@ -929,10 +933,11 @@ class GlmAsrForConditionalGeneration(
         t_parse = time.perf_counter()
 
         masked_audio_features = self._process_audio_input(audio_input)
+        torch.cuda.synchronize()
         t_process = time.perf_counter()
 
         logger.warning(
-            "[GlmAsrModel embed_multimodal] "
+            "[EmbedMultimodal] <<<EngineCore Entry>>> "
             "parse=%.3fms, process=%.3fms | TOTAL=%.3fms",
             (t_parse - t_start) * 1000,
             (t_process - t_parse) * 1000,
