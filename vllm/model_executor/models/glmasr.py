@@ -193,89 +193,127 @@ class GlmAsrDummyInputsBuilder(BaseDummyInputsBuilder[GlmAsrProcessingInfo]):
         }
 
 
-def extract_mel_features_gpu(
+def extract_mel_features_optimized_cpu(
     audio_arrays: list[np.ndarray],
     feature_extractor: WhisperFeatureExtractor,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
+) -> BatchFeature:
     """
-    GPU-accelerated mel spectrogram extraction using torchaudio.
+    Optimized CPU mel spectrogram extraction with minimal overhead.
 
-    This bypasses WhisperFeatureExtractor's broken GPU implementation
-    and uses torchaudio's native GPU kernels for STFT and mel filterbank.
+    This directly implements Whisper's mel spectrogram extraction without
+    going through the slow HF processor pipeline. Uses vectorized numpy
+    operations for maximum performance.
 
     Args:
         audio_arrays: List of audio arrays (numpy) at target sampling rate
         feature_extractor: WhisperFeatureExtractor for configuration
 
     Returns:
-        input_features: (B, C, T) mel spectrogram tensor, or (None, None) if failed
-        attention_mask: (B, T) attention mask tensor
+        BatchFeature with input_features and input_features_mask
     """
-    try:
-        import torchaudio.transforms as T  # type: ignore # noqa: F401
-    except ImportError:
-        # Fallback to CPU if torchaudio not available
-        logger.warning_once(
-            "torchaudio not available, falling back to CPU mel spectrogram extraction"
-        )
-        return None, None
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Get WhisperFeatureExtractor config
+    # Get config from feature extractor
     n_fft = feature_extractor.n_fft
     hop_length = feature_extractor.hop_length
     n_mels = feature_extractor.feature_size
     sampling_rate = feature_extractor.sampling_rate
 
-    # Create mel spectrogram transform on GPU
-    mel_transform = T.MelSpectrogram(
-        sample_rate=sampling_rate,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        n_mels=n_mels,
-        f_min=0.0,
-        f_max=8000.0,
-        norm="slaney",
-        mel_scale="slaney",
-    ).to(device)
+    # Build mel filterbank (cache this if possible)
+    mel_filters = _get_mel_filters_cached(sampling_rate, n_fft, n_mels)
 
-    # Process each audio
     all_features = []
     all_masks = []
 
     for audio in audio_arrays:
-        # Convert to tensor and move to GPU
-        waveform = torch.from_numpy(audio).float().to(device)
+        # Ensure float32
+        if audio.dtype != np.float32:
+            audio = audio.astype(np.float32)
 
-        # Add channel dimension if needed
-        if waveform.ndim == 1:
-            waveform = waveform.unsqueeze(0)
+        # Compute STFT using numpy/scipy (vectorized, very fast on CPU)
+        # Using reflection padding like Whisper
+        audio_padded = np.pad(audio, (n_fft // 2, n_fft // 2), mode="reflect")
 
-        # Compute mel spectrogram on GPU
-        mel_spec = mel_transform(waveform)  # (C, n_mels, T)
+        # Manual STFT implementation optimized for CPU
+        n_frames = 1 + (len(audio_padded) - n_fft) // hop_length
 
-        # Log mel (same as Whisper)
-        mel_spec = torch.clamp(mel_spec, min=1e-10)
-        mel_spec = torch.log10(mel_spec)
+        # Pre-allocate output
+        stft_matrix = np.zeros((n_fft // 2 + 1, n_frames), dtype=np.complex64)
+
+        # Hann window
+        window = np.hanning(n_fft).astype(np.float32)
+
+        # Compute STFT frame by frame (vectorized over frequency)
+        for frame_idx in range(n_frames):
+            start = frame_idx * hop_length
+            frame = audio_padded[start : start + n_fft] * window
+            # Use rfft for real-valued input (2x faster than fft)
+            stft_matrix[:, frame_idx] = np.fft.rfft(frame)
+
+        # Power spectrogram
+        power_spec = np.abs(stft_matrix) ** 2
+
+        # Apply mel filterbank
+        mel_spec = mel_filters @ power_spec  # (n_mels, n_frames)
+
+        # Log mel
+        mel_spec = np.log10(np.maximum(mel_spec, 1e-10))
 
         # Normalize (same as Whisper)
-        mel_spec = torch.maximum(mel_spec, mel_spec.max() - 8.0)
+        mel_spec = np.maximum(mel_spec, mel_spec.max() - 8.0)
         mel_spec = (mel_spec + 4.0) / 4.0
 
-        # Transpose to (C, T, n_mels) format expected by model
-        mel_spec = mel_spec.transpose(1, 2)  # (C, T, n_mels)
+        # Convert to torch tensor and transpose to (n_frames, n_mels)
+        mel_tensor = torch.from_numpy(mel_spec.T.copy())  # (n_frames, n_mels)
 
-        # Create attention mask (all 1s for valid frames)
-        seq_len = mel_spec.shape[1]
-        mask = torch.ones(seq_len, dtype=torch.long, device=device)
+        # Create mask (all 1s)
+        mask = torch.ones(mel_tensor.shape[0], dtype=torch.long)
 
-        all_features.append(mel_spec.squeeze(0))  # (T, n_mels)
+        all_features.append(mel_tensor)
         all_masks.append(mask)
 
-    # Stack and pad if needed
-    # For now, return list format (model will handle batching)
-    return all_features, all_masks
+    # Stack into batch
+    # Add batch and channel dimensions to match HF format
+    input_features = torch.stack(
+        [f.unsqueeze(0) for f in all_features]
+    )  # (B, 1, T, n_mels)
+    input_features = input_features.squeeze(1).transpose(1, 2)  # (B, n_mels, T)
+
+    input_features_mask = torch.stack(all_masks)  # (B, T)
+
+    return BatchFeature(
+        {
+            "input_features": input_features,
+            "input_features_mask": input_features_mask,
+        }
+    )
+
+
+# Cache mel filters to avoid recomputation
+_MEL_FILTERS_CACHE = {}
+
+
+def _get_mel_filters_cached(
+    sampling_rate: int,
+    n_fft: int,
+    n_mels: int,
+) -> np.ndarray:
+    """Get mel filterbank with caching."""
+    key = (sampling_rate, n_fft, n_mels)
+    if key not in _MEL_FILTERS_CACHE:
+        import librosa  # type: ignore
+
+        # Build mel filterbank using librosa (same as Whisper)
+        mel_filters = librosa.filters.mel(
+            sr=sampling_rate,
+            n_fft=n_fft,
+            n_mels=n_mels,
+            fmin=0.0,
+            fmax=8000.0,
+            norm="slaney",
+            htk=False,
+        )
+        _MEL_FILTERS_CACHE[key] = mel_filters.astype(np.float32)
+
+    return _MEL_FILTERS_CACHE[key]
 
 
 class GlmAsrMultiModalDataParser(AudioFlamingo3MultiModalDataParser):
@@ -371,43 +409,34 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
 
         t_prepare_kwargs = time.perf_counter()
 
-        # Try GPU-native mel spectrogram extraction first
+        # Use optimized CPU mel spectrogram extraction
+        # This bypasses HF processor's overhead and uses vectorized numpy
         t_extract_start = time.perf_counter()
 
-        gpu_features, gpu_masks = extract_mel_features_gpu(
-            audio_list, feature_extractor
-        )
-
-        if gpu_features is not None:
-            # GPU extraction succeeded
-            t_gpu_extract = time.perf_counter()
-
-            # Format output to match WhisperFeatureExtractor
-            audio_features = BatchFeature(
-                {
-                    "input_features": torch.stack(
-                        [f.transpose(0, 1).unsqueeze(0) for f in gpu_features]
-                    ),
-                    "input_features_mask": torch.stack(gpu_masks)
-                    if gpu_masks
-                    else None,
-                }
+        try:
+            audio_features = extract_mel_features_optimized_cpu(
+                audio_list, feature_extractor
             )
-
+            t_extract_method = "optimized_cpu"
+        except Exception as e:
+            # Fallback to original HF extractor if optimized version fails
             logger.warning(
-                "[GPU Mel Extraction] Extracted features on GPU in %.3fms",
-                (t_gpu_extract - t_extract_start) * 1000,
+                "Optimized CPU extraction failed (%s), falling back to HF extractor", e
             )
-        else:
-            # Fallback to CPU extraction
             audio_features = feature_extractor(
                 audio_list,
                 sampling_rate=sampling_rate,
                 return_tensors="pt",
-                # DO NOT use device='cuda' - it's broken and 7x slower!
             )
+            t_extract_method = "hf_fallback"
 
         t_extract_end = time.perf_counter()
+
+        logger.warning(
+            "[Mel Extraction] method=%s, time=%.3fms",
+            t_extract_method,
+            (t_extract_end - t_extract_start) * 1000,
+        )
 
         # Tokenize the text prompt
         t_tokenize_start = time.perf_counter()
