@@ -193,6 +193,125 @@ class GlmAsrDummyInputsBuilder(BaseDummyInputsBuilder[GlmAsrProcessingInfo]):
         }
 
 
+# Cache for GPU mel spectrogram transform and mel filters
+_GPU_MEL_TRANSFORM_CACHE: dict[tuple, Any] = {}
+_MEL_FILTERS_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def _get_gpu_mel_transform(
+    sampling_rate: int,
+    n_fft: int,
+    hop_length: int,
+    n_mels: int,
+    device: torch.device,
+) -> Any:
+    """Get cached GPU mel spectrogram transform."""
+    key = (sampling_rate, n_fft, hop_length, n_mels, str(device))
+    if key not in _GPU_MEL_TRANSFORM_CACHE:
+        import torchaudio.transforms as T  # type: ignore
+
+        transform = T.MelSpectrogram(
+            sample_rate=sampling_rate,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=n_mels,
+            f_min=0.0,
+            f_max=8000.0,
+            norm="slaney",
+            mel_scale="slaney",
+        ).to(device)
+
+        # Warmup CUDA kernel with dummy data
+        dummy = torch.randn(1, 16000, device=device)
+        _ = transform(dummy)
+        torch.cuda.synchronize()
+
+        _GPU_MEL_TRANSFORM_CACHE[key] = transform
+        logger.info("Created and warmed up GPU MelSpectrogram transform")
+
+    return _GPU_MEL_TRANSFORM_CACHE[key]
+
+
+def extract_mel_features_gpu(
+    audio_arrays: list[np.ndarray],
+    feature_extractor: WhisperFeatureExtractor,
+) -> BatchFeature:
+    """
+    GPU-accelerated mel spectrogram extraction using torchaudio.
+
+    Uses cached MelSpectrogram transform to avoid repeated kernel compilation.
+    Pre-warms CUDA kernels on first call for consistent performance.
+
+    Args:
+        audio_arrays: List of audio arrays (numpy) at target sampling rate
+        feature_extractor: WhisperFeatureExtractor for configuration
+
+    Returns:
+        BatchFeature with input_features and input_features_mask
+    """
+    device = torch.device("cuda")
+
+    # Get config from feature extractor
+    n_fft = feature_extractor.n_fft
+    hop_length = feature_extractor.hop_length
+    n_mels = feature_extractor.feature_size
+    sampling_rate = feature_extractor.sampling_rate
+
+    # Get cached transform (creates and warms up on first call)
+    mel_transform = _get_gpu_mel_transform(
+        sampling_rate, n_fft, hop_length, n_mels, device
+    )
+
+    all_features = []
+    all_masks = []
+
+    for audio in audio_arrays:
+        # Convert to tensor and move to GPU in one step
+        if isinstance(audio, np.ndarray):
+            waveform = torch.from_numpy(audio).float()
+        else:
+            waveform = torch.tensor(audio, dtype=torch.float32)
+
+        # Pin memory for faster CPU->GPU transfer
+        waveform = waveform.pin_memory().to(device, non_blocking=True)
+
+        # Add batch dimension
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+
+        # Compute mel spectrogram on GPU (kernel already warmed up)
+        mel_spec = mel_transform(waveform)  # (1, n_mels, T)
+
+        # Log mel (same as Whisper) - all on GPU
+        mel_spec = torch.clamp(mel_spec, min=1e-10)
+        mel_spec = torch.log10(mel_spec)
+
+        # Normalize
+        mel_spec = torch.maximum(mel_spec, mel_spec.max() - 8.0)
+        mel_spec = (mel_spec + 4.0) / 4.0
+
+        # Create mask
+        seq_len = mel_spec.shape[-1]
+        mask = torch.ones(seq_len, dtype=torch.long, device=device)
+
+        all_features.append(mel_spec.squeeze(0))  # (n_mels, T)
+        all_masks.append(mask)
+
+    # Synchronize before returning
+    torch.cuda.synchronize()
+
+    # Stack into batch
+    input_features = torch.stack(all_features)  # (B, n_mels, T)
+    input_features_mask = torch.stack(all_masks)  # (B, T)
+
+    return BatchFeature(
+        {
+            "input_features": input_features,
+            "input_features_mask": input_features_mask,
+        }
+    )
+
+
 def extract_mel_features_optimized_cpu(
     audio_arrays: list[np.ndarray],
     feature_extractor: WhisperFeatureExtractor,
@@ -283,10 +402,6 @@ def extract_mel_features_optimized_cpu(
             "input_features_mask": input_features_mask,
         }
     )
-
-
-# Cache mel filters to avoid recomputation
-_MEL_FILTERS_CACHE = {}
 
 
 def _get_mel_filters_cached(
@@ -407,26 +522,31 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
 
         t_prepare_kwargs = time.perf_counter()
 
-        # Use optimized CPU mel spectrogram extraction
-        # This bypasses HF processor's overhead and uses vectorized numpy
+        # Try GPU mel extraction first (with cached transform + warmup)
+        # Falls back to CPU if GPU fails
         t_extract_start = time.perf_counter()
+        t_extract_method = "unknown"
 
         try:
-            audio_features = extract_mel_features_optimized_cpu(
-                audio_list, feature_extractor
-            )
-            t_extract_method = "optimized_cpu"
+            # Check if torchaudio is available and CUDA is ready
+            import torchaudio  # type: ignore # noqa: F401
+
+            if torch.cuda.is_available():
+                audio_features = extract_mel_features_gpu(audio_list, feature_extractor)
+                t_extract_method = "gpu_torchaudio"
+            else:
+                raise RuntimeError("CUDA not available")
         except Exception as e:
-            # Fallback to original HF extractor if optimized version fails
-            logger.warning(
-                "Optimized CPU extraction failed (%s), falling back to HF extractor", e
+            # Fallback to HF extractor (proven to be 266ms)
+            logger.warning_once(
+                "GPU extraction unavailable (%s), using HF extractor", e
             )
             audio_features = feature_extractor(
                 audio_list,
                 sampling_rate=sampling_rate,
                 return_tensors="pt",
             )
-            t_extract_method = "hf_fallback"
+            t_extract_method = "hf_cpu"
 
         t_extract_end = time.perf_counter()
 
