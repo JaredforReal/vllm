@@ -256,6 +256,15 @@ class GlmAsrMultiModalProcessor(AudioFlamingo3MultiModalProcessor):
         # WhisperFeatureExtractor supports device parameter for STFT computation
         mm_kwargs = dict(**mm_kwargs, device="cuda")
 
+        # DEBUG: Log to verify device parameter is being passed
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            "GlmAsrMultiModalProcessor: mm_kwargs includes device=%s",
+            mm_kwargs.get("device"),
+        )
+
         # Call parent method (it will handle sampling_rate)
         outputs = super()._call_hf_processor(
             prompt=prompt,
