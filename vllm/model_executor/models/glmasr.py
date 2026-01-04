@@ -273,22 +273,86 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
 
         t_get_processor = time.perf_counter()
 
-        # Use the full GlmAsrProcessor to handle audio chunking properly
-        # GlmAsrProcessor internally handles:
-        # 1. Audio chunking into 30-second windows
-        # 2. Feature extraction with WhisperFeatureExtractor
-        # 3. Proper attention mask generation
-        t_extract_start = time.perf_counter()
+        # Manually decompose processor call for detailed profiling
+        tokenizer = processor.tokenizer
+        feature_extractor = processor.feature_extractor
 
-        outputs = processor(
-            text=prompt,
-            audio=audio_list,
+        # Step 1: Tokenize text
+        t_tokenize_start = time.perf_counter()
+        text_inputs = tokenizer(
+            prompt,
             return_tensors="pt",
             padding=True,
             **mm_kwargs,
         )
+        t_tokenize_end = time.perf_counter()
 
-        t_extract_end = time.perf_counter()
+        # Step 2: Audio feature extraction with chunking
+        # GlmAsrProcessor internally handles:
+        # - Audio chunking into 30-second windows
+        # - Feature extraction with WhisperFeatureExtractor
+        # - Proper attention mask generation
+        t_audio_start = time.perf_counter()
+
+        # Extract audio features using processor's method
+        # This includes chunking logic from GlmAsrProcessor
+        max_audio_len = getattr(processor, "max_audio_len", DEFAULT_MAX_AUDIO_LEN_S)
+        sampling_rate = feature_extractor.sampling_rate
+        chunk_length = feature_extractor.chunk_length
+
+        # Process each audio file
+        all_input_features = []
+        all_feature_masks = []
+
+        t_chunk_start = time.perf_counter()
+        all_chunks = []
+        for audio in audio_list:
+            # Chunk audio if needed
+            if isinstance(audio, list):
+                audio = np.array(audio)
+
+            n_samples = len(audio)
+            chunk_size = int(sampling_rate * chunk_length)
+            max_samples = int(sampling_rate * max_audio_len)
+
+            # Split into chunks
+            chunks = []
+            for i in range(0, min(n_samples, max_samples), chunk_size):
+                chunk = audio[i : i + chunk_size]
+                if len(chunk) > 0:
+                    chunks.append(chunk)
+
+            if not chunks:
+                chunks = [audio[:chunk_size]]
+
+            all_chunks.extend(chunks)
+        t_chunk_end = time.perf_counter()
+
+        # Extract features for all chunks
+        t_feature_extract_start = time.perf_counter()
+        for chunk in all_chunks:
+            features = feature_extractor(
+                chunk,
+                sampling_rate=sampling_rate,
+                return_tensors="pt",
+                padding=True,
+                return_attention_mask=True,
+            )
+            all_input_features.append(features["input_features"])
+            if "attention_mask" in features:
+                all_feature_masks.append(features["attention_mask"])
+        t_feature_extract_end = time.perf_counter()
+
+        t_audio_end = time.perf_counter()
+
+        # Step 3: Concatenate and prepare outputs
+        t_concat_start = time.perf_counter()
+        outputs = BatchFeature(text_inputs)
+        if all_input_features:
+            outputs["input_features"] = torch.cat(all_input_features, dim=0)
+        if all_feature_masks:
+            outputs["feature_attention_mask"] = torch.cat(all_feature_masks, dim=0)
+        t_concat_end = time.perf_counter()
 
         # Rename mask keys for consistency
         if "input_features_mask" in outputs:
@@ -310,15 +374,20 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
 
         t_postprocess = time.perf_counter()
 
-        # Log detailed timing breakdown
+        # Log detailed timing breakdown with sub-steps
         logger.warning(
             "[GlmAsrProcessor Profiling] "
             "normalize=%.3fms, get_processor=%.3fms, "
-            "processor_call=%.3fms, postprocess=%.3fms, TOTAL=%.3fms",
+            "tokenize=%.3fms, audio_chunk=%.3fms, feature_extract=%.3fms, "
+            "audio_total=%.3fms, concat=%.3fms, postprocess=%.3fms, TOTAL=%.3fms",
             (t_normalize - t_start) * 1000,
             (t_get_processor - t_normalize) * 1000,
-            (t_extract_end - t_extract_start) * 1000,
-            (t_postprocess - t_extract_end) * 1000,
+            (t_tokenize_end - t_tokenize_start) * 1000,
+            (t_chunk_end - t_chunk_start) * 1000,
+            (t_feature_extract_end - t_feature_extract_start) * 1000,
+            (t_audio_end - t_audio_start) * 1000,
+            (t_concat_end - t_concat_start) * 1000,
+            (t_postprocess - t_concat_end) * 1000,
             (t_postprocess - t_start) * 1000,
         )
 
