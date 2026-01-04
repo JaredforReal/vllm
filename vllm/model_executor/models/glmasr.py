@@ -193,6 +193,91 @@ class GlmAsrDummyInputsBuilder(BaseDummyInputsBuilder[GlmAsrProcessingInfo]):
         }
 
 
+def extract_mel_features_gpu(
+    audio_arrays: list[np.ndarray],
+    feature_extractor: WhisperFeatureExtractor,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
+    """
+    GPU-accelerated mel spectrogram extraction using torchaudio.
+
+    This bypasses WhisperFeatureExtractor's broken GPU implementation
+    and uses torchaudio's native GPU kernels for STFT and mel filterbank.
+
+    Args:
+        audio_arrays: List of audio arrays (numpy) at target sampling rate
+        feature_extractor: WhisperFeatureExtractor for configuration
+
+    Returns:
+        input_features: (B, C, T) mel spectrogram tensor, or (None, None) if failed
+        attention_mask: (B, T) attention mask tensor
+    """
+    try:
+        import torchaudio.transforms as T  # type: ignore # noqa: F401
+    except ImportError:
+        # Fallback to CPU if torchaudio not available
+        logger.warning_once(
+            "torchaudio not available, falling back to CPU mel spectrogram extraction"
+        )
+        return None, None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Get WhisperFeatureExtractor config
+    n_fft = feature_extractor.n_fft
+    hop_length = feature_extractor.hop_length
+    n_mels = feature_extractor.feature_size
+    sampling_rate = feature_extractor.sampling_rate
+
+    # Create mel spectrogram transform on GPU
+    mel_transform = T.MelSpectrogram(
+        sample_rate=sampling_rate,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        n_mels=n_mels,
+        f_min=0.0,
+        f_max=8000.0,
+        norm="slaney",
+        mel_scale="slaney",
+    ).to(device)
+
+    # Process each audio
+    all_features = []
+    all_masks = []
+
+    for audio in audio_arrays:
+        # Convert to tensor and move to GPU
+        waveform = torch.from_numpy(audio).float().to(device)
+
+        # Add channel dimension if needed
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+
+        # Compute mel spectrogram on GPU
+        mel_spec = mel_transform(waveform)  # (C, n_mels, T)
+
+        # Log mel (same as Whisper)
+        mel_spec = torch.clamp(mel_spec, min=1e-10)
+        mel_spec = torch.log10(mel_spec)
+
+        # Normalize (same as Whisper)
+        mel_spec = torch.maximum(mel_spec, mel_spec.max() - 8.0)
+        mel_spec = (mel_spec + 4.0) / 4.0
+
+        # Transpose to (C, T, n_mels) format expected by model
+        mel_spec = mel_spec.transpose(1, 2)  # (C, T, n_mels)
+
+        # Create attention mask (all 1s for valid frames)
+        seq_len = mel_spec.shape[1]
+        mask = torch.ones(seq_len, dtype=torch.long, device=device)
+
+        all_features.append(mel_spec.squeeze(0))  # (T, n_mels)
+        all_masks.append(mask)
+
+    # Stack and pad if needed
+    # For now, return list format (model will handle batching)
+    return all_features, all_masks
+
+
 class GlmAsrMultiModalDataParser(AudioFlamingo3MultiModalDataParser):
     def _parse_audio_data(
         self,
@@ -286,22 +371,41 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
 
         t_prepare_kwargs = time.perf_counter()
 
-        # Bypass HF processor and call components directly for fine-grained profiling
-        # This allows us to identify if the bottleneck is in:
-        # 1. Audio feature extraction (mel spectrogram)
-        # 2. Tokenization
-        # 3. Data preparation/chunking
-
+        # Try GPU-native mel spectrogram extraction first
         t_extract_start = time.perf_counter()
 
-        # Extract audio features using WhisperFeatureExtractor
-        # The device parameter enables GPU-accelerated STFT/mel spectrogram
-        audio_features = feature_extractor(
-            audio_list,
-            sampling_rate=sampling_rate,
-            return_tensors="pt",
-            **audio_kwargs,
+        gpu_features, gpu_masks = extract_mel_features_gpu(
+            audio_list, feature_extractor
         )
+
+        if gpu_features is not None:
+            # GPU extraction succeeded
+            t_gpu_extract = time.perf_counter()
+
+            # Format output to match WhisperFeatureExtractor
+            audio_features = BatchFeature(
+                {
+                    "input_features": torch.stack(
+                        [f.transpose(0, 1).unsqueeze(0) for f in gpu_features]
+                    ),
+                    "input_features_mask": torch.stack(gpu_masks)
+                    if gpu_masks
+                    else None,
+                }
+            )
+
+            logger.warning(
+                "[GPU Mel Extraction] Extracted features on GPU in %.3fms",
+                (t_gpu_extract - t_extract_start) * 1000,
+            )
+        else:
+            # Fallback to CPU extraction
+            audio_features = feature_extractor(
+                audio_list,
+                sampling_rate=sampling_rate,
+                return_tensors="pt",
+                # DO NOT use device='cuda' - it's broken and 7x slower!
+            )
 
         t_extract_end = time.perf_counter()
 
