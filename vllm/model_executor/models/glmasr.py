@@ -198,11 +198,10 @@ def extract_mel_features_optimized_cpu(
     feature_extractor: WhisperFeatureExtractor,
 ) -> BatchFeature:
     """
-    Optimized CPU mel spectrogram extraction with minimal overhead.
+    Optimized CPU mel spectrogram extraction using scipy's vectorized STFT.
 
-    This directly implements Whisper's mel spectrogram extraction without
-    going through the slow HF processor pipeline. Uses vectorized numpy
-    operations for maximum performance.
+    This uses scipy.signal.stft which is implemented in C and much faster
+    than Python loops. Typically 5-10x faster than a naive Python implementation.
 
     Args:
         audio_arrays: List of audio arrays (numpy) at target sampling rate
@@ -211,13 +210,15 @@ def extract_mel_features_optimized_cpu(
     Returns:
         BatchFeature with input_features and input_features_mask
     """
+    from scipy.signal import stft  # type: ignore
+
     # Get config from feature extractor
     n_fft = feature_extractor.n_fft
     hop_length = feature_extractor.hop_length
     n_mels = feature_extractor.feature_size
     sampling_rate = feature_extractor.sampling_rate
 
-    # Build mel filterbank (cache this if possible)
+    # Build mel filterbank (cached)
     mel_filters = _get_mel_filters_cached(sampling_rate, n_fft, n_mels)
 
     all_features = []
@@ -228,30 +229,26 @@ def extract_mel_features_optimized_cpu(
         if audio.dtype != np.float32:
             audio = audio.astype(np.float32)
 
-        # Compute STFT using numpy/scipy (vectorized, very fast on CPU)
-        # Using reflection padding like Whisper
+        # Pad audio like Whisper does
         audio_padded = np.pad(audio, (n_fft // 2, n_fft // 2), mode="reflect")
 
-        # Manual STFT implementation optimized for CPU
-        n_frames = 1 + (len(audio_padded) - n_fft) // hop_length
-
-        # Pre-allocate output
-        stft_matrix = np.zeros((n_fft // 2 + 1, n_frames), dtype=np.complex64)
-
-        # Hann window
-        window = np.hanning(n_fft).astype(np.float32)
-
-        # Compute STFT frame by frame (vectorized over frequency)
-        for frame_idx in range(n_frames):
-            start = frame_idx * hop_length
-            frame = audio_padded[start : start + n_fft] * window
-            # Use rfft for real-valued input (2x faster than fft)
-            stft_matrix[:, frame_idx] = np.fft.rfft(frame)
+        # Use scipy's optimized STFT (C implementation, very fast)
+        _, _, stft_matrix = stft(
+            audio_padded,
+            fs=sampling_rate,
+            window="hann",
+            nperseg=n_fft,
+            noverlap=n_fft - hop_length,
+            nfft=n_fft,
+            boundary=None,  # We already padded
+            padded=False,
+        )
+        # stft_matrix shape: (n_fft//2 + 1, n_frames)
 
         # Power spectrogram
         power_spec = np.abs(stft_matrix) ** 2
 
-        # Apply mel filterbank
+        # Apply mel filterbank (matrix multiply, very fast)
         mel_spec = mel_filters @ power_spec  # (n_mels, n_frames)
 
         # Log mel
@@ -261,8 +258,10 @@ def extract_mel_features_optimized_cpu(
         mel_spec = np.maximum(mel_spec, mel_spec.max() - 8.0)
         mel_spec = (mel_spec + 4.0) / 4.0
 
-        # Convert to torch tensor and transpose to (n_frames, n_mels)
-        mel_tensor = torch.from_numpy(mel_spec.T.copy())  # (n_frames, n_mels)
+        # Convert to torch tensor
+        mel_tensor = torch.from_numpy(
+            mel_spec.T.astype(np.float32)
+        )  # (n_frames, n_mels)
 
         # Create mask (all 1s)
         mask = torch.ones(mel_tensor.shape[0], dtype=torch.long)
@@ -270,8 +269,7 @@ def extract_mel_features_optimized_cpu(
         all_features.append(mel_tensor)
         all_masks.append(mask)
 
-    # Stack into batch
-    # Add batch and channel dimensions to match HF format
+    # Stack into batch format matching HF output
     input_features = torch.stack(
         [f.unsqueeze(0) for f in all_features]
     )  # (B, 1, T, n_mels)
