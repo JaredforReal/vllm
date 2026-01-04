@@ -252,6 +252,10 @@ class GlmAsrMultiModalProcessor(AudioFlamingo3MultiModalProcessor):
         # Get processor for chunk counts calculation
         processor = self.info.get_hf_processor(**mm_kwargs)
 
+        # Enable GPU-accelerated mel spectrogram extraction
+        # WhisperFeatureExtractor supports device parameter for STFT computation
+        mm_kwargs = dict(**mm_kwargs, device="cuda")
+
         # Call parent method (it will handle sampling_rate)
         outputs = super()._call_hf_processor(
             prompt=prompt,
