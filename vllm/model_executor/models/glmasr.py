@@ -480,9 +480,30 @@ class GlmAsrForConditionalGeneration(
         # Convert input_features to model dtype (e.g., bfloat16) to match model weights
         input_features = input_features.to(dtype=self.audio_tower.conv1.weight.dtype)
 
-        # audio_tower returns [batch_size, seq_len', hidden_size]
-        # where hidden_size = intermediate_size, so no reshape needed
+        # audio_tower returns [batch_size, seq_len, d_model] where d_model = 1280
         audio_hidden_states = self.audio_tower(input_features).last_hidden_state
+
+        # GLM-ASR merges consecutive frames: 4 frames with d_model=1280
+        # -> 1 frame with intermediate_size=5120
+        # This is done via reshape, so seq_len must be divisible by merge_ratio
+        d_model = self.config.audio_config.d_model
+        intermediate_size = self.config.audio_config.intermediate_size
+        merge_ratio = intermediate_size // d_model  # Typically 4
+
+        # Truncate sequence length to be divisible by merge_ratio
+        seq_len = audio_hidden_states.shape[1]
+        seq_len_truncated = (seq_len // merge_ratio) * merge_ratio
+        if seq_len_truncated < seq_len:
+            audio_hidden_states = audio_hidden_states[:, :seq_len_truncated, :]
+
+        # Reshape to merge consecutive frames: [batch, seq_len, d_model]
+        # -> [batch, seq_len/4, intermediate_size]
+        audio_hidden_states = audio_hidden_states.reshape(
+            num_chunks,
+            -1,
+            intermediate_size,
+        )
+
         audio_features = self.multi_modal_projector(audio_hidden_states)
 
         merge_factor = getattr(self.config, "merge_factor", DEFAULT_MERGE_FACTOR)
