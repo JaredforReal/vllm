@@ -286,14 +286,42 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
 
         t_prepare_kwargs = time.perf_counter()
 
-        # Call the HF processor directly (not through parent)
-        outputs = self.info.ctx.call_hf_processor(
-            processor,
-            dict(text=prompt, **mm_data),
-            dict(**mm_kwargs, **tok_kwargs),
+        # Bypass HF processor and call components directly for fine-grained profiling
+        # This allows us to identify if the bottleneck is in:
+        # 1. Audio feature extraction (mel spectrogram)
+        # 2. Tokenization
+        # 3. Data preparation/chunking
+
+        t_extract_start = time.perf_counter()
+
+        # Extract audio features using WhisperFeatureExtractor
+        # The device parameter enables GPU-accelerated STFT/mel spectrogram
+        audio_features = feature_extractor(
+            audio_list,
+            sampling_rate=sampling_rate,
+            return_tensors="pt",
+            **audio_kwargs,
         )
 
+        t_extract_end = time.perf_counter()
+
+        # Tokenize the text prompt
+        t_tokenize_start = time.perf_counter()
+        tokenizer = self.info.get_tokenizer()
+        tokenized = tokenizer(prompt, return_tensors="pt", **tok_kwargs)
+        t_tokenize_end = time.perf_counter()
+
+        # Merge outputs
+        outputs = BatchFeature({**audio_features, **tokenized})
+
         t_hf_processor = time.perf_counter()
+
+        # Log fine-grained timing
+        logger.warning(
+            "[HF Processor Internal] feature_extraction=%.3fms, tokenization=%.3fms",
+            (t_extract_end - t_extract_start) * 1000,
+            (t_tokenize_end - t_tokenize_start) * 1000,
+        )
 
         # Postprocess: rename mask and add chunk counts.
         if "input_features_mask" in outputs:
@@ -311,7 +339,7 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
         logger.warning(
             "[GlmAsrProcessor Profiling] "
             "normalize=%.3fms, get_processor=%.3fms, prepare_kwargs=%.3fms, "
-            "hf_processor=%.3fms, postprocess=%.3fms, TOTAL=%.3fms",
+            "[feature_extract+tokenize]=%.3fms, postprocess=%.3fms, TOTAL=%.3fms",
             (t_normalize - t_start) * 1000,
             (t_get_processor - t_normalize) * 1000,
             (t_prepare_kwargs - t_get_processor) * 1000,
