@@ -522,31 +522,16 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
 
         t_prepare_kwargs = time.perf_counter()
 
-        # Try GPU mel extraction first (with cached transform + warmup)
-        # Falls back to CPU if GPU fails
+        # Use HF WhisperFeatureExtractor on CPU (proven stable, ~266ms)
+        # Note: Custom GPU implementations have dtype compatibility issues
         t_extract_start = time.perf_counter()
-        t_extract_method = "unknown"
 
-        try:
-            # Check if torchaudio is available and CUDA is ready
-            import torchaudio  # type: ignore # noqa: F401
-
-            if torch.cuda.is_available():
-                audio_features = extract_mel_features_gpu(audio_list, feature_extractor)
-                t_extract_method = "gpu_torchaudio"
-            else:
-                raise RuntimeError("CUDA not available")
-        except Exception as e:
-            # Fallback to HF extractor (proven to be 266ms)
-            logger.warning_once(
-                "GPU extraction unavailable (%s), using HF extractor", e
-            )
-            audio_features = feature_extractor(
-                audio_list,
-                sampling_rate=sampling_rate,
-                return_tensors="pt",
-            )
-            t_extract_method = "hf_cpu"
+        audio_features = feature_extractor(
+            audio_list,
+            sampling_rate=sampling_rate,
+            return_tensors="pt",
+        )
+        t_extract_method = "hf_cpu"
 
         t_extract_end = time.perf_counter()
 
