@@ -480,12 +480,9 @@ class GlmAsrForConditionalGeneration(
         # Convert input_features to model dtype (e.g., bfloat16) to match model weights
         input_features = input_features.to(dtype=self.audio_tower.conv1.weight.dtype)
 
+        # audio_tower returns [batch_size, seq_len', hidden_size]
+        # where hidden_size = intermediate_size, so no reshape needed
         audio_hidden_states = self.audio_tower(input_features).last_hidden_state
-        audio_hidden_states = audio_hidden_states.reshape(
-            num_chunks,
-            -1,
-            self.config.audio_config.intermediate_size,
-        )
         audio_features = self.multi_modal_projector(audio_hidden_states)
 
         merge_factor = getattr(self.config, "merge_factor", DEFAULT_MERGE_FACTOR)
