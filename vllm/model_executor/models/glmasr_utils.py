@@ -732,11 +732,8 @@ class GlmAsrEncoder(nn.Module):
         t_rope = time.perf_counter()
 
         # Apply transformer layers
-        layer_times = []
         for encoder_layer in self.layers:
-            t_layer_start = time.perf_counter()
             hidden_states = encoder_layer(hidden_states, position_embeddings)
-            layer_times.append((time.perf_counter() - t_layer_start) * 1000)
 
         t_layers = time.perf_counter()
 
@@ -753,10 +750,10 @@ class GlmAsrEncoder(nn.Module):
         norm_time = (t_norm - t_layers) * 1000
 
         logger.warning(
-            "[GlmAsrEncoder Profiling] "
+            "[GlmAsrEncoder] "
             "batch=%d, seq_len=%d->%d | "
             "conv1=%.3fms, conv2=%.3fms, rope=%.3fms, "
-            "layers=%.3fms (avg=%.3fms), norm=%.3fms | "
+            "layers=%.3fms, norm=%.3fms | "
             "TOTAL=%.3fms",
             batch_size,
             seq_len,
@@ -765,7 +762,6 @@ class GlmAsrEncoder(nn.Module):
             conv2_time,
             rope_time,
             layers_time,
-            sum(layer_times) / len(layer_times) if layer_times else 0,
             norm_time,
             total_time,
         )

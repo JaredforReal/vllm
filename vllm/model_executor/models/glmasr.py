@@ -671,7 +671,7 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
         num_chunks = len(flat_chunks)
 
         logger.warning(
-            "[GlmAsrProcessor GPU Profiling] "
+            "[GlmAsrProcessor GPU] "
             "audio=%.2fs, chunks=%d, device=%s | "
             "normalize=%.3fms, get_processor=%.3fms, "
             "chunking=%.3fms, feature_extract=%.3fms, "
@@ -921,10 +921,24 @@ class GlmAsrForConditionalGeneration(
         return self.language_model
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        t_start = time.perf_counter()
+
         audio_input = self._parse_and_validate_audio_input(**kwargs)
         if audio_input is None:
             return []
+        t_parse = time.perf_counter()
+
         masked_audio_features = self._process_audio_input(audio_input)
+        t_process = time.perf_counter()
+
+        logger.warning(
+            "[GlmAsrModel embed_multimodal] "
+            "parse=%.3fms, process=%.3fms | TOTAL=%.3fms",
+            (t_parse - t_start) * 1000,
+            (t_process - t_parse) * 1000,
+            (t_process - t_start) * 1000,
+        )
+
         return masked_audio_features
 
     def forward(
