@@ -249,7 +249,7 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
     ) -> BatchFeature:
         """
         Call HF processor with detailed timing profiling.
-        Optimized for GPU-accelerated mel spectrogram extraction.
+        Uses the full GlmAsrProcessor to properly handle audio chunking.
         """
         t_start = time.perf_counter()
 
@@ -268,78 +268,41 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
 
         t_normalize = time.perf_counter()
 
-        # Get processor and feature extractor
+        # Get processor
         processor = self.info.get_hf_processor(**mm_kwargs)
-        feature_extractor = processor.feature_extractor
-        sampling_rate = feature_extractor.sampling_rate
 
         t_get_processor = time.perf_counter()
 
-        # Enable GPU-accelerated mel spectrogram extraction
-        # WhisperFeatureExtractor supports device parameter for STFT computation
-        audio_kwargs = mm_kwargs.get("audio_kwargs", {})
-        audio_kwargs = dict(**audio_kwargs, device="cuda")
-        mm_kwargs = dict(
-            **mm_kwargs,
-            audio_kwargs=audio_kwargs,
-            sampling_rate=sampling_rate,
-        )
-
-        t_prepare_kwargs = time.perf_counter()
-
-        # Bypass HF processor and call components directly for fine-grained profiling
-        # This allows us to identify if the bottleneck is in:
-        # 1. Audio feature extraction (mel spectrogram)
-        # 2. Tokenization
-        # 3. Data preparation/chunking
-
+        # Use the full GlmAsrProcessor to handle audio chunking properly
+        # GlmAsrProcessor internally handles:
+        # 1. Audio chunking into 30-second windows
+        # 2. Feature extraction with WhisperFeatureExtractor
+        # 3. Proper attention mask generation
         t_extract_start = time.perf_counter()
 
-        # Extract audio features using WhisperFeatureExtractor
-        # The device parameter enables GPU-accelerated STFT/mel spectrogram
-        # Enable padding and return_attention_mask to get feature_attention_mask
-        audio_features = feature_extractor(
-            audio_list,
-            sampling_rate=sampling_rate,
+        outputs = processor(
+            text=prompt,
+            audio=audio_list,
             return_tensors="pt",
             padding=True,
-            return_attention_mask=True,
-            **audio_kwargs,
+            **mm_kwargs,
         )
 
         t_extract_end = time.perf_counter()
 
-        # Rename audio attention_mask to feature_attention_mask BEFORE merging
-        # to avoid conflict with tokenizer's attention_mask
-        if "attention_mask" in audio_features:
-            audio_features["feature_attention_mask"] = audio_features.pop(
-                "attention_mask"
-            )
-        elif "input_features_mask" in audio_features:
-            audio_features["feature_attention_mask"] = audio_features.pop(
-                "input_features_mask"
-            )
-
-        # Tokenize the text prompt
-        t_tokenize_start = time.perf_counter()
-        tokenizer = self.info.get_tokenizer()
-        tokenized = tokenizer(prompt, return_tensors="pt", **tok_kwargs)
-        t_tokenize_end = time.perf_counter()
-
-        # Merge outputs (audio_features first, then tokenized)
-        # Note: tokenized may have its own attention_mask for text, which is separate
-        outputs = BatchFeature({**audio_features, **tokenized})
-
-        t_hf_processor = time.perf_counter()
-
-        # Log fine-grained timing
-        logger.warning(
-            "[HF Processor Internal] feature_extraction=%.3fms, tokenization=%.3fms",
-            (t_extract_end - t_extract_start) * 1000,
-            (t_tokenize_end - t_tokenize_start) * 1000,
-        )
+        # Rename mask keys for consistency
+        if "input_features_mask" in outputs:
+            outputs["feature_attention_mask"] = outputs.pop("input_features_mask")
+        elif "attention_mask" in outputs and "input_features" in outputs:
+            # Only rename if this is an audio attention mask
+            # (shape matches input_features)
+            attention_mask = outputs["attention_mask"]
+            input_features = outputs["input_features"]
+            if attention_mask.shape[0] == input_features.shape[0]:
+                outputs["feature_attention_mask"] = outputs.pop("attention_mask")
 
         # Calculate chunk counts with GLM-ASR specific logic
+        feature_extractor = processor.feature_extractor
         chunk_counts = self._calculate_chunk_counts(
             audio_list, feature_extractor, processor
         )
@@ -350,13 +313,12 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
         # Log detailed timing breakdown
         logger.warning(
             "[GlmAsrProcessor Profiling] "
-            "normalize=%.3fms, get_processor=%.3fms, prepare_kwargs=%.3fms, "
-            "[feature_extract+tokenize]=%.3fms, postprocess=%.3fms, TOTAL=%.3fms",
+            "normalize=%.3fms, get_processor=%.3fms, "
+            "processor_call=%.3fms, postprocess=%.3fms, TOTAL=%.3fms",
             (t_normalize - t_start) * 1000,
             (t_get_processor - t_normalize) * 1000,
-            (t_prepare_kwargs - t_get_processor) * 1000,
-            (t_hf_processor - t_prepare_kwargs) * 1000,
-            (t_postprocess - t_hf_processor) * 1000,
+            (t_extract_end - t_extract_start) * 1000,
+            (t_postprocess - t_extract_end) * 1000,
             (t_postprocess - t_start) * 1000,
         )
 
