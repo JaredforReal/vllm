@@ -2129,11 +2129,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         3. Extract information about the placeholder tokens from the
            processed token IDs.
         """
-        import time
-
-        t_start = time.perf_counter()
         mm_items = self._to_mm_items(mm_data)
-        t_to_mm_items = time.perf_counter()
 
         if tokenization_kwargs is None:
             tokenization_kwargs = {}
@@ -2149,8 +2145,6 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             tokenization_kwargs=tokenization_kwargs,
             mm_uuids=mm_uuids,
         )
-        torch.cuda.synchronize()
-        t_hf_processor = time.perf_counter()
 
         # NOTE: tokenization_kwargs are not required to init processor
         prompt_ids, mm_placeholders = self._maybe_apply_prompt_updates(
@@ -2160,26 +2154,11 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             mm_prompt_updates=mm_info.prompt_updates,
             is_update_applied=is_update_applied,
         )
-        t_prompt_updates = time.perf_counter()
 
         mm_placeholder_ranges = {
             modality: [item.to_range() for item in placeholders]
             for modality, placeholders in mm_placeholders.items()
         }
-        t_placeholder_ranges = time.perf_counter()
-
-        # Log profiling info
-        logger.warning(
-            "[MultiModalProcessor.apply] "
-            "to_mm_items=%.3fms, hf_processor=%.3fms, "
-            "prompt_updates=%.3fms, placeholder_ranges=%.3fms | "
-            "TOTAL=%.3fms",
-            (t_to_mm_items - t_start) * 1000,
-            (t_hf_processor - t_to_mm_items) * 1000,
-            (t_prompt_updates - t_hf_processor) * 1000,
-            (t_placeholder_ranges - t_prompt_updates) * 1000,
-            (t_placeholder_ranges - t_start) * 1000,
-        )
 
         return MultiModalInputs(
             type="multimodal",

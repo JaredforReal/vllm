@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
-import time
 from collections.abc import Iterable, Mapping, Sequence
 from functools import lru_cache
 from typing import Annotated, Any, Literal, TypeAlias, cast
@@ -214,8 +213,6 @@ class GPUWhisperFeatureExtractor:
                 f"Expected sampling_rate={self.sampling_rate}, got {sampling_rate}"
             )
 
-        t_start = time.perf_counter()
-
         device = torch.device(device) if device else self.device
         max_length = max_length or self.n_samples
 
@@ -240,10 +237,7 @@ class GPUWhisperFeatureExtractor:
         else:  # 'longest'
             target_length = min(max(lengths), max_length)
 
-        t_prepare = time.perf_counter()
-
-        # Create padded batch tensor directly on GPU
-        # NOTE: This allocates GPU memory but doesn't transfer data yet
+        # Create padded batch tensor
         padded_waveforms = torch.zeros(
             batch_size, target_length, dtype=torch.float32, device=device
         )
@@ -251,13 +245,9 @@ class GPUWhisperFeatureExtractor:
             batch_size, target_length, dtype=torch.int32, device=device
         )
 
-        t_alloc = time.perf_counter()
-
-        # CPU -> GPU transfer happens here (per waveform)
         for i, waveform in enumerate(raw_speech):
             if isinstance(waveform, np.ndarray):
                 waveform = torch.from_numpy(waveform)
-            # This is the actual CPU->GPU transfer!
             waveform = waveform.to(device=device, dtype=torch.float32)
 
             # Truncate if needed
@@ -265,18 +255,8 @@ class GPUWhisperFeatureExtractor:
             padded_waveforms[i, :actual_len] = waveform[:actual_len]
             attention_mask[i, :actual_len] = 1
 
-        # Synchronize to measure CPU->GPU transfer time accurately
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t_cpu_to_gpu = time.perf_counter()
-
         # Extract features on GPU
         input_features = self._extract_fbank_features(padded_waveforms)
-
-        # Synchronize to measure GPU compute time accurately
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t_gpu_compute = time.perf_counter()
 
         # Rescale attention mask from samples to frames
         # STFT produces L//hop_length + 1 frames, but we drop the last one
@@ -284,26 +264,6 @@ class GPUWhisperFeatureExtractor:
         # Trim to match actual frame count (we drop last frame in _extract)
         if attention_mask.shape[1] % self.hop_length != 0:
             frame_attention_mask = frame_attention_mask[:, :-1]
-
-        t_postprocess = time.perf_counter()
-
-        # Log detailed timing for GPU feature extractor
-        total_samples = sum(lengths)
-        logger.warning(
-            "[GPUFeatureExtractor] "
-            "samples=%d, batch=%d, device=%s | "
-            "prepare=%.3fms, alloc=%.3fms, cpu_to_gpu=%.3fms, "
-            "gpu_compute=%.3fms, postprocess=%.3fms | TOTAL=%.3fms",
-            total_samples,
-            batch_size,
-            device.type,
-            (t_prepare - t_start) * 1000,
-            (t_alloc - t_prepare) * 1000,
-            (t_cpu_to_gpu - t_alloc) * 1000,
-            (t_gpu_compute - t_cpu_to_gpu) * 1000,
-            (t_postprocess - t_gpu_compute) * 1000,
-            (t_postprocess - t_start) * 1000,
-        )
 
         result: dict[str, Any] = {"input_features": input_features}
         if return_attention_mask:
@@ -544,8 +504,6 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
         """
         Call processor with GPU-accelerated feature extraction.
         """
-        t_start = time.perf_counter()
-
         # Normalize input: handle deprecated key and list conversion.
         if "audios" in mm_data:
             mm_data["audio"] = mm_data.pop("audios")
@@ -559,14 +517,10 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
             prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
             return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
 
-        t_normalize = time.perf_counter()
-
         # Get processor for tokenizer and config
         processor = self.info.get_hf_processor(**mm_kwargs)
         hf_feature_extractor = processor.feature_extractor
         tokenizer = processor.tokenizer
-
-        t_get_processor = time.perf_counter()
 
         # ===== Audio chunking (CPU, fast) =====
         sampling_rate = hf_feature_extractor.sampling_rate
@@ -598,8 +552,6 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
                 end = min((i + 1) * window_size, time_cap)
                 flat_chunks.append(audio_el[start:end])
 
-        t_chunking = time.perf_counter()
-
         # ===== GPU Feature Extraction =====
         # Check if CUDA is available, fallback to CPU if not
         use_gpu = torch.cuda.is_available()
@@ -616,8 +568,6 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
                 return_attention_mask=True,
                 return_tensors="pt",
             )
-            # Synchronize to ensure GPU feature extraction is complete
-            torch.cuda.synchronize()
         else:
             # Fallback to HF CPU implementation
             audio_inputs = hf_feature_extractor(
@@ -627,8 +577,6 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
                 padding=True,
                 return_attention_mask=True,
             )
-
-        t_feature_extract = time.perf_counter()
 
         # ===== Process attention mask =====
         padding_mask = audio_inputs.pop("attention_mask")
@@ -653,8 +601,6 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
             ) // stride + 1
         audio_tokens_lengths = (audio_lengths - merge_factor) // merge_factor + 1
 
-        t_token_length = time.perf_counter()
-
         # ===== Expand audio tokens in text =====
         import regex as re
 
@@ -670,8 +616,6 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
                 )
                 text_list[i] = expanded
 
-        t_expand_tokens = time.perf_counter()
-
         # ===== Tokenize text =====
         text_inputs = tokenizer(
             text_list,
@@ -680,18 +624,13 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
             **tok_kwargs,
         )
 
-        t_tokenize = time.perf_counter()
-
         # ===== Combine outputs =====
         # Move input_features to CPU for compatibility
-        # NOTE: This GPU->CPU transfer can be a hidden bottleneck!
         input_features = audio_inputs["input_features"]
-        t_before_gpu_to_cpu = time.perf_counter()
         if input_features.device.type != "cpu":
             input_features = input_features.cpu()
         if input_features_mask.device.type != "cpu":
             input_features_mask = input_features_mask.cpu()
-        t_gpu_to_cpu = time.perf_counter()
 
         outputs = BatchFeature(
             data={
@@ -703,38 +642,6 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor["GlmAsrProcessingInfo"])
         )
 
         outputs["chunk_counts"] = torch.tensor(per_sample_windows, dtype=torch.long)
-
-        t_postprocess = time.perf_counter()
-
-        # Log timing
-        total_audio_samples = sum(
-            len(a) if isinstance(a, (list, np.ndarray)) else a.shape[0]
-            for a in audio_list
-        )
-        total_audio_seconds = total_audio_samples / sampling_rate
-        num_chunks = len(flat_chunks)
-
-        logger.warning(
-            "[Processor] "
-            "audio=%.2fs, chunks=%d, device=%s | "
-            "normalize=%.3fms, get_processor=%.3fms, "
-            "chunking=%.3fms, feature_extract=%.3fms, "
-            "token_length=%.3fms, expand_tokens=%.3fms, "
-            "tokenize=%.3fms, gpu_to_cpu=%.3fms, postprocess=%.3fms | TOTAL=%.3fms",
-            total_audio_seconds,
-            num_chunks,
-            device,
-            (t_normalize - t_start) * 1000,
-            (t_get_processor - t_normalize) * 1000,
-            (t_chunking - t_get_processor) * 1000,
-            (t_feature_extract - t_chunking) * 1000,
-            (t_token_length - t_feature_extract) * 1000,
-            (t_expand_tokens - t_token_length) * 1000,
-            (t_tokenize - t_expand_tokens) * 1000,
-            (t_gpu_to_cpu - t_before_gpu_to_cpu) * 1000,
-            (t_postprocess - t_gpu_to_cpu) * 1000,
-            (t_postprocess - t_start) * 1000,
-        )
 
         return outputs
 
@@ -876,8 +783,6 @@ class GlmAsrForConditionalGeneration(
     def _process_audio_input(
         self, audio_input: GlmAsrInputs
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        t_start = time.perf_counter()
-
         if audio_input["type"] == "audio_embeds":
             return tuple(audio_input["audio_embeds"])
 
@@ -895,13 +800,9 @@ class GlmAsrForConditionalGeneration(
 
         # Convert input_features to model dtype (e.g., bfloat16) to match model weights
         input_features = input_features.to(dtype=self.audio_tower.conv1.weight.dtype)
-        torch.cuda.synchronize()
-        t_prepare = time.perf_counter()
 
         # audio_tower returns [batch_size, seq_len, hidden_size] where hidden_size=1280
         audio_hidden_states = self.audio_tower(input_features).last_hidden_state
-        torch.cuda.synchronize()
-        t_encoder = time.perf_counter()
 
         # GLM-ASR merges consecutive frames: 4 frames with hidden_size=1280
         # -> 1 frame with intermediate_size=5120
@@ -921,12 +822,8 @@ class GlmAsrForConditionalGeneration(
             -1,
             intermediate_size,
         )
-        torch.cuda.synchronize()
-        t_reshape = time.perf_counter()
 
         audio_features = self.multi_modal_projector(audio_hidden_states)
-        torch.cuda.synchronize()
-        t_projector = time.perf_counter()
 
         merge_factor = getattr(self.config, "merge_factor", DEFAULT_MERGE_FACTOR)
         conv_params = getattr(self.config, "conv_params", DEFAULT_CONV_PARAMS)
@@ -946,23 +843,6 @@ class GlmAsrForConditionalGeneration(
             masked_audio_features, audio_output_lengths.flatten().tolist()
         )
         result = _group_audio_embeddings(chunk_embeddings, chunk_counts)
-        t_postprocess = time.perf_counter()
-
-        logger.warning(
-            "[AudioProcessing] "
-            "chunks=%d, seq_len=%d->%d | "
-            "prepare=%.3fms, encoder=%.3fms, reshape=%.3fms, "
-            "projector=%.3fms, postprocess=%.3fms | TOTAL=%.3fms",
-            num_chunks,
-            seq_len,
-            seq_len_truncated,
-            (t_prepare - t_start) * 1000,
-            (t_encoder - t_prepare) * 1000,
-            (t_reshape - t_encoder) * 1000,
-            (t_projector - t_reshape) * 1000,
-            (t_postprocess - t_projector) * 1000,
-            (t_postprocess - t_start) * 1000,
-        )
 
         return result
 
@@ -970,24 +850,11 @@ class GlmAsrForConditionalGeneration(
         return self.language_model
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
-        t_start = time.perf_counter()
-
         audio_input = self._parse_and_validate_audio_input(**kwargs)
         if audio_input is None:
             return []
-        t_parse = time.perf_counter()
 
         masked_audio_features = self._process_audio_input(audio_input)
-        torch.cuda.synchronize()
-        t_process = time.perf_counter()
-
-        logger.warning(
-            "[EmbedMultimodal] <<<EngineCore Entry>>> "
-            "parse=%.3fms, process=%.3fms | TOTAL=%.3fms",
-            (t_parse - t_start) * 1000,
-            (t_process - t_parse) * 1000,
-            (t_process - t_start) * 1000,
-        )
 
         return masked_audio_features
 

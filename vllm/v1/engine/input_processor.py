@@ -493,13 +493,11 @@ class InputProcessor:
         # 1. Tokenize text prompt, with LoRA request if one exists.
         # 2. For multimodal models with a merged preprocessor, preprocess
         #   multimodal data and expand prompt token ids accordingly.
-        t_preprocess_start = time.time()
         processed_inputs: ProcessorInputs = self.input_preprocessor.preprocess(
             prompt,
             tokenization_kwargs=tokenization_kwargs,
             mm_uuids=mm_uuids,
         )
-        t_preprocess_end = time.time()
 
         from vllm.platforms import current_platform
 
@@ -567,17 +565,6 @@ class InputProcessor:
                         mm_position=decoder_mm_positions[modality][idx],
                     )
                 )
-
-        t_process_end = time.time()
-
-        # Log profiling info
-        logger.warning(
-            "[InputProcessor.process_inputs] "
-            "preprocess=%.3fms, post_process=%.3fms | TOTAL=%.3fms",
-            (t_preprocess_end - t_preprocess_start) * 1000,
-            (t_process_end - t_preprocess_end) * 1000,
-            (t_process_end - t_preprocess_start) * 1000,
-        )
 
         return EngineCoreRequest(
             request_id=request_id,
