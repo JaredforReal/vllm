@@ -1081,9 +1081,183 @@ class GlmImageTextModel(nn.Module):
 
 
 class GlmImageModel(nn.Module):
-    """Placeholder - to be implemented."""
+    """
+    GLM-Image model that combines Vision Encoder, VQ-VAE, and Text Model.
 
-    pass
+    This model is used for image generation tasks:
+    - Image-to-Image: Source image → Vision Encoder → VQ-VAE tokens → Text Model
+    - Text-to-Image: Text tokens → Text Model → Generate image tokens
+
+    Key components:
+    - visual: GlmImageVisionModel for encoding input images
+    - vqmodel: GlmImageVQVAE for tokenizing image features
+    - language_model: GlmImageTextModel for text/token generation
+
+    The model uses M-RoPE (3D position encoding) for multimodal position awareness:
+    - temporal: constant for image tokens, incremental for text
+    - height: row position for image tokens
+    - width: column position for image tokens
+    """
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        multimodal_config = vllm_config.model_config.multimodal_config
+
+        self.config = config
+        self.multimodal_config = multimodal_config
+
+        # Vision encoder
+        self.visual = GlmImageVisionModel(
+            config.vision_config,
+            quant_config=quant_config,
+            multimodal_config=multimodal_config,
+            prefix=f"{prefix}.visual" if prefix else "visual",
+        )
+
+        # VQ-VAE for image tokenization (frozen)
+        self.vqmodel = GlmImageVQVAE(config.vq_config)
+
+        # Text/Language model
+        self.language_model = GlmImageTextModel(
+            vllm_config=vllm_config,
+            config=config.text_config,
+            prefix=f"{prefix}.language_model" if prefix else "language_model",
+        )
+
+        # Store special token IDs
+        self.image_token_id = config.image_token_id
+        self.image_start_token_id = config.image_start_token_id
+        self.image_end_token_id = config.image_end_token_id
+
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    def get_input_embeddings(self) -> VocabParallelEmbedding:
+        return self.language_model.get_input_embeddings()
+
+    def get_image_features(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Extract image features using the vision encoder.
+
+        Args:
+            pixel_values: Packed pixel values
+                [total_patches, num_channels * patch_size * patch_size]
+            image_grid_thw: [num_images, 3] with (t, h, w) for each image
+
+        Returns:
+            Image features [total_patches, hidden_size]
+        """
+        return self.visual(pixel_values, image_grid_thw)
+
+    def get_image_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Tokenize image features into discrete tokens using VQ-VAE.
+
+        Args:
+            hidden_states: Image features [total_patches, hidden_size]
+            image_grid_thw: [num_images, 3] with (t, h, w) for each image
+
+        Returns:
+            Discrete token indices [total_patches]
+        """
+        hidden_size = hidden_states.shape[-1]
+        split_sizes = (image_grid_thw.prod(dim=-1)).tolist()
+        hidden_states_list = torch.split(hidden_states, split_sizes, dim=0)
+
+        all_image_tokens = []
+        for i, hs in enumerate(hidden_states_list):
+            grid_t, grid_h, grid_w = image_grid_thw[i].tolist()
+            # Reshape to spatial format: [t, h, w, c] -> [t, c, h, w]
+            hs = hs.view(grid_t, grid_h, grid_w, hidden_size)
+            hs = hs.permute(0, 3, 1, 2).contiguous()
+            # Encode with VQ-VAE
+            _, indices = self.vqmodel.encode(hs)
+            all_image_tokens.append(indices)
+
+        return torch.cat(all_image_tokens, dim=0)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        """
+        Forward pass through the GLM-Image model.
+
+        For image-to-image generation:
+        1. Encode source images with vision encoder
+        2. Tokenize features with VQ-VAE
+        3. Replace placeholder tokens with actual image tokens
+        4. Run through language model
+
+        Args:
+            input_ids: Input token IDs [batch_size, seq_len]
+            positions: Position IDs, shape (3, seq_len) for M-RoPE
+            intermediate_tensors: For pipeline parallelism
+            inputs_embeds: Pre-computed embeddings (optional)
+            pixel_values: Source image pixels (for image-to-image)
+            image_grid_thw: Grid dimensions for source images
+
+        Returns:
+            Hidden states or intermediate tensors for PP
+        """
+        # Handle intermediate tensors for pipeline parallelism
+        if intermediate_tensors is not None:
+            return self.language_model(
+                input_ids=None,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=None,
+            )
+
+        # Process source images if provided (image-to-image generation)
+        if pixel_values is not None and image_grid_thw is not None:
+            # Encode images
+            image_features = self.get_image_features(pixel_values, image_grid_thw)
+            # Tokenize with VQ-VAE
+            image_tokens = self.get_image_tokens(image_features, image_grid_thw)
+            image_tokens = image_tokens.to(input_ids.device)
+
+            # Replace placeholder tokens with actual image tokens
+            special_image_mask = input_ids == self.image_token_id
+            if special_image_mask.sum() > 0:
+                input_ids = input_ids.clone()
+                input_ids[special_image_mask] = image_tokens
+
+        # Get embeddings
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+            input_ids = None
+
+        # Forward through language model
+        hidden_states = self.language_model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
+
+        return hidden_states
 
 
 class GlmImageForConditionalGeneration(nn.Module):
