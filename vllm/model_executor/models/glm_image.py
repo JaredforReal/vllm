@@ -21,10 +21,15 @@
 # limitations under the License.
 """Inference-only GLM-Image model compatible with HuggingFace weights."""
 
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Annotated, Literal
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import BatchFeature
 from transformers.models.glm_image.configuration_glm_image import (
+    GlmImageConfig,
     GlmImageTextConfig,
     GlmImageVisionConfig,
     GlmImageVQVAEConfig,
@@ -32,6 +37,7 @@ from transformers.models.glm_image.configuration_glm_image import (
 
 from vllm.attention.layer import Attention
 from vllm.config import CacheConfig, MultiModalConfig, VllmConfig
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.distributed import utils as dist_utils
 from vllm.logger import init_logger
@@ -46,21 +52,296 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-from .utils import (
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
+    SupportsMultiModal,
+    SupportsPP,
+)
+from vllm.model_executor.models.utils import (
+    WeightsMapper,
     make_empty_intermediate_tensors_factory,
     make_layers,
 )
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import (
+    MultiModalDataDict,
+    MultiModalFeatureSpec,
+    MultiModalFieldConfig,
+    MultiModalKwargsItems,
+)
+from vllm.multimodal.parse import MultiModalDataItems
+from vllm.multimodal.processing import (
+    BaseMultiModalProcessor,
+    BaseProcessingInfo,
+    PromptReplacement,
+    PromptUpdate,
+    PromptUpdateDetails,
+)
+from vllm.multimodal.profiling import BaseDummyInputsBuilder
+from vllm.sequence import IntermediateTensors
+from vllm.utils.tensor_schema import TensorSchema, TensorShape
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
 from .vision import get_vit_attn_backend
 
 logger = init_logger(__name__)
+
+
+# === Multimodal Processing ===
+
+
+class GlmImagePixelInputs(TensorSchema):
+    """
+    Schema for GLM-Image pixel inputs.
+
+    Dimensions:
+        - np: Number of patches (total across all images)
+        - cpp: channels * patch_size * patch_size
+        - ni: Number of images
+        - g: Grid dimensions (3 for temporal, height, width)
+    """
+
+    type: Literal["pixel_values"] = "pixel_values"
+
+    pixel_values: Annotated[torch.Tensor, TensorShape("np", "cpp")]
+    image_grid_thw: Annotated[torch.Tensor, TensorShape("ni", 3)]
+
+
+class GlmImageProcessingInfo(BaseProcessingInfo):
+    """
+    Processing information for GLM-Image model.
+
+    GLM-Image is an image generation model that uses:
+    - Vision encoder for encoding source images (image-to-image)
+    - VQ-VAE for tokenizing image features
+    - Text model for generating image tokens
+    """
+
+    def get_hf_config(self) -> GlmImageConfig:
+        return self.ctx.get_hf_config(GlmImageConfig)
+
+    def get_hf_processor(self, **kwargs: object):
+        # GLM-Image uses a processor similar to Qwen2-VL
+        # Try to get GlmImageProcessor if available
+        try:
+            from transformers import GlmImageProcessor
+
+            return self.ctx.get_hf_processor(GlmImageProcessor, **kwargs)
+        except ImportError:
+            # Fallback: return None and handle in processor
+            return None
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        # GLM-Image supports multiple source images for image-to-image generation
+        # or no image for text-to-image generation
+        # None means no limit on the number of images
+        return {"image": None}
+
+    def get_num_image_tokens(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> int:
+        """
+        Calculate the number of image tokens for a given image size.
+
+        GLM-Image processes images through a patch embedding with patch_size=16,
+        then quantizes through VQ-VAE. The number of tokens is:
+        (image_height // patch_size) * (image_width // patch_size)
+        """
+        hf_config = self.get_hf_config()
+        vision_config = hf_config.vision_config
+        patch_size = vision_config.patch_size
+
+        # Number of patches in each dimension
+        num_patches_h = image_height // patch_size
+        num_patches_w = image_width // patch_size
+
+        return num_patches_h * num_patches_w
+
+    def get_max_image_tokens(self) -> int:
+        """
+        Get the maximum number of image tokens.
+
+        Based on the default image size (2048x2048) and patch size (16).
+        """
+        hf_config = self.get_hf_config()
+        vision_config = hf_config.vision_config
+
+        # Default max size
+        image_size = getattr(vision_config, "image_size", 2048)
+        patch_size = getattr(vision_config, "patch_size", 16)
+
+        max_patches = (image_size // patch_size) ** 2
+        return max_patches
+
+    def get_image_size_with_most_features(self) -> tuple[int, int]:
+        """
+        Get the image size that produces the most features.
+
+        Returns:
+            Tuple of (width, height)
+        """
+        hf_config = self.get_hf_config()
+        vision_config = hf_config.vision_config
+        image_size = getattr(vision_config, "image_size", 2048)
+        return (image_size, image_size)
+
+
+class GlmImageDummyInputsBuilder(BaseDummyInputsBuilder[GlmImageProcessingInfo]):
+    """
+    Builds dummy inputs for GLM-Image model profiling.
+    """
+
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        """
+        Generate dummy text with image placeholders.
+
+        GLM-Image uses <|image|> as the image placeholder token.
+        """
+        num_images = mm_counts.get("image", 0)
+
+        hf_config = self.info.get_hf_config()
+        # Get image token from config or use default
+        image_token_id = getattr(hf_config, "image_token_id", 167855)
+
+        tokenizer = self.info.get_tokenizer()
+        # Try to get the image token string
+        try:
+            image_token = tokenizer.convert_ids_to_tokens(image_token_id)
+        except Exception:
+            image_token = "<|image|>"
+
+        return image_token * num_images
+
+    def get_dummy_mm_data(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+    ) -> MultiModalDataDict:
+        """
+        Generate dummy multimodal data for profiling.
+        """
+        hf_config = self.info.get_hf_config()
+        vision_config = hf_config.vision_config
+
+        # Default image size from config
+        image_size = getattr(vision_config, "image_size", 2048)
+        width = height = image_size
+
+        num_images = mm_counts.get("image", 0)
+
+        image_overrides = mm_options.get("image") if mm_options else None
+
+        return {
+            "image": self._get_dummy_images(
+                width=width,
+                height=height,
+                num_images=num_images,
+                overrides=image_overrides,
+            )
+        }
+
+
+class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo]):
+    """
+    Multimodal processor for GLM-Image.
+
+    Handles:
+    - Image preprocessing and tokenization
+    - Prompt construction with image placeholders
+    - Grid dimension calculation for M-RoPE position encoding
+    """
+
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        """
+        Call the HuggingFace processor.
+
+        If no multimodal data is provided (text-to-image mode),
+        we only tokenize the text.
+        """
+        if not mm_data or not mm_data.get("image"):
+            # Text-to-image mode: just tokenize the prompt
+            tokenizer = self.info.get_tokenizer()
+            prompt_ids = tokenizer.encode(prompt)
+            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
+
+        # Image-to-image mode: use full processor
+        return super()._call_hf_processor(
+            prompt=prompt,
+            mm_data=mm_data,
+            mm_kwargs=mm_kwargs,
+            tok_kwargs=tok_kwargs,
+        )
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        """
+        Get the multimodal field configuration.
+        """
+        return dict(
+            pixel_values=MultiModalFieldConfig.batched("image"),
+            image_grid_thw=MultiModalFieldConfig.batched("image"),
+        )
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptUpdate]:
+        """
+        Get prompt updates for image tokens.
+
+        GLM-Image replaces each image placeholder with:
+        <|image_start|> + image_tokens + <|image_end|>
+        """
+        hf_config = self.info.get_hf_config()
+
+        # Get special token IDs from config
+        image_token_id = getattr(hf_config, "image_token_id", 167855)
+        image_start_id = getattr(hf_config, "image_start_token_id", 16384)
+        image_end_id = getattr(hf_config, "image_end_token_id", 16385)
+
+        # Get image grid info to determine number of tokens per image
+        # For now, use a simple approach based on config
+        vision_config = hf_config.vision_config
+        image_size = getattr(vision_config, "image_size", 2048)
+        patch_size = getattr(vision_config, "patch_size", 16)
+
+        # Default number of image tokens
+        num_image_tokens = (image_size // patch_size) ** 2
+        image_tokens = [image_token_id] * num_image_tokens
+
+        return [
+            PromptReplacement(
+                modality="image",
+                target=[image_token_id],
+                replacement=PromptUpdateDetails.select_token_id(
+                    [image_start_id] + image_tokens + [image_end_id],
+                    embed_token_id=image_token_id,
+                ),
+            )
+        ]
 
 
 # === VQ-VAE Components ===
@@ -1260,7 +1541,293 @@ class GlmImageModel(nn.Module):
         return hidden_states
 
 
-class GlmImageForConditionalGeneration(nn.Module):
-    """Placeholder - to be implemented."""
+@MULTIMODAL_REGISTRY.register_processor(
+    GlmImageMultiModalProcessor,
+    info=GlmImageProcessingInfo,
+    dummy_inputs=GlmImageDummyInputsBuilder,
+)
+class GlmImageForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE
+):
+    """
+    GLM-Image model for conditional image generation.
 
-    pass
+    This is the main entry point for GLM-Image in vLLM. It wraps:
+    - GlmImageModel (Vision Encoder + VQ-VAE + Text Model)
+    - LM Head for token prediction
+
+    Supports:
+    - Multimodal inputs (images for image-to-image generation)
+    - M-RoPE (3D position encoding) for multimodal generation
+    - Pipeline Parallelism
+    - Image-to-Image and Text-to-Image generation
+    """
+
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": ["gate_up_proj"],
+    }
+
+    # Weight mapping from HuggingFace to vLLM format
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "lm_head.": "lm_head.",
+            "model.language_model.": "model.language_model.",
+            "model.visual.": "model.visual.",
+            "model.vqmodel.": "model.vqmodel.",
+        }
+    )
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        config: GlmImageConfig = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+
+        self.config = config
+        self.vllm_config = vllm_config
+
+        # Main model (Vision + VQ-VAE + Text)
+        self.model = GlmImageModel(
+            vllm_config=vllm_config,
+            prefix=f"{prefix}.model" if prefix else "model",
+        )
+
+        # LM head for token prediction
+        # GLM-Image outputs to vision_vocab_size (16512) not full vocab
+        self.lm_head = ParallelLMHead(
+            config.text_config.vision_vocab_size,
+            config.text_config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.lm_head" if prefix else "lm_head",
+        )
+
+        # Logits processor
+        self.logits_processor = LogitsProcessor(
+            config.text_config.vision_vocab_size,
+            soft_cap=None,
+        )
+
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+
+    def get_input_embeddings(self) -> VocabParallelEmbedding:
+        return self.model.get_input_embeddings()
+
+    def get_image_features(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Extract image features using vision encoder."""
+        return self.model.get_image_features(pixel_values, image_grid_thw)
+
+    def get_image_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Tokenize image features with VQ-VAE."""
+        return self.model.get_image_tokens(hidden_states, image_grid_thw)
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list[MultiModalFeatureSpec],
+    ) -> tuple[torch.Tensor, int]:
+        """
+        Compute M-RoPE position IDs for GLM-Image generation.
+
+        GLM-Image uses 3D position encoding:
+        - For text tokens: all 3 dimensions (temporal, height, width) are the same
+        - For image tokens:
+          - temporal: constant (marks image region)
+          - height: row position in image grid
+          - width: column position in image grid
+
+        Args:
+            input_tokens: List of input token IDs
+            mm_features: Multimodal feature specifications
+
+        Returns:
+            Tuple of (position_ids [3, seq_len], mrope_position_delta)
+        """
+        # Gather image grid info from multimodal features
+        kwargs = MultiModalFeatureSpec.gather_kwargs(
+            mm_features,
+            {"image_grid_thw"},
+        )
+        image_grid_thw = [item.tolist() for item in kwargs.get("image_grid_thw", [])]
+
+        hf_config = self.config
+        image_start_token_id = hf_config.image_start_token_id
+        image_end_token_id = hf_config.image_end_token_id
+
+        seq_len = len(input_tokens)
+        llm_pos_ids_list: list[torch.Tensor] = []
+
+        if image_grid_thw:
+            # Build position IDs considering image regions
+            current_pos = 0
+            image_idx = 0
+            i = 0
+
+            while i < seq_len:
+                token = input_tokens[i]
+
+                if token == image_start_token_id and image_idx < len(image_grid_thw):
+                    # Start of image region
+                    # Add position for the start marker
+                    llm_pos_ids_list.append(
+                        torch.tensor([[current_pos], [current_pos], [current_pos]])
+                    )
+                    current_pos += 1
+                    i += 1
+
+                    # Get grid dimensions for this image
+                    _, h, w = image_grid_thw[image_idx]
+                    total_image_tokens = h * w
+
+                    # Build 2D position IDs for image tokens
+                    t_indices = torch.full((total_image_tokens,), current_pos)
+                    h_indices = (
+                        torch.arange(h).unsqueeze(1).expand(h, w).flatten()
+                        + current_pos
+                    )
+                    w_indices = (
+                        torch.arange(w).unsqueeze(0).expand(h, w).flatten()
+                        + current_pos
+                    )
+
+                    llm_pos_ids_list.append(
+                        torch.stack([t_indices, h_indices, w_indices], dim=0)
+                    )
+
+                    # Skip image tokens
+                    i += total_image_tokens
+                    current_pos += max(h, w)
+                    image_idx += 1
+
+                elif token == image_end_token_id:
+                    # End marker - just add normal position
+                    llm_pos_ids_list.append(
+                        torch.tensor([[current_pos], [current_pos], [current_pos]])
+                    )
+                    current_pos += 1
+                    i += 1
+
+                else:
+                    # Regular text token
+                    llm_pos_ids_list.append(
+                        torch.tensor([[current_pos], [current_pos], [current_pos]])
+                    )
+                    current_pos += 1
+                    i += 1
+
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1)
+        else:
+            # Pure text - all dimensions same
+            llm_positions = torch.arange(seq_len).view(1, -1).expand(3, -1)
+
+        mrope_position_delta = (llm_positions.max() + 1 - seq_len).item()
+        return llm_positions, mrope_position_delta
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | IntermediateTensors:
+        """
+        Forward pass through GLM-Image.
+
+        Args:
+            input_ids: Input token IDs [seq_len]
+            positions: Position IDs, shape (3, seq_len) for M-RoPE
+            intermediate_tensors: For pipeline parallelism
+            inputs_embeds: Pre-computed embeddings
+            pixel_values: Source image pixels (for image-to-image)
+            image_grid_thw: Grid dimensions for images
+
+        Returns:
+            Hidden states or intermediate tensors
+        """
+        if intermediate_tensors is not None:
+            inputs_embeds = None
+
+        hidden_states = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+
+        return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Compute logits from hidden states."""
+        logits = self.logits_processor(
+            self.lm_head,
+            hidden_states,
+        )
+        return logits
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """
+        Load weights from HuggingFace checkpoint.
+
+        Handles weight mapping for:
+        - Vision encoder weights
+        - VQ-VAE weights
+        - Text model weights
+        - LM head weights
+        """
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            # Handle stacked parameters (QKV, gate_up)
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                if name not in params_dict:
+                    break
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Regular weight loading
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+            loaded_params.add(name)
+
+        return loaded_params
