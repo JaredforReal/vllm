@@ -431,7 +431,28 @@ class _ModuleOffloader:
 
         Called after process_weights_after_loading to ensure _cpu_storage
         contains the final processed weights, not stale pre-loading data.
+
+        Also prunes parameters that were deleted by
+        process_weights_after_loading (e.g. k_scale / v_scale / q_scale /
+        prob_scale in FP8 KV-cache quantization). Those parameters are
+        temporary – their values get copied into private buffers before
+        deletion, so they have nothing to contribute to the prefetch pool.
         """
+        deleted = [
+            name
+            for name, offloader in self._param_offloaders.items()
+            if not offloader._param_exists()
+        ]
+        for name in deleted:
+            logger.debug(
+                "Parameter '%s' in layer %d was deleted by "
+                "process_weights_after_loading (e.g. FP8 KV cache scales); "
+                "removing from prefetch offload list.",
+                name,
+                self.layer_idx,
+            )
+            del self._param_offloaders[name]
+
         for param_offloader in self._param_offloaders.values():
             param_offloader.sync_cpu_storage()
 
@@ -555,6 +576,22 @@ class _BaseParamOffloader(ABC):
         for attr in self._param_name.split("."):
             obj = getattr(obj, attr)
         return obj
+
+    def _param_exists(self) -> bool:
+        """Check whether the parameter still exists on the module.
+
+        Parameters may be deleted by process_weights_after_loading.
+        For example, BaseKVCacheMethod deletes k_scale / v_scale /
+        q_scale / prob_scale after copying their values into private
+        _k_scale / _v_scale buffers (kv_cache.py).
+        """
+        try:
+            obj: Any = self._module
+            for attr in self._param_name.split("."):
+                obj = getattr(obj, attr)
+            return True
+        except AttributeError:
+            return False
 
     def post_init(self):
         """Initialize offloading (move parameter to storage)."""
