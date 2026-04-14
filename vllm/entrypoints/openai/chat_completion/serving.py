@@ -557,6 +557,17 @@ class OpenAIServingChat(OpenAIServing):
             and self._should_stream_with_auto_tool_parsing(request)
         )
 
+        # Determine whether required/named tool_choice should use the tool_parser
+        tool_choice_uses_parser = (
+            self.tool_parser is not None
+            and self.tool_parser.supports_required_and_named
+            and request.tools
+            and (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
+            )
+        )
+
         all_previous_token_ids: list[list[int]] | None
         function_name_returned = [False] * num_choices
         if self.tool_call_id_type == "kimi_k2":
@@ -569,7 +580,7 @@ class OpenAIServingChat(OpenAIServing):
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
-        if is_mistral_grammar_path or tool_choice_auto or reasoning_parser:
+        if is_mistral_grammar_path or tool_choice_auto or tool_choice_uses_parser or reasoning_parser:
             # These are only required in "auto" tool choice case
             all_previous_token_ids = [[] for _ in range(num_choices)]
             reasoning_end_arr = [False] * num_choices
@@ -764,7 +775,7 @@ class OpenAIServingChat(OpenAIServing):
                     delta_message: DeltaMessage | None
 
                     # just update previous_texts and previous_token_ids
-                    if is_mistral_grammar_path or tool_choice_auto or reasoning_parser:
+                    if is_mistral_grammar_path or tool_choice_auto or tool_choice_uses_parser or reasoning_parser:
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
                         previous_text = previous_texts[i]
@@ -856,7 +867,32 @@ class OpenAIServingChat(OpenAIServing):
                                     delta_message.content = None
                                 else:
                                     current_text = ""
+                        elif tool_choice_uses_parser and parsers[i] is not None:
+                            # Use tool_parser for streaming extraction
+                            tool_parser_i = parsers[i]
+                            assert tool_parser_i is not None
+                            delta_message = tool_parser_i.extract_tool_calls_streaming(
+                                previous_text=previous_text,
+                                current_text=current_text,
+                                delta_text=delta_text,
+                                previous_token_ids=previous_token_ids,
+                                current_token_ids=current_token_ids,
+                                delta_token_ids=as_list(output.token_ids),
+                                request=request,
+                            )
+                            # Override function name for named tool choice
+                            if delta_message and delta_message.tool_calls:
+                                for tc in delta_message.tool_calls:
+                                    if tc.function is not None:
+                                        if isinstance(tc.function, dict):
+                                            tc.function["name"] = (
+                                                tool_choice_function_name
+                                            )
+                                        elif hasattr(tc.function, "name"):
+                                            tc.function.name = tool_choice_function_name
+                                tools_streamed[i] = True
                         else:
+                            # Fallback: existing hardcoded logic
                             # Just to add remaining `content`
                             if reasoning_parser:
                                 delta_text = previous_text + delta_text
@@ -930,7 +966,24 @@ class OpenAIServingChat(OpenAIServing):
                                     # reasoning ended
                                     current_text = ""
 
+                        elif tool_choice_uses_parser and parsers[i] is not None:
+                            # Use tool_parser for streaming extraction
+                            tool_parser_i = parsers[i]
+                            assert tool_parser_i is not None
+                            delta_message = tool_parser_i.extract_tool_calls_streaming(
+                                previous_text=previous_text,
+                                current_text=current_text,
+                                delta_text=delta_text,
+                                previous_token_ids=previous_token_ids,
+                                current_token_ids=current_token_ids,
+                                delta_token_ids=output_token_ids,
+                                request=request,
+                            )
+                            if delta_message and delta_message.tool_calls:
+                                tools_streamed[i] = True
+
                         else:
+                            # Fallback: existing extract_tool_call_required_streaming
                             # either finished reasoning or no reasoning at all
                             content = current_text
 
@@ -966,7 +1019,10 @@ class OpenAIServingChat(OpenAIServing):
 
                     # update the previous values for the next iteration
                     if (
-                        is_mistral_grammar_path or tool_choice_auto or reasoning_parser
+                        is_mistral_grammar_path
+                        or tool_choice_auto
+                        or tool_choice_uses_parser
+                        or reasoning_parser
                     ) and not self.use_harmony:
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
