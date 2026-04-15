@@ -1522,21 +1522,6 @@ def _parse_chat_message_content(
         content = []
     elif isinstance(content, str):
         content = [ChatCompletionContentPartTextParam(type="text", text=content)]
-    elif role == "tool" and isinstance(content, list):
-        # Normalize tool message content from OpenAI array format to plain
-        # string. Clients like Claude Code / Cursor send tool results as
-        # [{"type": "text", "text": "..."}], but most chat templates only
-        # handle string content for tool messages.
-        texts = [
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        ]
-        content = [
-            ChatCompletionContentPartTextParam(
-                type="text", text="\n".join(texts) if texts else ""
-            )
-        ]
     result = _parse_chat_message_content_parts(
         role,
         content,  # type: ignore
@@ -1565,6 +1550,18 @@ def _parse_chat_message_content(
             parsed_msg = _ToolParser(message)
             if "tool_call_id" in parsed_msg:
                 result_msg["tool_call_id"] = parsed_msg["tool_call_id"]
+            # Normalize tool message content from OpenAI array format to plain
+            # string. Clients like Claude Code / Cursor send tool results as
+            # [{"type": "text", "text": "..."}], but most chat templates only
+            # handle string content for tool messages.
+            msg_content = result_msg.get("content")
+            if isinstance(msg_content, list):
+                texts = [
+                    item.get("text", "")
+                    for item in msg_content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ]
+                result_msg["content"] = "\n".join(texts) if texts else ""
 
         if "name" in message and isinstance(message["name"], str):
             result_msg["name"] = message["name"]
