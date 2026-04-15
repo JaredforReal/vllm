@@ -1522,6 +1522,21 @@ def _parse_chat_message_content(
         content = []
     elif isinstance(content, str):
         content = [ChatCompletionContentPartTextParam(type="text", text=content)]
+    elif role == "tool" and isinstance(content, list):
+        # Normalize tool message content from OpenAI array format to plain
+        # string. Clients like Claude Code / Cursor send tool results as
+        # [{"type": "text", "text": "..."}], but most chat templates only
+        # handle string content for tool messages.
+        texts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        content = [
+            ChatCompletionContentPartTextParam(
+                type="text", text="\n".join(texts) if texts else ""
+            )
+        ]
     result = _parse_chat_message_content_parts(
         role,
         content,  # type: ignore
