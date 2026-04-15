@@ -881,14 +881,23 @@ class OpenAIServingChat(OpenAIServing):
                                 request=request,
                             )
                             # Override function name for named tool choice
+                            # Only override when the parser already set a name
+                            # (the first chunk for a tool call); leave
+                            # name=None on subsequent chunks as-is.
                             if delta_message and delta_message.tool_calls:
                                 for tc in delta_message.tool_calls:
                                     if tc.function is not None:
-                                        if isinstance(tc.function, dict):
+                                        if (
+                                            isinstance(tc.function, dict)
+                                            and tc.function.get("name") is not None
+                                        ):
                                             tc.function["name"] = (
                                                 tool_choice_function_name
                                             )
-                                        elif hasattr(tc.function, "name"):
+                                        elif (
+                                            hasattr(tc.function, "name")
+                                            and tc.function.name is not None
+                                        ):
                                             tc.function.name = tool_choice_function_name
                                 tools_streamed[i] = True
                         else:
