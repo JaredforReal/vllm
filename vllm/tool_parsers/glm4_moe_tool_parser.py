@@ -51,7 +51,7 @@ class Glm4MoeModelToolParser(ToolParser):
     call, and diffs against what was previously sent to emit only new content.
     """
 
-    supports_required_and_named = True
+    supports_required_and_named = False
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)

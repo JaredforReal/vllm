@@ -627,7 +627,7 @@ class OpenAIServing:
             and isinstance(request.tool_choice, ToolChoiceFunction)
         ):
             assert content is not None
-            # Forced Function Call
+            # Forced Function Call (Responses API)
             function_calls.append(
                 FunctionCall(name=request.tool_choice.name, arguments=content)
             )
@@ -650,6 +650,7 @@ class OpenAIServing:
         elif not use_mistral_tool_parser and request.tool_choice == "required" and (
             tool_parser_cls is None or tool_parser_cls.supports_required_and_named
         ):
+            # "required" with standard JSON-based parsing
             tool_calls = []
             with contextlib.suppress(ValidationError):
                 content = content or ""
@@ -692,7 +693,6 @@ class OpenAIServing:
                     "Tokenizer not available when `skip_tokenizer_init=True`"
                 )
 
-            # Automatic Tool Call Parsing
             try:
                 tool_parser = tool_parser_cls(tokenizer, request.tools)
             except RuntimeError as e:
