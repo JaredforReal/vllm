@@ -136,7 +136,6 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
 class ChatCompletionToolsParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
     function: FunctionDefinition
-    defer_loading: bool | None = None
 
 
 class ChatCompletionNamedFunction(OpenAIBaseModel):
