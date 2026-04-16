@@ -17,7 +17,6 @@ from collections.abc import Sequence
 from typing import Any
 
 import regex as re
-from openai.types.responses.function_tool import ToolChoiceFunction
 
 from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -169,9 +168,7 @@ class Glm4MoeModelToolParser(ToolParser):
         """
         if request.tools:
             tc = request.tool_choice
-            if tc == "required" or isinstance(
-                tc, (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction)
-            ):
+            if tc == "required" or isinstance(tc, ChatCompletionNamedToolChoiceParam):
                 # Do NOT call super().adjust_request() for required/named,
                 # because it would set structured_outputs and force JSON
                 # output via guided decoding.  GLM models use XML tool-call
