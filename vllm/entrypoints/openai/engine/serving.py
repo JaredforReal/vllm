@@ -636,10 +636,7 @@ class OpenAIServing:
             not use_mistral_tool_parser
             and request.tool_choice
             and isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
-            and (
-                tool_parser_cls is None
-                or tool_parser_cls.supports_required_and_named
-            )
+            and (tool_parser_cls is None or tool_parser_cls.supports_required_and_named)
         ):
             # Named function with standard JSON-based parsing
             assert content is not None
@@ -647,8 +644,10 @@ class OpenAIServing:
                 FunctionCall(name=request.tool_choice.function.name, arguments=content)
             )
             content = None  # Clear content since tool is called.
-        elif not use_mistral_tool_parser and request.tool_choice == "required" and (
-            tool_parser_cls is None or tool_parser_cls.supports_required_and_named
+        elif (
+            not use_mistral_tool_parser
+            and request.tool_choice == "required"
+            and (tool_parser_cls is None or tool_parser_cls.supports_required_and_named)
         ):
             # "required" with standard JSON-based parsing
             tool_calls = []

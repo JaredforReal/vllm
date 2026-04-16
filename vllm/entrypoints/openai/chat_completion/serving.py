@@ -583,7 +583,12 @@ class OpenAIServingChat(OpenAIServing):
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
-        if is_mistral_grammar_path or tool_choice_auto or tool_choice_uses_parser or reasoning_parser:
+        if (
+            is_mistral_grammar_path
+            or tool_choice_auto
+            or tool_choice_uses_parser
+            or reasoning_parser
+        ):
             # These are only required in "auto" tool choice case
             all_previous_token_ids = [[] for _ in range(num_choices)]
             reasoning_end_arr = [False] * num_choices
@@ -778,7 +783,12 @@ class OpenAIServingChat(OpenAIServing):
                     delta_message: DeltaMessage | None
 
                     # just update previous_texts and previous_token_ids
-                    if is_mistral_grammar_path or tool_choice_auto or tool_choice_uses_parser or reasoning_parser:
+                    if (
+                        is_mistral_grammar_path
+                        or tool_choice_auto
+                        or tool_choice_uses_parser
+                        or reasoning_parser
+                    ):
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
                         previous_text = previous_texts[i]
