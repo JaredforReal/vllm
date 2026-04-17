@@ -254,6 +254,23 @@ class CustomThinkCompletionContentParam(TypedDict, total=False):
     """The thinking type."""
 
 
+class CustomChatCompletionContentToolReferenceParam(TypedDict, total=False):
+    """A tool reference content param that only accepts a plain tool name.
+
+    Example:
+    {
+        "name": "get_weather",
+        "type": "tool_reference"
+    }
+    """
+
+    name: str
+    """The name of the tool being referenced."""
+
+    type: Literal["tool_reference"]
+    """The content type."""
+
+
 ChatCompletionContentPartParam: TypeAlias = (
     OpenAIChatCompletionContentPartParam
     | ChatCompletionContentPartAudioParam
@@ -266,6 +283,7 @@ ChatCompletionContentPartParam: TypeAlias = (
     | ChatCompletionContentPartAudioEmbedsParam
     | CustomChatCompletionContentSimpleAudioParam
     | CustomChatCompletionContentSimpleVideoParam
+    | CustomChatCompletionContentToolReferenceParam
     | str
     | CustomThinkCompletionContentParam
 )
