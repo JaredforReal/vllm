@@ -1518,6 +1518,12 @@ def _parse_chat_message_content_part(
         str_content = cast(str, content)
         mm_parser.parse_video(str_content, uuid)
         modality = "video"
+    elif part_type == "tool_reference":
+        # Tool references are not multimodal data — they reference deferred
+        # tools and are passed through as-is for the chat template to expand.
+        if wrap_dicts:
+            return {"type": "tool_reference", "name": cast(str, content)}
+        return cast(str, content)
     else:
         raise NotImplementedError(f"Unknown part type: {part_type}")
 
