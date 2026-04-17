@@ -136,6 +136,13 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
 class ChatCompletionToolsParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
     function: FunctionDefinition
+    defer_loading: bool | None = None
+
+    @model_validator(mode="after")
+    def _propagate_defer_loading(self) -> "ChatCompletionToolsParam":
+        if self.defer_loading is not None and self.function.defer_loading is None:
+            self.function.defer_loading = self.defer_loading
+        return self
 
 
 class ChatCompletionNamedFunction(OpenAIBaseModel):
