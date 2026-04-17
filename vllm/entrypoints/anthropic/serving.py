@@ -237,6 +237,10 @@ class AnthropicServingMessages(OpenAIServingChat):
             cls._convert_tool_use_block(block, tool_calls)
         elif block.type == "tool_result":
             cls._convert_tool_result_block(block, role, openai_messages, content_parts)
+        elif block.type == "tool_reference":
+            # Tool references are expanded during tool_result processing
+            # when they appear inside tool_result content.
+            pass
 
     @classmethod
     def _convert_tool_use_block(cls, block, tool_calls: list[dict[str, Any]]) -> None:
@@ -275,7 +279,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         """Convert user tool_result with text and image support"""
         tool_text = ""
         tool_image_urls: list[str] = []
-        tool_reference = []
+        tool_reference: list[dict[str, Any]] = []
 
         if isinstance(block.content, str):
             tool_text = block.content
