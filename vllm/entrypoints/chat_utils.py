@@ -1390,6 +1390,12 @@ def _parse_chat_message_content_mm_part(
                 # with url as a dict of {"url": url}
                 video_url = video_url.get("url", None)
             return "video_url", video_url
+        if "tool_reference" in part:
+            tool_reference_params = cast(
+                CustomChatCompletionContentToolReferenceParam, part
+            )
+            tool_reference = tool_reference_params.get("tool_reference", None)
+            return "tool_reference", tool_reference
         # Raise an error if no 'type' or direct URL is found.
         raise ValueError("Missing 'type' field in multimodal part.")
 
