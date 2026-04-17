@@ -39,6 +39,7 @@ class AnthropicContentBlock(BaseModel):
         "image",
         "tool_use",
         "tool_result",
+        "tool_reference",
         "thinking",
         "redacted_thinking",
     ]
@@ -72,6 +73,7 @@ class AnthropicTool(BaseModel):
     name: str
     description: str | None = None
     input_schema: dict[str, Any]
+    defer_loading: bool | None = None
 
     @field_validator("input_schema")
     @classmethod
