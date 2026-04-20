@@ -53,6 +53,8 @@ class AnthropicContentBlock(BaseModel):
     input: dict[str, Any] | None = None
     content: str | list[dict[str, Any]] | None = None
     is_error: bool | None = None
+    # For tool_reference content
+    tool_name: str | None = None
     # For thinking content
     thinking: str | None = None
     signature: str | None = None
