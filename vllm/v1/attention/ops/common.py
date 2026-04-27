@@ -256,14 +256,14 @@ def cp_lse_ag_out_ar(
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "Lmax"])
 def _pack_seq_kernel(
     x_ptr,  # [N, D]
     out_ptr,  # [B, Lmax, D]
     lengths_ptr,  # *i32, [B]
-    N: tl.constexpr,
+    N,  # total tokens
     D: tl.constexpr,
-    Lmax: tl.constexpr,
+    Lmax,  # max seq len
     PAD_VALUE: tl.constexpr,
     PAD_IS_UINT8: tl.constexpr,
     BLOCK_T: tl.constexpr,  # timesteps per program
@@ -382,13 +382,13 @@ def pack_seq_triton(
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B", "Lmax"])
 def _unpack_seq_triton_kernel(
     packed_ptr,  # [B, Lmax, D]
     out_ptr,  # [N, D]
     lengths_ptr,  # *i32, [B]
-    B: tl.constexpr,
-    Lmax: tl.constexpr,
+    B,  # batch size
+    Lmax,  # max seq len
     D: tl.constexpr,
     BLOCK_T: tl.constexpr,  # timesteps per program
     BLOCK_D: tl.constexpr,  # features per program
