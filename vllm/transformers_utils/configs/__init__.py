@@ -105,6 +105,7 @@ __all__ = [
     "FunAudioChatConfig",
     "FunAudioChatAudioEncoderConfig",
     "Granite4VisionConfig",
+    "GlmLinearConfig",
     "HunYuanVLConfig",
     "HunYuanVLTextConfig",
     "HunYuanVLVisionConfig",
