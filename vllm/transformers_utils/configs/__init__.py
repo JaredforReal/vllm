@@ -34,6 +34,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "FunAudioChatConfig": "vllm.transformers_utils.configs.funaudiochat",
     "FunAudioChatAudioEncoderConfig": "vllm.transformers_utils.configs.funaudiochat",
     "Granite4VisionConfig": "vllm.transformers_utils.configs.granite4_vision",
+    "GlmLinearConfig": "vllm.transformers_utils.configs.glm_linear",
     "HunYuanVLConfig": "vllm.transformers_utils.configs.hunyuan_vl",
     "HunYuanVLTextConfig": "vllm.transformers_utils.configs.hunyuan_vl",
     "HunYuanVLVisionConfig": "vllm.transformers_utils.configs.hunyuan_vl",
