@@ -24,9 +24,9 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
-import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+from typing import cast
 
 import torch
 from torch import nn
@@ -44,7 +44,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
@@ -204,6 +204,7 @@ class DeepseekV2MLP(nn.Module):
         reduce_results: bool = True,
         is_sequence_parallel=False,
         prefix: str = "",
+        swiglu_limit: float | None = None,
     ) -> None:
         super().__init__()
 
@@ -232,7 +233,12 @@ class DeepseekV2MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+
+        self.swiglu_limit = swiglu_limit
+        if self.swiglu_clamp_limit is not None:
+            self.act_fn = SiluAndMulWithClamp(clamp_limit=self.swiglu_clamp_limit)
+        else:
+            self.act_fn = SiluAndMul()
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
@@ -312,6 +318,7 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            swiglu_limit = getattr(config, "swiglu_clamp_limit", None)
 
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -321,6 +328,7 @@ class DeepseekV2MoE(nn.Module):
                 is_sequence_parallel=self.is_sequence_parallel,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
+                swiglu_limit=swiglu_limit,
             )
 
         self.experts = FusedMoE(
@@ -348,6 +356,7 @@ class DeepseekV2MoE(nn.Module):
             if self.is_fusion_moe_shared_experts_enabled
             else None,
             router_logits_dtype=self.gate.out_dtype,
+            swiglu_limit=swiglu_limit,
         )
 
         if (
@@ -1656,9 +1665,7 @@ class DeepseekV2ForCausalLM(
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # other available replicas.
-                        weight_loader = typing.cast(
-                            Callable[..., bool], param.weight_loader
-                        )
+                        weight_loader = cast(Callable[..., bool], param.weight_loader)
                         success = weight_loader(
                             param,
                             weight_to_load,
