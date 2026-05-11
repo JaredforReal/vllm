@@ -7,13 +7,13 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-class GlmLinearConfig(PretrainedConfig):
-    model_type = "glm_linear"
+class Glm5NextConfig(PretrainedConfig):
+    model_type = "glm5_next"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
-        model_type="glm_linear",
+        model_type="glm5_next",
         vocab_size=154880,
         hidden_size=4096,
         head_dim=None,
