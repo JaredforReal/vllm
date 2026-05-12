@@ -685,3 +685,13 @@ direct_register_custom_op(
     op_func=_hc_head_fused_kernel,
     mutates_args=["out"],
 )
+
+
+def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
+    """[s, hidden_size] -> [s, n * hidden_size] by replication."""
+    return x.repeat(1, n)
+
+
+def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
+    """[s, n * hidden_size] -> [s, hidden_size] by averaging."""
+    return x.unflatten(-1, (n, -1)).mean(dim=-2)

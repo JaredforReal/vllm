@@ -30,6 +30,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.mhc import hc_contract, hc_expand
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -40,9 +41,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
-from vllm.model_executor.models.deepseek_v2 import (
-    DeepseekV2MLAAttention as Glm5NextMLAAttention,
-)
+from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLAAttention
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoE
 from vllm.model_executor.models.interfaces import (
@@ -83,6 +82,13 @@ def naive_kda_lowerbound_gate(
     return g.to(output_dtype)
 
 
+class Glm5NextMLAAttention(DeepseekV2MLAAttention):
+    def forward(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        output[:] = super().forward(positions, hidden_states, None)
+
+
 class Glm5NextLinearAttention(KimiDeltaAttention):
     """GLM5-Next variant of KDA with safe_gate and allow_neg_eigval support"""
 
@@ -118,8 +124,8 @@ class Glm5NextLinearAttention(KimiDeltaAttention):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        hidden_states: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
         num_tokens = hidden_states.size(0)
@@ -175,7 +181,7 @@ class Glm5NextDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-
+        self.layer_idx = layer_idx
         self.is_moe = config.is_moe
 
         if config.is_kda_layer(layer_idx):
@@ -230,32 +236,106 @@ class Glm5NextDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # config.mhc = True
+        n = config.mhc_num_residual_streams
+        d_model = n * self.hidden_size
+        mix_hc = (2 + n) * n
+
+        # attn hc
+        self.attn_hc_mapping_proj = nn.Linear(
+            d_model, mix_hc, bias=False, dtype=torch.float32
+        )
+        self.attn_hc_bias = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+        self.attn_hc_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        if not config.mhc_no_norm_weight:
+            self.attn_hc_norm = nn.RMSNorm(d_model, eps=config.rms_norm_eps)
+        else:
+            self.attn_hc_norm = None
+
+        # ffn hc
+        self.ffn_hc_mapping_proj = nn.Linear(
+            d_model, mix_hc, bias=False, dtype=torch.float32
+        )
+        self.ffn_hc_bias = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+        self.ffn_hc_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        if not config.mhc_no_norm_weight:
+            self.ffn_hc_norm = nn.RMSNorm(d_model, eps=config.rms_norm_eps)
+        else:
+            self.ffn_hc_norm = None
+
     def forward(
         self,
+        input_ids: torch.Tensor,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
+        x: torch.Tensor,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # mHC start
+        if self.layer_idx == 0:
+            x = hc_expand(x, self.n)
 
-        attn_output = torch.empty_like(hidden_states)
+        # Self Attention
+        residual = x
+        post, comb, x = self.hc_pre(
+            x, self.attn_hc_mapping_proj.weight, self.attn_hc_scale, self.attn_hc_bias
+        )
+        x = self.input_layernorm(x)
+
+        attn_output = torch.empty_like(x)
         self.self_attn(
-            hidden_states=hidden_states,
+            hidden_states=x,
             positions=positions,
             output=attn_output,
         )
-        hidden_states = attn_output
+        x = attn_output
+
+        x = self.hc_post(x, residual, post, comb)
+
+        residual = x
+        post, comb, x = self.hc_pre(
+            x, self.attn_hc_mapping_proj.weight, self.attn_hc_scale, self.attn_hc_bias
+        )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+
+        x = self.hc_post(x, residual, post, comb)
+
+        # mHC end
+        if self.layer_idx == self.config.num_hidden_layers - 1:
+            x = hc_contract(x, self.n)
+
+        return x
+
+    def hc_pre(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ):
+        post_mix, res_mix, layer_input = torch.ops.vllm.mhc_pre(
+            residual=x,
+            fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=self.rms_norm_eps,
+            hc_pre_eps=self.hc_eps,
+            hc_sinkhorn_eps=self.hc_eps,
+            hc_post_mult_value=self.hc_post_alpha,
+            sinkhorn_repeat=self.hc_sinkhorn_iters,
+        )
+        return post_mix, res_mix, layer_input
+
+    def hc_post(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ):
+        return torch.ops.vllm.mhc_post(x, residual, post, comb)
 
 
 @support_torch_compile
@@ -263,7 +343,7 @@ class Glm5NextModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        config = vllm_config.model_config.hf_text_config
+        config = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
@@ -328,25 +408,20 @@ class Glm5NextModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
 
         for _, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
-            hidden_states, residual = layer(
+            hidden_states = layer(
                 positions=positions,
                 hidden_states=hidden_states,
-                residual=residual,
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            return IntermediateTensors({"hidden_states": hidden_states})
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
