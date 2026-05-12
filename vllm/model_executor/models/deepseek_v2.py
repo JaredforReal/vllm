@@ -896,6 +896,7 @@ class DeepseekV2MLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
+        skip_rope: bool | None = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -968,30 +969,34 @@ class DeepseekV2MLAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        if config.rope_parameters["rope_type"] != "default":
-            config.rope_parameters["rope_type"] = (
-                "deepseek_yarn"
-                if config.rope_parameters.get("apply_yarn_scaling", True)
-                else "deepseek_llama_scaling"
+        if not skip_rope:
+            if config.rope_parameters["rope_type"] != "default":
+                config.rope_parameters["rope_type"] = (
+                    "deepseek_yarn"
+                    if config.rope_parameters.get("apply_yarn_scaling", True)
+                    else "deepseek_llama_scaling"
+                )
+
+            self.rotary_emb = get_rope(
+                qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                rope_parameters=config.rope_parameters,
+                is_neox_style=False,
             )
 
-        self.rotary_emb = get_rope(
-            qk_rope_head_dim,
-            max_position=max_position_embeddings,
-            rope_parameters=config.rope_parameters,
-            is_neox_style=False,
-        )
+            if (
+                config.rope_parameters["rope_type"] != "default"
+                and config.rope_parameters["rope_type"] == "deepseek_yarn"
+            ):
+                mscale_all_dim = config.rope_parameters.get("mscale_all_dim", False)
+                scaling_factor = config.rope_parameters["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
+        else:
+            self.rotary_emb = None
 
-        if (
-            config.rope_parameters["rope_type"] != "default"
-            and config.rope_parameters["rope_type"] == "deepseek_yarn"
-        ):
-            mscale_all_dim = config.rope_parameters.get("mscale_all_dim", False)
-            scaling_factor = config.rope_parameters["factor"]
-            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-            self.scaling = self.scaling * mscale * mscale
-
-        self.is_v32 = hasattr(config, "index_topk")
+        # self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = False
 
         _skip_topk = False
         if self.is_v32:

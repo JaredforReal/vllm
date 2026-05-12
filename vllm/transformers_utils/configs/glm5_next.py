@@ -26,8 +26,7 @@ class Glm5NextConfig(PretrainedConfig):
         pad_token_id=151329,
         bos_token_id=None,
         eos_token_id=None,
-        rope_theta=10000.0,
-        rope_scaling=None,
+        rope_parameters=None,
         max_position_embeddings=4196,
         tie_word_embeddings=False,
         moe_intermediate_size: int | None = None,
@@ -90,8 +89,8 @@ class Glm5NextConfig(PretrainedConfig):
         self.hidden_act = hidden_act
         self.rms_norm_eps = rms_norm_eps
         self.max_position_embeddings = max_position_embeddings
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
+        self.rope_parameters = rope_parameters
+
         # mla config
         self.mla = mla
         self.q_lora_rank = q_lora_rank
