@@ -235,13 +235,12 @@ class Glm5NextDecoderLayer(nn.Module):
             and self.num_experts is not None
             and layer_idx >= config.first_k_dense_replace
         ):
-            self.experts = Glm5NextMoE(
+            self.mlp = Glm5NextMoE(
                 config=config,
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
-            self.mlp = self.experts
         else:
             self.mlp = Glm5NextMLP(
                 hidden_size=self.hidden_size,
