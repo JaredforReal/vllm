@@ -464,6 +464,14 @@ class Glm5NextModel(nn.Module):
             expert_params_mapping = []
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+
+        # GLM5-Next NoPE: checkpoint's kv_a_proj_with_mqa has only kv_lora_rank
+        # rows, but the model expects kv_lora_rank + qk_rope_head_dim rows.
+        # Pad the missing rope portion with zeros.
+        kv_a_pad_size = 0
+        if self.config.mla_nope and self.config.qk_rope_head_dim > 0:
+            kv_a_pad_size = self.config.qk_rope_head_dim
+
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
@@ -477,6 +485,17 @@ class Glm5NextModel(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
+
+            # Pad kv_a_proj_with_mqa for NoPE models
+            if kv_a_pad_size > 0 and ".kv_a_proj_with_mqa." in name:
+                pad = torch.zeros(
+                    kv_a_pad_size,
+                    *loaded_weight.shape[1:],
+                    dtype=loaded_weight.dtype,
+                    device=loaded_weight.device,
+                )
+                loaded_weight = torch.cat([loaded_weight, pad], dim=0)
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
