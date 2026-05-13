@@ -235,8 +235,8 @@ class DeepseekV2MLP(nn.Module):
             )
 
         self.swiglu_limit = swiglu_limit
-        if self.swiglu_clamp_limit is not None:
-            self.act_fn = SiluAndMulWithClamp(clamp_limit=self.swiglu_clamp_limit)
+        if self.swiglu_limit is not None:
+            self.act_fn = SiluAndMulWithClamp(clamp_limit=self.swiglu_limit)
         else:
             self.act_fn = SiluAndMul()
 
