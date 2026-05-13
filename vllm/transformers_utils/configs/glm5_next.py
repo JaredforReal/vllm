@@ -45,7 +45,7 @@ class Glm5NextConfig(PretrainedConfig):
         q_lora_rank: int | None = None,
         kv_lora_rank: int | None = 512,
         qk_nope_head_dim: int | None = 192,
-        qk_rope_head_dim: int | None = 64,
+        qk_rope_head_dim: int | None = 0,
         v_head_dim: int | None = None,
         mla_nope: bool | None = True,
         num_nextn_predict_layers: int = 0,
