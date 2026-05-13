@@ -56,7 +56,6 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
@@ -120,7 +119,7 @@ class Glm5NextLinearAttention(KimiDeltaAttention):
                 loaded_weight = loaded_weight.view([1, 1, -1, 1])
             return sharded_weight_loader(2)(param, loaded_weight)
 
-        set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader})
+        self.A_log.weight_loader = a_log_weight_loader
 
     def forward(
         self,
