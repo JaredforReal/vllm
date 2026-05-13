@@ -105,7 +105,54 @@ class Glm5NextMLAAttention(DeepseekV2MLAAttention):
     def forward(
         self, hidden_states: torch.Tensor, positions: torch.Tensor, output: torch.Tensor
     ) -> None:
-        output[:] = super().forward(positions, hidden_states, None)
+        mla = self.mla_attn  # MultiHeadLatentAttentionWrapper
+
+        if self.q_lora_rank is not None:
+            qkv_lora = mla.fused_qkv_a_proj(hidden_states)[0]
+            if _is_debug_rank():
+                _debug_print(f"    MLA fused_qkv_a_proj: norm={qkv_lora.float().norm():.4f}, "
+                             f"shape={qkv_lora.shape}, has_inf={qkv_lora.isinf().any()}")
+            q_c, kv_lora = qkv_lora.split(
+                [mla.q_lora_rank, mla.kv_lora_rank + mla.qk_rope_head_dim], dim=-1
+            )
+            q_c = mla.q_a_layernorm(q_c)
+            q = mla.q_b_proj(q_c)[0]
+        else:
+            kv_lora = mla.kv_a_proj_with_mqa(hidden_states)[0]
+            q = mla.q_proj(hidden_states)[0]
+
+        kv_c, k_pe = kv_lora.split([mla.kv_lora_rank, mla.qk_rope_head_dim], dim=-1)
+        kv_c_normed = mla.kv_a_layernorm(kv_c)
+
+        if _is_debug_rank():
+            _debug_print(f"    MLA q: norm={q.float().norm():.4f}, has_inf={q.isinf().any()}")
+            _debug_print(f"    MLA kv_c: norm={kv_c.float().norm():.4f}, has_inf={kv_c.isinf().any()}")
+            _debug_print(f"    MLA kv_c_normed: norm={kv_c_normed.float().norm():.4f}, has_inf={kv_c_normed.isinf().any()}")
+            _debug_print(f"    MLA k_pe: norm={k_pe.float().norm():.4f}, has_inf={k_pe.isinf().any()}")
+
+        q = q.view(-1, mla.num_heads, mla.qk_head_dim)
+        k_pe = k_pe.unsqueeze(1)
+
+        if mla.rotary_emb is not None:
+            q[..., mla.qk_nope_head_dim:], k_pe = mla.rotary_emb(
+                positions, q[..., mla.qk_nope_head_dim:], k_pe
+            )
+
+        attn_out = mla.mla_attn(
+            q, kv_c_normed, k_pe,
+            output_shape=(hidden_states.shape[0], mla.num_heads * mla.v_head_dim),
+        )
+
+        if _is_debug_rank():
+            _debug_print(f"    MLA attn_out: norm={attn_out.float().norm():.4f}, "
+                         f"has_inf={attn_out.isinf().any()}, has_nan={attn_out.isnan().any()}")
+
+        result = mla.o_proj(attn_out)[0]
+        if _is_debug_rank():
+            _debug_print(f"    MLA o_proj: norm={result.float().norm():.4f}, "
+                         f"has_inf={result.isinf().any()}")
+
+        output[:] = result
 
 
 class Glm5NextLinearAttention(KimiDeltaAttention):
