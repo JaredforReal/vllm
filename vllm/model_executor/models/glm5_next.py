@@ -66,6 +66,26 @@ KDA_SAFE_GATE_LOWER_BOUND = -5.0
 KDA_NEG_EIGVAL_BETA_SCALE = 2.0
 KDA_DEFAULT_BETA_SCALE = 1.0
 
+# --- Temporary debug helpers ---
+import os
+
+import torch.distributed as _dist
+
+_DEBUG_RANK = int(os.environ.get("GLM5_DEBUG_RANK", "0"))
+
+
+def _is_debug_rank() -> bool:
+    if not _dist.is_initialized():
+        return True
+    return _dist.get_rank() == _DEBUG_RANK
+
+
+def _debug_print(msg: str):
+    print(f"[GLM5-DEBUG] {msg}", flush=True)
+
+
+# --- End debug helpers ---
+
 
 def naive_kda_lowerbound_gate(
     g: torch.Tensor,
@@ -279,15 +299,37 @@ class Glm5NextDecoderLayer(nn.Module):
         x: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        _dbg = _is_debug_rank() and self.layer_idx in (
+            0,
+            1,
+            2,
+            10,
+            20,
+            30,
+            self.num_hidden_layers - 1,
+        )
+
         # mHC start
         if self.layer_idx == 0:
+            if _dbg:
+                _debug_print(
+                    f"  L{self.layer_idx} pre hc_expand: norm={x.float().norm():.4f}, shape={x.shape}"
+                )
             x = hc_expand(x, self.n)
+            if _dbg:
+                _debug_print(
+                    f"  L{self.layer_idx} post hc_expand: norm={x.float().norm():.4f}, shape={x.shape}"
+                )
 
         # Self Attention
         residual = x
         post, comb, x = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
+        if _dbg:
+            _debug_print(
+                f"  L{self.layer_idx} post hc_pre(attn): norm={x.float().norm():.4f}, shape={x.shape}"
+            )
         x = self.input_layernorm(x)
 
         attn_output = torch.empty_like(x)
@@ -297,6 +339,10 @@ class Glm5NextDecoderLayer(nn.Module):
             output=attn_output,
         )
         x = attn_output
+        if _dbg:
+            _debug_print(
+                f"  L{self.layer_idx} post attn: norm={x.float().norm():.4f}, shape={x.shape}"
+            )
 
         x = self.hc_post(x, residual, post, comb)
 
@@ -308,12 +354,24 @@ class Glm5NextDecoderLayer(nn.Module):
         # Fully Connected
         x = self.post_attention_layernorm(x)
         x = self.mlp(x)
+        if _dbg:
+            _debug_print(
+                f"  L{self.layer_idx} post mlp: norm={x.float().norm():.4f}, shape={x.shape}"
+            )
 
         x = self.hc_post(x, residual, post, comb)
 
         # mHC end
         if self.layer_idx == self.num_hidden_layers - 1:
+            if _dbg:
+                _debug_print(
+                    f"  L{self.layer_idx} pre hc_contract: norm={x.float().norm():.4f}, shape={x.shape}"
+                )
             x = hc_contract(x, self.n)
+            if _dbg:
+                _debug_print(
+                    f"  L{self.layer_idx} post hc_contract: norm={x.float().norm():.4f}, shape={x.shape}"
+                )
 
         return x
 
@@ -425,11 +483,26 @@ class Glm5NextModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        for _, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+        _debug = _is_debug_rank()
+        if _debug:
+            _debug_print(
+                f"[embed] shape={hidden_states.shape}, "
+                f"norm={hidden_states.float().norm():.4f}, "
+                f"nan={hidden_states.isnan().any()}"
+            )
+
+        for i, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
             hidden_states = layer(
                 positions=positions,
                 x=hidden_states,
             )
+            if _debug:
+                idx = self.start_layer + i
+                _debug_print(
+                    f"[layer {idx:2d}] shape={hidden_states.shape}, "
+                    f"norm={hidden_states.float().norm():.4f}, "
+                    f"nan={hidden_states.isnan().any()}"
+                )
 
         if not get_pp_group().is_last_rank:
             # PP: intermediate tensor may be 3D [T, n, H] (after hc_expand)
