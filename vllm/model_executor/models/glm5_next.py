@@ -453,9 +453,9 @@ class Glm5NextModel(nn.Module):
             # (param_name, weight_name, expert_id, shard_id)
             expert_params_mapping = fused_moe_make_expert_params_mapping(
                 self,
-                ckpt_gate_proj_name="w1",
-                ckpt_down_proj_name="w2",
-                ckpt_up_proj_name="w3",
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
                 num_experts=self.config.n_routed_experts,
             )
         else:
