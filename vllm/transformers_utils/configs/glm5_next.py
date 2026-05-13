@@ -93,7 +93,7 @@ class Glm5NextConfig(PretrainedConfig):
 
         # mla config
         self.mla = mla
-        self.q_lora_rank = q_lora_rank
+        self.q_lora_rank = None
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -183,3 +183,12 @@ class Glm5NextConfig(PretrainedConfig):
             self.linear_attn_config is not None
             and layer_idx in self.linear_attn_config["kda_layers"]
         )
+
+    @property
+    def layers_block_type(self):
+        if not self.is_linear_attn:
+            return ["attention"] * self.num_hidden_layers
+        return [
+            "linear_attention" if self.is_kda_layer(i) else "attention"
+            for i in range(self.num_hidden_layers)
+        ]
