@@ -347,7 +347,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 else None,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=quant_config,
+                quant_config=None,  # MLA projections are BF16 in checkpoint
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=getattr(config, "mla_nope", False),
