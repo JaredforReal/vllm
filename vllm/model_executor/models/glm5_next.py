@@ -180,6 +180,7 @@ class Glm5NextDecoderLayer(nn.Module):
 
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        parallel_config = vllm_config.parallel_config
 
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
@@ -236,6 +237,7 @@ class Glm5NextDecoderLayer(nn.Module):
         ):
             self.experts = Glm5NextMoE(
                 config=config,
+                parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
