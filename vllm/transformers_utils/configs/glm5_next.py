@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from transformers.configuration_utils import PretrainedConfig
 
 from vllm.logger import init_logger
@@ -14,26 +15,26 @@ class Glm5NextConfig(PretrainedConfig):
     def __init__(
         self,
         model_type="glm5_next",
-        vocab_size=154880,
-        hidden_size=4096,
-        head_dim=None,
-        intermediate_size=12288,
-        num_hidden_layers=45,
-        num_attention_heads=64,
-        num_key_value_heads=None,
-        hidden_act="silu",
-        rms_norm_eps=1e-05,
-        pad_token_id=151329,
-        bos_token_id=None,
-        eos_token_id=None,
-        rope_parameters=None,
-        max_position_embeddings=4196,
-        tie_word_embeddings=False,
-        moe_intermediate_size: int | None = None,
+        vocab_size: int = 154880,
+        hidden_size: int = 4096,
+        head_dim: int | None = None,
+        intermediate_size: int = 12288,
+        num_hidden_layers: int = 45,
+        num_attention_heads: int = 64,
+        num_key_value_heads: int | None = None,
+        hidden_act: str = "silu",
+        rms_norm_eps: float = 1e-5,
+        pad_token_id: int | None = 151329,
+        bos_token_id: int | None = None,
+        eos_token_id: int | list[int] | None = None,
+        rope_parameters: dict | None = None,
+        max_position_embeddings: int = 1013760,
+        tie_word_embeddings: bool = False,
+        moe_intermediate_size: int = 2048,
         moe_renormalize: bool = True,
         scoring_func: str = "sigmoid",
-        n_routed_experts: int | None = None,
-        num_experts_per_token: int | None = None,
+        n_routed_experts: int | None = 288,
+        num_experts_per_token: int = 7,
         n_shared_experts: int = 1,
         routed_scaling_factor: float = 2.5,
         first_k_dense_replace: int = 0,
@@ -42,23 +43,23 @@ class Glm5NextConfig(PretrainedConfig):
         n_group: int = 1,
         topk_group: int = 1,
         mla: bool = True,
-        q_lora_rank: int | None = None,
+        q_lora_rank: int | None = 1536,
         kv_lora_rank: int | None = 512,
         qk_nope_head_dim: int = 192,
         qk_rope_head_dim: int = 64,
-        v_head_dim: int | None = None,
+        v_head_dim: int | None = 256,
         mla_nope: bool | None = True,
-        num_nextn_predict_layers: int = 0,
+        num_nextn_predict_layers: int = 1,
         linear_attn_config: dict | None = None,
         index_head_dim: int | None = None,
         index_topk: int | None = None,
         index_n_heads: int | None = None,
         index_dsa_use_layernorm: bool = True,
         linear_conv_kernel_dim: int = 4,
-        linear_num_key_heads: int | None = None,
-        linear_num_value_heads: int | None = None,
-        linear_key_head_dim: int | None = None,
-        linear_value_head_dim: int | None = None,
+        linear_num_key_heads: int | None = 64,
+        linear_num_value_heads: int | None = 64,
+        linear_key_head_dim: int | None = 128,
+        linear_value_head_dim: int | None = 128,
         linear_allow_neg_eigval: bool | None = False,
         mhc: bool | None = True,
         mhc_num_residual_streams: int = 4,
@@ -68,7 +69,7 @@ class Glm5NextConfig(PretrainedConfig):
         mhc_no_norm_weight: bool | None = False,
         mhc_sinkhorn_iterations: int | None = 20,
         mhc_post_mult_value: float | None = 2.0,
-        swiglu_clamp_limit: float | None = None,
+        swiglu_limit: float | None = 10.0,
         **kwargs,
     ):
         self.model_type = model_type
@@ -142,7 +143,7 @@ class Glm5NextConfig(PretrainedConfig):
         self.mhc_sinkhorn_iterations = mhc_sinkhorn_iterations
         self.mhc_post_mult_value = mhc_post_mult_value
 
-        self.swiglu_clamp_limit = swiglu_clamp_limit
+        self.swiglu_limit = swiglu_limit
 
         super().__init__(
             pad_token_id=pad_token_id,

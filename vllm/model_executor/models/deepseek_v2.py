@@ -318,7 +318,7 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            swiglu_limit = getattr(config, "swiglu_clamp_limit", None)
+            swiglu_limit = getattr(config, "swiglu_limit", None)
 
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
