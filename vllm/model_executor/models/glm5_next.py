@@ -110,8 +110,10 @@ class Glm5NextMLAAttention(DeepseekV2MLAAttention):
         if self.q_lora_rank is not None:
             qkv_lora = mla.fused_qkv_a_proj(hidden_states)[0]
             if _is_debug_rank():
-                _debug_print(f"    MLA fused_qkv_a_proj: norm={qkv_lora.float().norm():.4f}, "
-                             f"shape={qkv_lora.shape}, has_inf={qkv_lora.isinf().any()}")
+                _debug_print(
+                    f"    MLA fused_qkv_a_proj: norm={qkv_lora.float().norm():.4f}, "
+                    f"shape={qkv_lora.shape}, has_inf={qkv_lora.isinf().any()}"
+                )
             q_c, kv_lora = qkv_lora.split(
                 [mla.q_lora_rank, mla.kv_lora_rank + mla.qk_rope_head_dim], dim=-1
             )
@@ -125,32 +127,46 @@ class Glm5NextMLAAttention(DeepseekV2MLAAttention):
         kv_c_normed = mla.kv_a_layernorm(kv_c)
 
         if _is_debug_rank():
-            _debug_print(f"    MLA q: norm={q.float().norm():.4f}, has_inf={q.isinf().any()}")
-            _debug_print(f"    MLA kv_c: norm={kv_c.float().norm():.4f}, has_inf={kv_c.isinf().any()}")
-            _debug_print(f"    MLA kv_c_normed: norm={kv_c_normed.float().norm():.4f}, has_inf={kv_c_normed.isinf().any()}")
-            _debug_print(f"    MLA k_pe: norm={k_pe.float().norm():.4f}, has_inf={k_pe.isinf().any()}")
+            _debug_print(
+                f"    MLA q: norm={q.float().norm():.4f}, has_inf={q.isinf().any()}"
+            )
+            _debug_print(
+                f"    MLA kv_c: norm={kv_c.float().norm():.4f}, has_inf={kv_c.isinf().any()}"
+            )
+            _debug_print(
+                f"    MLA kv_c_normed: norm={kv_c_normed.float().norm():.4f}, has_inf={kv_c_normed.isinf().any()}"
+            )
+            _debug_print(
+                f"    MLA k_pe: norm={k_pe.float().norm():.4f}, has_inf={k_pe.isinf().any()}"
+            )
 
         q = q.view(-1, mla.num_heads, mla.qk_head_dim)
         k_pe = k_pe.unsqueeze(1)
 
         if mla.rotary_emb is not None:
-            q[..., mla.qk_nope_head_dim:], k_pe = mla.rotary_emb(
-                positions, q[..., mla.qk_nope_head_dim:], k_pe
+            q[..., mla.qk_nope_head_dim :], k_pe = mla.rotary_emb(
+                positions, q[..., mla.qk_nope_head_dim :], k_pe
             )
 
         attn_out = mla.mla_attn(
-            q, kv_c_normed, k_pe,
+            q,
+            kv_c_normed,
+            k_pe,
             output_shape=(hidden_states.shape[0], mla.num_heads * mla.v_head_dim),
         )
 
         if _is_debug_rank():
-            _debug_print(f"    MLA attn_out: norm={attn_out.float().norm():.4f}, "
-                         f"has_inf={attn_out.isinf().any()}, has_nan={attn_out.isnan().any()}")
+            _debug_print(
+                f"    MLA attn_out: norm={attn_out.float().norm():.4f}, "
+                f"has_inf={attn_out.isinf().any()}, has_nan={attn_out.isnan().any()}"
+            )
 
         result = mla.o_proj(attn_out)[0]
         if _is_debug_rank():
-            _debug_print(f"    MLA o_proj: norm={result.float().norm():.4f}, "
-                         f"has_inf={result.isinf().any()}")
+            _debug_print(
+                f"    MLA o_proj: norm={result.float().norm():.4f}, "
+                f"has_inf={result.isinf().any()}"
+            )
 
         output[:] = result
 
@@ -195,9 +211,22 @@ class Glm5NextLinearAttention(KimiDeltaAttention):
         output: torch.Tensor,
     ) -> None:
         num_tokens = hidden_states.size(0)
+        _dbg = _is_debug_rank()
+
         q = self.q_proj(hidden_states)[0]
         k = self.k_proj(hidden_states)[0]
         v = self.v_proj(hidden_states)[0]
+
+        if _dbg:
+            _debug_print(
+                f"    KDA q_proj: norm={q.float().norm():.4f}, inf={q.isinf().any()}"
+            )
+            _debug_print(
+                f"    KDA k_proj: norm={k.float().norm():.4f}, inf={k.isinf().any()}"
+            )
+            _debug_print(
+                f"    KDA v_proj: norm={v.float().norm():.4f}, inf={v.isinf().any()}"
+            )
 
         beta = self.b_proj(hidden_states)[0].float().sigmoid()
         if self.allow_neg_eigval:
@@ -210,6 +239,14 @@ class Glm5NextLinearAttention(KimiDeltaAttention):
         else:
             g1 = fused_kda_gate(g1, self.A_log, self.head_dim, g_bias=self.dt_bias)
         g1 = g1.unsqueeze(0)
+
+        if _dbg:
+            _debug_print(
+                f"    KDA g1: norm={g1.float().norm():.4f}, inf={g1.isinf().any()}"
+            )
+            _debug_print(
+                f"    KDA beta: norm={beta.float().norm():.4f}, inf={beta.isinf().any()}"
+            )
 
         g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
@@ -228,9 +265,28 @@ class Glm5NextLinearAttention(KimiDeltaAttention):
             core_attn_out,
             self.prefix,
         )
+
+        if _dbg:
+            _debug_print(
+                f"    KDA core_attn_out: norm={core_attn_out.float().norm():.4f}, "
+                f"inf={core_attn_out.isinf().any()}, nan={core_attn_out.isnan().any()}"
+            )
+
         core_attn_out = self.o_norm(core_attn_out, g2)
+
+        if _dbg:
+            _debug_print(
+                f"    KDA o_norm: norm={core_attn_out.float().norm():.4f}, "
+                f"inf={core_attn_out.isinf().any()}, nan={core_attn_out.isnan().any()}"
+            )
+
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
+
+        if _dbg:
+            _debug_print(
+                f"    KDA o_proj: norm={output.float().norm():.4f}, inf={output.isinf().any()}"
+            )
 
 
 class Glm5NextDecoderLayer(nn.Module):
