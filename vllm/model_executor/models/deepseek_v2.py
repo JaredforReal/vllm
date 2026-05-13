@@ -935,15 +935,6 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.kv_a_proj_with_mqa",
             )
-            logger.info(
-                f"[ReplicatedLinear] prefix={self.kv_a_proj_with_mqa.prefix}, \
-                input_size={self.kv_a_proj_with_mqa.input_size}, \
-                output_size={self.kv_a_proj_with_mqa.output_size}"
-            )
-            logger.info(
-                f"[ReplicatedLinear] kv_lora_rank = {self.kv_lora_rank}, \
-                    qk_rope_head_dim = {self.qk_rope_head_dim}"
-            )
 
         if self.q_lora_rank is not None:
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)

@@ -214,7 +214,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 hidden_size=self.hidden_size,
                 num_heads=config.num_attention_heads,
                 qk_nope_head_dim=config.qk_nope_head_dim,
-                qk_rope_head_dim=0,
+                qk_rope_head_dim=config.qk_rope_head_dim,
                 v_head_dim=config.v_head_dim,
                 q_lora_rank=config.q_lora_rank
                 if hasattr(config, "q_lora_rank")
