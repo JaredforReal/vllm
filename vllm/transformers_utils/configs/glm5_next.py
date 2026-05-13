@@ -44,8 +44,8 @@ class Glm5NextConfig(PretrainedConfig):
         mla: bool = True,
         q_lora_rank: int | None = None,
         kv_lora_rank: int | None = 512,
-        qk_nope_head_dim: int | None = 192,
-        qk_rope_head_dim: int | None = 64,
+        qk_nope_head_dim: int = 192,
+        qk_rope_head_dim: int = 64,
         v_head_dim: int | None = None,
         mla_nope: bool | None = True,
         num_nextn_predict_layers: int = 0,
@@ -95,8 +95,8 @@ class Glm5NextConfig(PretrainedConfig):
         self.mla = mla
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_nope_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.qk_rope_head_dim = 0
         self.v_head_dim = v_head_dim
         self.mla_nope = mla_nope
         # moe config

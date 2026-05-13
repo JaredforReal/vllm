@@ -446,6 +446,9 @@ class Glm5NextModel(nn.Module):
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
+            # MLA: fuse q_a_proj and kv_a_proj_with_mqa
+            (".fused_qkv_a_proj", ".q_a_proj", 0),
+            (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
         ]
         if self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
@@ -485,7 +488,11 @@ class Glm5NextModel(nn.Module):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                name = name.replace(weight_name, param_name)
+                name_mapped = name.replace(weight_name, param_name)
+                # QKV fusion: skip if fused module doesn't exist in model
+                if param_name == ".fused_qkv_a_proj" and name_mapped not in params_dict:
+                    continue
+                name = name_mapped
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
