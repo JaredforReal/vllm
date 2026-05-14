@@ -80,8 +80,18 @@ def _is_debug_rank() -> bool:
     return _dist.get_rank() == _DEBUG_RANK
 
 
-def _debug_print(msg: str):
-    print(f"[GLM5-DEBUG] {msg}", flush=True)
+def _debug_print(msg: str, tensor: torch.Tensor | None = None):
+    if tensor is not None:
+        f = tensor.float()
+        print(
+            f"[GLM5-DEBUG] {msg} "
+            f"norm={f.norm():.4f}, min={f.min():.4f}, max={f.max():.4f}, "
+            f"mean={f.mean():.4f}, std={f.std():.4f}, "
+            f"nan={tensor.isnan().sum().item()}, inf={tensor.isinf().sum().item()}",
+            flush=True,
+        )
+    else:
+        print(f"[GLM5-DEBUG] {msg}", flush=True)
 
 
 # --- End debug helpers ---
@@ -420,9 +430,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 )
             x = hc_expand(x, self.n)
             if _dbg:
-                _debug_print(
-                    f"  L{self.layer_idx} post hc_expand: norm={x.float().norm():.4f}, shape={x.shape}"
-                )
+                _debug_print(f"  L{self.layer_idx} post hc_expand:", x)
 
         # Self Attention
         residual = x
@@ -430,9 +438,7 @@ class Glm5NextDecoderLayer(nn.Module):
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         if _dbg:
-            _debug_print(
-                f"  L{self.layer_idx} post hc_pre(attn): norm={x.float().norm():.4f}, shape={x.shape}"
-            )
+            _debug_print(f"  L{self.layer_idx} post hc_pre(attn):", x)
         x = self.input_layernorm(x)
 
         attn_output = torch.empty_like(x)
@@ -443,9 +449,7 @@ class Glm5NextDecoderLayer(nn.Module):
         )
         x = attn_output
         if _dbg:
-            _debug_print(
-                f"  L{self.layer_idx} post attn: norm={x.float().norm():.4f}, shape={x.shape}"
-            )
+            _debug_print(f"  L{self.layer_idx} post attn:", x)
 
         x = self.hc_post(x, residual, post, comb)
 
@@ -458,23 +462,17 @@ class Glm5NextDecoderLayer(nn.Module):
         x = self.post_attention_layernorm(x)
         x = self.mlp(x)
         if _dbg:
-            _debug_print(
-                f"  L{self.layer_idx} post mlp: norm={x.float().norm():.4f}, shape={x.shape}"
-            )
+            _debug_print(f"  L{self.layer_idx} post mlp:", x)
 
         x = self.hc_post(x, residual, post, comb)
 
         # mHC end
         if self.layer_idx == self.num_hidden_layers - 1:
             if _dbg:
-                _debug_print(
-                    f"  L{self.layer_idx} pre hc_contract: norm={x.float().norm():.4f}, shape={x.shape}"
-                )
+                _debug_print(f"  L{self.layer_idx} pre hc_contract:", x)
             x = hc_contract(x, self.n)
             if _dbg:
-                _debug_print(
-                    f"  L{self.layer_idx} post hc_contract: norm={x.float().norm():.4f}, shape={x.shape}"
-                )
+                _debug_print(f"  L{self.layer_idx} post hc_contract:", x)
 
         return x
 
@@ -588,11 +586,7 @@ class Glm5NextModel(nn.Module):
 
         _debug = _is_debug_rank()
         if _debug:
-            _debug_print(
-                f"[embed] shape={hidden_states.shape}, "
-                f"norm={hidden_states.float().norm():.4f}, "
-                f"nan={hidden_states.isnan().any()}"
-            )
+            _debug_print("[embed]", hidden_states)
 
         for i, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
             hidden_states = layer(
@@ -601,11 +595,7 @@ class Glm5NextModel(nn.Module):
             )
             if _debug:
                 idx = self.start_layer + i
-                _debug_print(
-                    f"[layer {idx:2d}] shape={hidden_states.shape}, "
-                    f"norm={hidden_states.float().norm():.4f}, "
-                    f"nan={hidden_states.isnan().any()}"
-                )
+                _debug_print(f"[layer {idx:2d}]", hidden_states)
 
         if not get_pp_group().is_last_rank:
             # PP: intermediate tensor may be 3D [T, n, H] (after hc_expand)
