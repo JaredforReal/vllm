@@ -117,7 +117,7 @@ class NixlConnectorWorker:
                 num_blocks,
                 num_fa_descs,
                 len(block_ids),
-                [t.name for t in self._group_spec_types],
+                [t.__name__ for t in self._group_spec_types],
                 [len(g) for g in block_ids],
                 block_size_ratio,
             )
@@ -981,6 +981,16 @@ class NixlConnectorWorker:
         self.num_regions = len(caches_data)
 
         if _DESC_DEBUG:
+            # Build a per-region spec type map for diagnosing hybrid models.
+            # Maps each base_addr index to its layer spec type name.
+            region_spec_map = []
+            for layer_name, cache_or_caches in xfer_buffers.items():
+                layer_spec = self._layer_specs[layer_name]
+                if isinstance(layer_spec, UniformTypeKVCacheSpecs):
+                    layer_spec = layer_spec.kv_cache_specs[layer_name]
+                region_spec_map.append(
+                    f"{layer_name}={type(layer_spec).__name__}"
+                )
             logger.warning(
                 "[DESC-DEBUG] register_kv_caches summary: "
                 "num_regions=%d num_blocks=%d logical_num_blocks=%d "
@@ -988,7 +998,9 @@ class NixlConnectorWorker:
                 "has_mamba=%s use_mla=%s "
                 "mamba_ssm_size=%s "
                 "block_len_per_layer_count=%d unique_block_lens=%s "
-                "tp_rank=%d tp_size=%d",
+                "tp_rank=%d tp_size=%d "
+                "group_spec_types=%s "
+                "layer_spec_types=%s",
                 self.num_regions,
                 self.num_blocks,
                 self._logical_num_blocks,
@@ -1001,6 +1013,8 @@ class NixlConnectorWorker:
                 set(self.block_len_per_layer),
                 self.tp_rank,
                 self.world_size,
+                [t.__name__ for t in self._group_spec_types],
+                region_spec_map[:10],  # first 10 for readability
             )
 
         if self.transfer_topo.virtually_split_kv_in_blocks:
