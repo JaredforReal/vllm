@@ -1121,8 +1121,15 @@ class NixlConnectorWorker:
             if meta.local_physical_block_ids and meta.local_physical_block_ids[0]
             else [0]
         )
-        for layer_idx in range(min(4, len(self.device_kv_caches))):
-            kv_tensor = self.device_kv_caches[layer_idx]
+        # device_kv_caches may be a dict (keyed by layer name) or a list.
+        kv_items = list(
+            self.device_kv_caches.items()
+            if isinstance(self.device_kv_caches, dict)
+            else enumerate(self.device_kv_caches)
+        )
+        for layer_key, kv_tensor in kv_items[:4]:
+            if not isinstance(kv_tensor, torch.Tensor):
+                continue
             for blk_id in block_ids_to_check:
                 if blk_id >= kv_tensor.shape[0]:
                     continue
@@ -1135,10 +1142,10 @@ class NixlConnectorWorker:
                 flat = block_data.flatten()
                 first_vals = flat[:8].tolist()
                 logger.warning(
-                    "[DESC-DEBUG] KV spot-check layer=%d block=%d: "
+                    "[DESC-DEBUG] KV spot-check layer=%s block=%d: "
                     "shape=%s dtype=%s mean=%.6f std=%.6f "
                     "nan=%s inf=%s first_vals=%s",
-                    layer_idx,
+                    layer_key,
                     blk_id,
                     tuple(kv_tensor[blk_id].shape),
                     kv_tensor.dtype,
