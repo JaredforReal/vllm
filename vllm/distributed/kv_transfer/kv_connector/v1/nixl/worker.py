@@ -1329,16 +1329,27 @@ class NixlConnectorWorker:
                 continue
             # For dual-purpose HMA regions, use the attention spec's stride
             # instead of block_len_per_layer (which stores KDA's stride).
-            # MLA stride is TP-independent (num_kv_heads=1), so skip
-            # block_size_ratio scaling — local and remote MLA strides match.
+            # MLA stride scales with block_size (tokens per block).  When P
+            # and D have different kernel block sizes, the LOCAL MLA stride
+            # cannot be used directly to step through REMOTE memory — we
+            # must scale it by the block_size ratio.
             attn_stride = self._attn_block_len.get(i)
             if attn_stride is not None:
-                if self.transfer_topo.virtually_split_kv_in_blocks:
-                    local_block_len = attn_stride // 2
+                # Compute remote MLA stride from local.  MLA page size is
+                # proportional to block_size, so:
+                #   remote_attn = local_attn * remote_block_size / local_block_size
+                if self.block_size != nixl_agent_meta.block_size:
+                    remote_attn_stride = (
+                        attn_stride * nixl_agent_meta.block_size // self.block_size
+                    )
                 else:
-                    local_block_len = attn_stride
+                    remote_attn_stride = attn_stride
+                if self.transfer_topo.virtually_split_kv_in_blocks:
+                    local_block_len = remote_attn_stride // 2
+                else:
+                    local_block_len = remote_attn_stride
                 remote_kv_block_len = local_block_len
-                page_size = attn_stride
+                page_size = remote_attn_stride
             else:
                 local_block_len = self.get_backend_aware_kv_block_len(
                     layer_idx=i, first_split=True, mamba_view=False
@@ -1354,13 +1365,15 @@ class NixlConnectorWorker:
             if _HETEROTP_DEBUG:
                 logger.info(
                     "HeteroTP build_fa_remote region %d/%d: "
-                    "attn_stride=%s, page_size=%s, "
-                    "local_block_len=%s, remote_kv_block_len=%s, "
-                    "rank_offset=%s, num_blocks=%s, "
-                    "num_attn_reads=%s, block_size_ratio=%s",
+                    "attn_stride=%s, remote_attn_stride=%s, "
+                    "page_size=%s, local_block_len=%s, "
+                    "remote_kv_block_len=%s, rank_offset=%s, "
+                    "num_blocks=%s, num_attn_reads=%s, "
+                    "block_size_ratio=%s, local_bs=%s, remote_bs=%s",
                     i,
                     len(nixl_agent_meta.kv_caches_base_addr),
                     attn_stride,
+                    remote_attn_stride if attn_stride is not None else "N/A",
                     page_size,
                     local_block_len,
                     remote_kv_block_len,
@@ -1368,6 +1381,8 @@ class NixlConnectorWorker:
                     num_blocks,
                     num_attn_reads,
                     block_size_ratio,
+                    self.block_size,
+                    nixl_agent_meta.block_size,
                 )
 
             for block_id in range(num_blocks):
@@ -1380,8 +1395,8 @@ class NixlConnectorWorker:
             if self.transfer_topo.virtually_split_kv_in_blocks:
                 # With FlashInfer index V separately to allow head splitting.
                 if attn_stride is not None:
-                    second_split = attn_stride // 2
-                    v_stride = attn_stride
+                    second_split = remote_attn_stride // 2
+                    v_stride = remote_attn_stride
                 else:
                     second_split = self.get_backend_aware_kv_block_len(
                         layer_idx=i, first_split=False, mamba_view=False
