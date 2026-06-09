@@ -762,7 +762,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
             if self.impl.dcp_world_size > 1:
-                assert not fp8_attention, "DCP not support fp8 kvcache now."
+                if not is_sparse_impl:
+                    assert not fp8_attention, "DCP not support fp8 kvcache now."
+                # For sparse MLA, FP8 KV cache is handled internally by the
+                # kernel and does not affect the DCP query all-gather.
+                # NOTE: For sparse MLA with DCP, the all-gather applies to ALL
+                # tokens (including prefill in mixed batches).  Mixed batches
+                # with DCP are not fully supported for sparse MLA yet; use
+                # decode-only batches for correct DCP behavior.
                 # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                 mqa_q = torch.cat(mqa_q, dim=-1)
                 # mqa_q do allgather in head dim.
@@ -774,7 +781,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
             # correct dcp attn_out with lse.
-            if self.impl.dcp_world_size > 1:
+            # Guard on lse is not None so that sparse MLA can skip DCP
+            # correction when it does not produce LSE (e.g. mixed batches).
+            if self.impl.dcp_world_size > 1 and lse is not None:
                 if self.dcp_a2a:
                     attn_out = dcp_a2a_lse_reduce(
                         attn_out,
