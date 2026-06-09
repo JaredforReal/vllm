@@ -82,6 +82,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Set to True via VLLM_HETEROTP_DEBUG=1 to enable verbose heterogeneous-TP
+# debug logging.  All logging positions check this flag; production runs skip.
+_HETEROTP_DEBUG = os.environ.get("VLLM_HETEROTP_DEBUG", "0") == "1"
+
 
 class NixlConnectorWorker:
     """Implementation of Worker side methods"""
@@ -963,6 +967,21 @@ class NixlConnectorWorker:
         logger.debug(
             "Different block lengths collected: %s", set(self.block_len_per_layer)
         )
+        if _HETEROTP_DEBUG:
+            logger.info(
+                "HeteroTP region metadata: num_regions=%d, num_blocks=%d, "
+                "logical_num_blocks=%d, phys_per_logical=%d, "
+                "is_ssm=%s, is_attn=%s, attn_block_len=%s, "
+                "block_len_per_layer=%s",
+                len(seen_base_addresses),
+                self.num_blocks,
+                self._logical_num_blocks,
+                self._physical_blocks_per_logical_kv_block,
+                self._is_ssm_region,
+                self._is_attn_region,
+                self._attn_block_len,
+                self.block_len_per_layer,
+            )
         assert len(self.block_len_per_layer) == len(seen_base_addresses)
         # Expand NIXL registration size for dual-purpose regions.  KDA
         # registers first with its stride, but the physical allocation
@@ -1013,6 +1032,26 @@ class NixlConnectorWorker:
         self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
         logger.debug("Done registering descs")
         self._registered_descs.append(descs)
+
+        if _HETEROTP_DEBUG:
+            for idx, (base, size, dev, _label) in enumerate(caches_data):
+                logger.info(
+                    "HeteroTP NIXL region %d: base=0x%x, size=%d, "
+                    "end=0x%x, is_ssm=%s, is_attn=%s, block_len=%s, "
+                    "attn_block_len=%s",
+                    idx,
+                    base,
+                    size,
+                    base + size,
+                    self._is_ssm_region[idx] if idx < len(self._is_ssm_region) else "?",
+                    self._is_attn_region[idx]
+                    if idx < len(self._is_attn_region)
+                    else "?",
+                    self.block_len_per_layer[idx]
+                    if idx < len(self.block_len_per_layer)
+                    else "?",
+                    self._attn_block_len.get(idx, "N/A"),
+                )
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
@@ -1091,6 +1130,23 @@ class NixlConnectorWorker:
             page_stride = (
                 self.block_len_per_layer[i] // block_size_ratio * physical_per_logical
             )
+            if _HETEROTP_DEBUG:
+                max_offset = (num_blocks - 1) * page_stride + conv_size + ssm_size
+                logger.info(
+                    "HeteroTP build_mamba_local region %d: "
+                    "page_stride=%s, conv_offsets=%s, "
+                    "num_blocks=%s, block_size_ratio=%s, "
+                    "phys_per_logical=%s, max_offset=%d, "
+                    "conv+ssm_per_block=%d",
+                    i,
+                    page_stride,
+                    conv_offsets,
+                    num_blocks,
+                    block_size_ratio,
+                    physical_per_logical,
+                    max_offset,
+                    conv_size + ssm_size,
+                )
             for off, sz in conv_offsets:
                 for blk in range(num_blocks):
                     result.append(
@@ -1142,6 +1198,31 @@ class NixlConnectorWorker:
             if i < len(self._is_ssm_region) and not self._is_ssm_region[i]:
                 continue
             page_stride = nixl_agent_meta.block_lens[i] * remote_physical_per_logical
+            if _HETEROTP_DEBUG:
+                max_offset = (
+                    (num_blocks - 1) * page_stride
+                    + conv_size_remote
+                    + local_offset * ssm_read_size
+                    + ssm_read_size
+                )
+                logger.info(
+                    "HeteroTP build_mamba_remote region %d: "
+                    "page_stride=%s, conv_offsets=%s, "
+                    "ssm_read_size=%s, num_blocks=%s, "
+                    "local_offset=%s, tp_ratio=%s, "
+                    "effective_ratio=%s, max_offset=%d, "
+                    "remote_block_len=%s",
+                    i,
+                    page_stride,
+                    conv_offsets,
+                    ssm_read_size,
+                    num_blocks,
+                    local_offset,
+                    tp_ratio,
+                    effective_ratio,
+                    max_offset,
+                    nixl_agent_meta.block_lens[i],
+                )
             for off, sz in conv_offsets:
                 for blk in range(num_blocks):
                     result.append((base_addr + blk * page_stride + off, sz, device_id))
@@ -1190,6 +1271,20 @@ class NixlConnectorWorker:
                     // block_size_ratio
                 )
                 page_stride = self.block_len_per_layer[i] // block_size_ratio
+            if _HETEROTP_DEBUG:
+                logger.info(
+                    "HeteroTP build_fa_local region %d/%d: "
+                    "attn_stride=%s, page_stride=%s, "
+                    "kv_block_len=%s, num_blocks=%s, "
+                    "block_size_ratio=%s",
+                    i,
+                    len(base_addresses),
+                    attn_stride,
+                    page_stride,
+                    kv_block_len,
+                    num_blocks,
+                    block_size_ratio,
+                )
             for block_id in range(num_blocks):
                 block_offset = block_id * page_stride
                 addr = base_addr + block_offset
@@ -1255,6 +1350,25 @@ class NixlConnectorWorker:
 
             local_block_len = local_block_len // num_attn_reads
             rank_offset = plan.rank_offset_factor * remote_kv_block_len
+
+            if _HETEROTP_DEBUG:
+                logger.info(
+                    "HeteroTP build_fa_remote region %d/%d: "
+                    "attn_stride=%s, page_size=%s, "
+                    "local_block_len=%s, remote_kv_block_len=%s, "
+                    "rank_offset=%s, num_blocks=%s, "
+                    "num_attn_reads=%s, block_size_ratio=%s",
+                    i,
+                    len(nixl_agent_meta.kv_caches_base_addr),
+                    attn_stride,
+                    page_size,
+                    local_block_len,
+                    remote_kv_block_len,
+                    rank_offset,
+                    num_blocks,
+                    num_attn_reads,
+                    block_size_ratio,
+                )
 
             for block_id in range(num_blocks):
                 block_offset = block_id * page_size
@@ -1405,6 +1519,18 @@ class NixlConnectorWorker:
             remote_tp_size=remote_tp_size,
             group_spec_types=self._group_spec_types,
         )
+        plan = self.tp_mappings[engine_id]
+
+        if _HETEROTP_DEBUG:
+            logger.info(
+                "HeteroTP tp_mapping: source_ranks_per_group=%s, "
+                "all_source_ranks=%s, rank_offset_factor=%s, "
+                "rank_to_attention_slot=%s",
+                plan.source_ranks_per_group,
+                plan.all_source_ranks,
+                plan.rank_offset_factor,
+                plan.rank_to_attention_slot,
+            )
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
@@ -1444,6 +1570,25 @@ class NixlConnectorWorker:
                 nixl_agent_meta.block_size
             )
 
+        if _HETEROTP_DEBUG:
+            logger.info(
+                "HeteroTP add_remote_agent: engine=%s, remote_rank=%s/%s, "
+                "local_tp=%s, tp_ratio=%s, "
+                "block_size_ratio(byte)=%s, "
+                "local_block_len[0]=%s, remote_block_len[0]=%s, "
+                "local_block_size=%s, remote_block_size=%s",
+                engine_id,
+                remote_tp_rank,
+                remote_tp_size,
+                self.world_size,
+                transfer_topo.tp_ratio(remote_tp_size),
+                block_size_ratio,
+                self.block_len_per_layer[0] if self.block_len_per_layer else "N/A",
+                nixl_agent_meta.block_lens[0] if nixl_agent_meta.block_lens else "N/A",
+                self.block_size,
+                nixl_agent_meta.block_size,
+            )
+
         if engine_id not in self.dst_num_blocks:
             self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
 
@@ -1463,8 +1608,6 @@ class NixlConnectorWorker:
             remote_tp_rank,
             tp_ratio,
         )
-
-        plan = self.tp_mappings[engine_id]
 
         ### (Optional) Register local agent memory regions. MLA is not split.
         # For hybrid MLA+GDN models, SSM state is TP-sharded and must be split
@@ -1524,6 +1667,27 @@ class NixlConnectorWorker:
                 )
             )
         # Register with NIXL.
+        if _HETEROTP_DEBUG and blocks_data:
+            min_desc_addr = min(a for a, _, _ in blocks_data)
+            max_desc_end = max(a + s for a, s, _ in blocks_data)
+            remote_base0 = (
+                nixl_agent_meta.kv_caches_base_addr[0]
+                if nixl_agent_meta.kv_caches_base_addr
+                else 0
+            )
+            logger.info(
+                "HeteroTP remote descs: %d total, "
+                "addr_range=[0x%x, 0x%x), remote_base[0]=0x%x, "
+                "remote_num_blocks=%d, remote_block_lens=%s",
+                len(blocks_data),
+                min_desc_addr,
+                max_desc_end,
+                remote_base0,
+                nixl_agent_meta.num_blocks,
+                nixl_agent_meta.block_lens[:3]
+                if len(nixl_agent_meta.block_lens) <= 10
+                else nixl_agent_meta.block_lens[:3],
+            )
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
