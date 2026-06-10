@@ -904,20 +904,24 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         topk_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_tokens = q.shape[0]
+        # Use actual head count from q — after DCP all-gather the head
+        # dimension is num_heads * dcp_world_size.
+        actual_num_heads = q.size(1)
+
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
 
         # NOTE(Chen): kernel requires num_local_head to be a multiple of
         # 64 on hopper and 128 on blackwell
-        if self.num_heads % self.prefill_padding != 0:
-            assert self.prefill_padding % self.num_heads == 0
+        if actual_num_heads % self.prefill_padding != 0:
+            assert self.prefill_padding % actual_num_heads == 0
             logger.warning_once(
-                f"Padding num_heads from {self.num_heads} to "
+                f"Padding num_heads from {actual_num_heads} to "
                 f"{self.prefill_padding} for BF16 sparse prefill kernel"
             )
             q_padded = q.new_empty((q.shape[0], self.prefill_padding, q.shape[2]))
-            q_padded[:, : self.num_heads, :] = q
+            q_padded[:, :actual_num_heads, :] = q
             q = q_padded
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
@@ -934,9 +938,9 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 if lse.dim() == 3:
                     # (num_tokens, 1, padded_heads) -> (num_tokens, padded_heads)
                     lse = lse.squeeze(1)
-                lse = lse[:, : self.num_heads]
+                lse = lse[:, :actual_num_heads]
 
-        output = output[:, : self.num_heads, :]
+        output = output[:, :actual_num_heads, :]
         return output, lse
 
     def forward_mqa(
