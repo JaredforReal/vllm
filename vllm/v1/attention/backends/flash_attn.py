@@ -48,7 +48,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
 )
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv, round_up
@@ -622,6 +622,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
 class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
+    # PCP prefill is supported (GQA zigzag, attention-only v1; see
+    # ``_forward_with_pcp``). Decode under PCP is inert (replicated cache).
+    supports_pcp: bool = True
 
     def __init__(
         self,
@@ -694,6 +697,20 @@ class FlashAttentionImpl(AttentionImpl):
         self._dcp_dtype: torch.dtype | None = None
         if vllm_config is not None and self.dcp_world_size > 1:
             self._dcp_dtype = vllm_config.model_config.dtype
+
+        # CP config consumed by the PCP paths (stored on the impl, not just the
+        # builder, so _forward_with_pcp / _forward_decode_pcp can build a
+        # CPContext without reaching back into parallel_config).
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+            if vllm_config is not None
+            else 1
+        )
+        self.dcp_comm_backend = (
+            vllm_config.parallel_config.dcp_comm_backend
+            if vllm_config is not None
+            else "ag_rs"
+        )
 
     def forward(
         self,
@@ -804,6 +821,37 @@ class FlashAttentionImpl(AttentionImpl):
             k_descale = layer._k_scale.expand(descale_shape)
             v_descale = layer._v_scale.expand(descale_shape)
 
+            if self.pcp_world_size > 1:
+                if self._pcp_prefill_active(attn_metadata):
+                    # Prefill: zigzag Q-shard attention against the full
+                    # in-memory KV (nomask + mask per chunk, LSE-merged);
+                    # outputs assembled by all-reduce.
+                    self._forward_with_pcp(
+                        query[:num_actual_tokens],
+                        key[:num_actual_tokens],
+                        value[:num_actual_tokens],
+                        output[:num_actual_tokens],
+                        attn_metadata,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                    )
+                    return output
+                if self._pcp_decode_active(attn_metadata):
+                    # Decode (Mode-2): each rank attends its (replicated)
+                    # decode Q against its local KV shard, then merges out/lse
+                    # across PCP (+DCP) via LSE.
+                    self._forward_decode_pcp(
+                        query[:num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        output[:num_actual_tokens],
+                        attn_metadata,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                    )
+                    return output
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
@@ -926,6 +974,269 @@ class FlashAttentionImpl(AttentionImpl):
             layer._k_scale,
             layer._v_scale,
         )
+
+    def _pcp_prefill_active(self, attn_metadata: FlashAttentionMetadata) -> bool:
+        """Whether to run the PCP prefill path for this batch.
+
+        v1: only pure-prefill batches (every request query_len > 1). Decode-only
+        and mixed prefill+decode batches fall back to the normal path -- PCP is
+        inert at decode (replicated cache). Mixed-batch PCP is Phase E.
+        """
+        if self.pcp_world_size <= 1:
+            return False
+        if attn_metadata.max_query_len <= 1:
+            return False
+        qlens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
+        return int(qlens.min()) > 1
+
+    def _pcp_decode_active(self, attn_metadata: FlashAttentionMetadata) -> bool:
+        """Whether to run the PCP Mode-2 decode path: a pure decode batch
+        (every request query_len == 1) under PCP. Mixed batches fall back to
+        the normal path (Phase E)."""
+        if self.pcp_world_size <= 1:
+            return False
+        return attn_metadata.max_query_len <= 1
+
+    @staticmethod
+    def _pcp_real_chunks(
+        q_len: int, pcp_size: int, pcp_rank: int
+    ) -> list[tuple[int, int]]:
+        # Thin wrapper over the shared cp.py primitive so the zigzag chunk math
+        # lives in exactly one place (vllm/v1/attention/cp.py).
+        from vllm.v1.attention.cp import pcp_zigzag_real_chunks
+
+        return pcp_zigzag_real_chunks(q_len, pcp_size, pcp_rank)
+
+    def _forward_with_pcp(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        q_descale: torch.Tensor | None = None,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
+    ) -> None:
+        """GQA zigzag PCP prefill (attention-only v1).
+
+        Each PCP rank computes attention for its zigzag Q-shard (head+tail real
+        chunks) against the FULL in-memory K/V (every rank has full K/V in
+        attention-only mode). Per chunk, a causal-free "nomask" call over the
+        prefix KV is merged (via LSE) with a causal "mask" call over the local
+        chunk KV -- this split is required for correctness because a single
+        causal ``flash_attn_varlen_func`` call treats each segment's Q as
+        starting at position 0, which is wrong for a shard at global offset.
+
+        Outputs are assembled by zero-filling the full output buffer with each
+        rank's disjoint shard and all-reducing across the PCP group.
+
+        v1 scope: pure-prefill batches (caller gates via
+        ``_pcp_prefill_active``); replicated cache; decode inert.
+        """
+        assert self.vllm_flash_attn_version is not None, (
+            "FlashAttention version not detected."
+        )
+        from vllm.v1.attention.cp import CPContext
+
+        # Route CP facts through the shared CPContext value object instead of
+        # ad-hoc get_pcp_group() / self.pcp_* reads scattered in the backend.
+        ctx = CPContext(
+            pcp_size=self.pcp_world_size,
+            pcp_rank=self.pcp_rank,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            pcp_group=get_pcp_group(),
+            dcp_group=get_dcp_group(),
+            interleave=self.cp_kv_cache_interleave_size,
+            dcp_comm_backend=self.dcp_comm_backend,
+        )
+        assert ctx.pcp_group is not None  # pcp_active guarantees the group
+        pcp_group = ctx.pcp_group
+        pcp_size = ctx.pcp_size
+        pcp_rank = ctx.pcp_rank
+        cu = attn_metadata.query_start_loc
+        qlens = cu[1:] - cu[:-1]
+        num_reqs = int(qlens.shape[0])
+        device = query.device
+        sliding_window_size = (
+            list(self.sliding_window) if self.sliding_window is not None else None
+        )
+        num_heads, head_size = self.num_heads, self.head_size
+
+        output.zero_()
+        for i in range(num_reqs):
+            q_i = int(qlens[i].item())
+            off = int(cu[i].item())
+            for chunk_start, chunk_len in self._pcp_real_chunks(
+                q_i, pcp_size, pcp_rank
+            ):
+                if chunk_len <= 0:
+                    continue
+                q_chunk = query[off + chunk_start : off + chunk_start + chunk_len]
+                cu_q = torch.tensor([0, chunk_len], device=device, dtype=torch.int32)
+                # mask: local causal chunk (Q and K both shifted by chunk_start,
+                # so causal within is globally correct).
+                k_loc = key[off + chunk_start : off + chunk_start + chunk_len]
+                v_loc = value[off + chunk_start : off + chunk_start + chunk_len]
+                mask_out, mask_lse = flash_attn_varlen_func(
+                    q=q_chunk,
+                    k=k_loc,
+                    v=v_loc,
+                    cu_seqlens_q=cu_q,
+                    max_seqlen_q=chunk_len,
+                    cu_seqlens_k=cu_q,
+                    max_seqlen_k=chunk_len,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=sliding_window_size,
+                    softcap=self.logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                if chunk_start > 0:
+                    # nomask: causal-free attention over the prefix KV
+                    # (every K in the prefix is strictly before every Q in the
+                    # chunk, so no mask is needed -> faster kernel path).
+                    k_pre = key[off : off + chunk_start]
+                    v_pre = value[off : off + chunk_start]
+                    cu_k = torch.tensor(
+                        [0, chunk_start], device=device, dtype=torch.int32
+                    )
+                    nomask_out, nomask_lse = flash_attn_varlen_func(
+                        q=q_chunk,
+                        k=k_pre,
+                        v=v_pre,
+                        cu_seqlens_q=cu_q,
+                        max_seqlen_q=chunk_len,
+                        cu_seqlens_k=cu_k,
+                        max_seqlen_k=chunk_start,
+                        softmax_scale=self.scale,
+                        causal=False,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=sliding_window_size,
+                        softcap=self.logits_soft_cap,
+                        return_softmax_lse=True,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                    )
+                    chunk_out = torch.empty(
+                        (chunk_len, num_heads, head_size),
+                        device=device,
+                        dtype=output.dtype,
+                    )
+                    merge_attn_states(
+                        chunk_out,
+                        nomask_out,
+                        nomask_lse,
+                        mask_out,
+                        mask_lse,
+                        prefill_tokens_with_context=chunk_len,
+                    )
+                else:
+                    chunk_out = mask_out
+                output[off + chunk_start : off + chunk_start + chunk_len] = chunk_out
+
+        # Assemble the full output across PCP ranks. Each rank filled only its
+        # own (disjoint) shard positions; all-reduce (sum) reconstructs the full
+        # output on every rank for the residual stream.
+        output.copy_(pcp_group.all_reduce(output.contiguous()))
+
+    def _forward_decode_pcp(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        q_descale: torch.Tensor | None = None,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
+    ) -> None:
+        """PCP decode (Mode-2).
+
+        Port of vLLM-Ascend's ``_forward_decode_pcp_dcp`` +
+        ``_process_attn_out_lse``. The KV cache is sharded round-robin across
+        the full CP group (``total_cp = pcp*dcp``), so each rank owns a
+        disjoint slice of each request's KV. Each rank attends its (replicated)
+        decode Q against its local KV shard, then the per-rank partial
+        (out, lse) are merged across PCP (+DCP) via LSE
+        (:func:`cp_merge_decode_out_lse`).
+
+        Decode Q is not gathered across PCP (decode tokens are replicated);
+        it is gathered across DCP heads when ``dcp>1``.
+        """
+        assert self.vllm_flash_attn_version is not None, (
+            "FlashAttention version not detected."
+        )
+        from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+        from vllm.v1.attention.cp import CPContext, cp_merge_decode_out_lse
+
+        ctx = CPContext(
+            pcp_size=self.pcp_world_size,
+            pcp_rank=self.pcp_rank,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            pcp_group=get_pcp_group(),
+            dcp_group=get_dcp_group(),
+            interleave=self.cp_kv_cache_interleave_size,
+            dcp_comm_backend=self.dcp_comm_backend,
+        )
+        cu = attn_metadata.query_start_loc
+        seq_lens = attn_metadata.seq_lens
+        num_reqs = int(cu.shape[0]) - 1
+        total_cp = self.total_cp_world_size
+        total_rank = self.total_cp_rank
+        interleave = self.cp_kv_cache_interleave_size
+
+        # Per-request KV length owned by this total_cp rank (round-robin).
+        local_kv = get_dcp_local_seq_lens(
+            seq_lens[:num_reqs], total_cp, total_rank, interleave
+        )
+        # Workspace bound without a GPU->CPU sync.
+        max_local_kv = (
+            (attn_metadata.max_seq_len + total_cp * interleave - 1)
+            // (total_cp * interleave)
+        ) * interleave
+
+        q = query.contiguous()
+        if self.dcp_world_size > 1:
+            q = get_dcp_group().all_gather(q, dim=1)
+        sliding_window_size = (
+            list(self.sliding_window) if self.sliding_window is not None else None
+        )
+        attn_out, softmax_lse = flash_attn_varlen_func(
+            q=q,
+            k=key_cache,
+            v=value_cache,
+            cu_seqlens_q=cu,
+            max_seqlen_q=attn_metadata.max_query_len,
+            seqused_k=local_kv,
+            max_seqlen_k=max_local_kv,
+            softmax_scale=self.scale,
+            causal=False,
+            alibi_slopes=self.alibi_slopes,
+            window_size=sliding_window_size,
+            block_table=attn_metadata.block_table,
+            softcap=self.logits_soft_cap,
+            return_softmax_lse=True,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            num_splits=attn_metadata.max_num_splits,
+        )
+        # FA returns lse as [H, B]; cp_merge_decode_out_lse wants [B, H].
+        merged = cp_merge_decode_out_lse(
+            ctx, attn_out, softmax_lse.transpose(0, 1), self.head_size
+        )
+        output[: merged.shape[0]] = merged
 
     def _forward_with_dcp(
         self,

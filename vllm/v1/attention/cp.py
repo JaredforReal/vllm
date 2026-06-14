@@ -244,6 +244,36 @@ def pcp_zigzag_owner_rank(position: int, padded_len: int, pcp_size: int) -> int:
     return int(min(c, 2 * pcp_size - 1 - c))
 
 
+def pcp_zigzag_real_chunks(
+    q_len: int, pcp_size: int, pcp_rank: int
+) -> list[tuple[int, int]]:
+    """Real (non-padded) head+tail chunk ``(start, len)`` ranges within a
+    request of ``q_len`` tokens owned by ``pcp_rank`` under zigzag.
+
+    Unlike :func:`pcp_zigzag_rank_positions` (which returns padded positions
+    for the balanced all-gather of the sequence-parallel mode), this returns
+    only the *real* token ranges (clipped to ``[0, q_len)``). It is used by the
+    attention-only PCP path, where each rank computes attention for its real
+    Q-shard and outputs are assembled via all-reduce (no padding/balancing
+    needed).
+
+    ``chunk = ceil(q_len / (2*pcp_size))``; the ``2*pcp_size`` chunks of size
+    ``chunk`` are assigned so rank ``r`` owns chunk ``r`` (head) and chunk
+    ``(2*pcp_size-1-r)`` (tail). The returned ranges across all ranks partition
+    ``[0, q_len)`` disjointly.
+    """
+    c = (q_len + 2 * pcp_size - 1) // (2 * pcp_size)
+    if c == 0:
+        return []
+    chunks: list[tuple[int, int]] = []
+    for j in (pcp_rank, 2 * pcp_size - 1 - pcp_rank):
+        start = j * c
+        end = min((j + 1) * c, q_len)
+        if start < end:
+            chunks.append((start, end - start))
+    return chunks
+
+
 # ---------------------------------------------------------------------------
 # Batch layout construction
 # ---------------------------------------------------------------------------
@@ -435,3 +465,81 @@ def pcp_gather_logits(
     owner_rank = owner_rank.to(gathered.device, non_blocking=True)
     req_idx = torch.arange(num_requests, device=gathered.device)
     return gathered[owner_rank, req_idx]
+
+
+def cp_merge_decode_out_lse(
+    ctx: CPContext,
+    attn_out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    head_size: int,
+) -> torch.Tensor:
+    """Merge per-rank decode attention (out, lse) across PCP and DCP (Mode-2).
+
+    Faithful port of vLLM-Ascend's ``_process_attn_out_lse`` +
+    ``_npu_attention_update``, using a pure-torch N-way logsumexp merge
+    (Ascend's ``_update_out_and_lse``) in place of the CANN
+    ``npu_attention_update`` op.
+
+    Flow::
+
+        cat(out, lse) -> [B, H_total, D+1]
+        if dcp>1: all_to_all over heads (DCP)
+        if pcp>1: all_gather over seq   (PCP) -> [pcp*B, H_total, D+1]
+        reshape [pcp, B, dcp, H, D+1] -> [N=pcp*dcp, B, H, D+1]
+        N-way online-softmax merge      -> [B, H, D]
+
+    Each rank computed attention of (its Q) against (its local KV shard); the
+    per-rank partial (out, lse) are combined into the correct full output via
+    logsumexp weighting.
+
+    Args:
+        ctx: CP context (uses ``pcp_group`` and ``dcp_group``).
+        attn_out: ``[B, H_total, D]`` where ``H_total`` includes DCP-gathered
+            heads when ``dcp>1``.
+        softmax_lse: ``[B, H_total]`` or ``[B, H_total, 1]``.
+        head_size: ``D``.
+
+    Returns:
+        ``[B, H, D]`` merged output, where ``H = H_total // dcp_size``.
+    """
+    import torch.distributed as dist
+
+    pcp_size = ctx.pcp_size
+    dcp_size = ctx.dcp_size
+    out = attn_out.to(torch.float32)
+    lse = softmax_lse.to(torch.float32)
+    if lse.dim() == 2:
+        lse = lse.unsqueeze(-1)
+    attn_out_lse = torch.cat([out, lse], dim=-1)  # [B, H_total, D+1]
+
+    if dcp_size > 1:
+        assert ctx.dcp_group is not None  # dcp_size>1 implies the group exists
+        # head-dim all-to-all across the DCP group: [B, H_total, D+1] ->
+        # [H_total, D+1, B] -> a2a -> [H_total, D+1, B] -> [B, H_total, D+1].
+        attn_out_lse = attn_out_lse.permute(1, 2, 0).contiguous()
+        recv = torch.empty_like(attn_out_lse)
+        dist.all_to_all_single(recv, attn_out_lse, group=ctx.dcp_group.device_group)
+        attn_out_lse = recv.permute(2, 0, 1).contiguous()
+
+    if pcp_size > 1:
+        assert ctx.pcp_group is not None  # pcp_size>1 implies the group exists
+        # seq-dim all-gather across the PCP group: -> [pcp*B, H_total, D+1].
+        attn_out_lse = ctx.pcp_group.all_gather(attn_out_lse.contiguous(), dim=0)
+
+    b_total, h_total, d_plus_1 = attn_out_lse.shape
+    seq = b_total // pcp_size if pcp_size > 1 else b_total
+    heads = h_total // dcp_size if dcp_size > 1 else h_total
+    assert d_plus_1 == head_size + 1, (d_plus_1, head_size)
+
+    # [pcp, seq, dcp, heads, D+1] -> [N=pcp*dcp, seq, heads, D+1].
+    x = attn_out_lse.view(pcp_size, seq, dcp_size, heads, d_plus_1)
+    x = x.permute(0, 2, 1, 3, 4).contiguous().view(-1, seq, heads, d_plus_1)
+    out_flat = x[..., :head_size]  # [N, seq, heads, D]
+    lse_flat = x[..., head_size:]  # [N, seq, heads, 1]
+
+    # N-way online-softmax merge (Ascend _update_out_and_lse).
+    lse_final = torch.logsumexp(lse_flat, dim=0)  # [seq, heads, 1]
+    out_final = torch.sum(
+        torch.exp(lse_flat - lse_final) * out_flat, dim=0
+    )  # [seq, heads, D]
+    return out_final.to(attn_out.dtype)

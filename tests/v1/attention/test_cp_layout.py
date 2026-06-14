@@ -18,6 +18,7 @@ from vllm.v1.attention.cp import (
     pcp_zigzag_owner_rank,
     pcp_zigzag_padded_len,
     pcp_zigzag_rank_positions,
+    pcp_zigzag_real_chunks,
 )
 
 
@@ -147,6 +148,26 @@ def test_policy_only_zigzag_supported():
             pcp_rank=0,
             policy=CPShardingPolicy.CONTINUOUS,
         )
+
+
+@pytest.mark.parametrize("pcp_size", [2, 3, 4])
+@pytest.mark.parametrize("query_len", [1, 2, 3, 5, 8, 12, 16, 23, 100])
+def test_zigzag_real_chunks_partition(query_len, pcp_size):
+    """Real (non-padded) chunks across ranks partition [0, query_len) disjointly.
+
+    This is the primitive used by the attention-only PCP path (FlashAttention
+    `_forward_with_pcp`); the partition guarantee is what makes the per-rank
+    Q-shards assemble into the full output via all-reduce.
+    """
+    seen: set[int] = set()
+    for r in range(pcp_size):
+        for start, length in pcp_zigzag_real_chunks(query_len, pcp_size, r):
+            assert length > 0
+            for p in range(start, start + length):
+                assert p < query_len
+                assert p not in seen  # disjoint
+                seen.add(p)
+    assert seen == set(range(query_len))  # complete cover
 
 
 class _FakePCPGroup:
