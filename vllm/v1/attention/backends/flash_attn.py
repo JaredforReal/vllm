@@ -3,6 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -972,8 +973,14 @@ class FlashAttentionImpl(AttentionImpl):
         v1: only pure-prefill batches (every request query_len > 1). Decode-only
         and mixed prefill+decode batches fall back to the normal path -- PCP is
         inert at decode (replicated cache). Mixed-batch PCP is Phase E.
+
+        Diagnostic: set ``VLLM_PCP_DISABLE_ATTENTION=1`` to force the normal
+        path (PCP fully inert, replicated cache) -- used to isolate whether a
+        failure is in the PCP attention code or in the distributed/cache setup.
         """
         if self.pcp_world_size <= 1:
+            return False
+        if os.environ.get("VLLM_PCP_DISABLE_ATTENTION", "0") == "1":
             return False
         if attn_metadata.max_query_len <= 1:
             return False
