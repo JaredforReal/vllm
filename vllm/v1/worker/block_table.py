@@ -10,7 +10,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.cp_utils import get_total_cp_world_size
+from vllm.v1.worker.cp_utils import get_dcp_world_size
 
 logger = init_logger(__name__)
 
@@ -145,8 +145,15 @@ class BlockTable:
         positions: torch.Tensor,
     ) -> None:
         num_tokens = positions.shape[0]
-        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
-        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        # The KV cache is sharded by DCP only. PCP uses a *replicated* cache
+        # (PCP is a prefill-compute optimization and is inert at decode), so
+        # PCP ranks do not partition KV slots -- every PCP rank holds the full
+        # cache and decode runs the normal path. This is backward-compatible:
+        # when pcp_world_size == 1 the values are identical to the prior
+        # ``pcp*dcp`` formula. (Engaging total_cp sharding for PCP -- the
+        # ascend-style decode Mode-2 path -- is a future opt-in.)
+        total_cp_world_size = self.dcp_world_size
+        total_cp_rank = self.dcp_rank
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,
@@ -245,9 +252,11 @@ class MultiGroupBlockTable:
             # (max_model_len//dcp_world_size) tokens in kvcache,
             # so the block_size which used for calc max_num_blocks_per_req
             # must be multiplied by dcp_world_size.
-            total_cp_world_size = get_total_cp_world_size()
+            # PCP uses a replicated cache (PCP inert at decode), so it does
+            # not reduce per-rank block allocation -- only DCP does.
+            dcp_world_size = get_dcp_world_size()
             max_num_blocks = [
-                cdiv(max_model_len, block_size * total_cp_world_size)
+                cdiv(max_model_len, block_size * dcp_world_size)
                 for block_size in block_sizes
             ]
 
