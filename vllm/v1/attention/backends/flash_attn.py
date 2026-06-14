@@ -821,37 +821,28 @@ class FlashAttentionImpl(AttentionImpl):
             k_descale = layer._k_scale.expand(descale_shape)
             v_descale = layer._v_scale.expand(descale_shape)
 
-            if self.pcp_world_size > 1:
-                if self._pcp_prefill_active(attn_metadata):
-                    # Prefill: zigzag Q-shard attention against the full
-                    # in-memory KV (nomask + mask per chunk, LSE-merged);
-                    # outputs assembled by all-reduce.
-                    self._forward_with_pcp(
-                        query[:num_actual_tokens],
-                        key[:num_actual_tokens],
-                        value[:num_actual_tokens],
-                        output[:num_actual_tokens],
-                        attn_metadata,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                    )
-                    return output
-                if self._pcp_decode_active(attn_metadata):
-                    # Decode (Mode-2): each rank attends its (replicated)
-                    # decode Q against its local KV shard, then merges out/lse
-                    # across PCP (+DCP) via LSE.
-                    self._forward_decode_pcp(
-                        query[:num_actual_tokens],
-                        key_cache,
-                        value_cache,
-                        output[:num_actual_tokens],
-                        attn_metadata,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                    )
-                    return output
+            # NOTE: PCP decode (Mode-2 LSE-merge over a total_cp-sharded cache)
+            # is implemented in ``_forward_decode_pcp`` but is NOT dispatched
+            # here -- it produced incorrect outputs (gsm8k ~0.0) and could not
+            # be diagnosed without multi-GPU runs. The cache is replicated
+            # across PCP ranks (sharded by DCP only, see block_table) and decode
+            # runs the normal path below against the full cache. Re-enable the
+            # sharded decode once diagnosed on H100.
+            if self.pcp_world_size > 1 and self._pcp_prefill_active(attn_metadata):
+                # Prefill: zigzag Q-shard attention against the full in-memory
+                # KV (nomask + mask per chunk, LSE-merged); outputs assembled
+                # by all-reduce.
+                self._forward_with_pcp(
+                    query[:num_actual_tokens],
+                    key[:num_actual_tokens],
+                    value[:num_actual_tokens],
+                    output[:num_actual_tokens],
+                    attn_metadata,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                return output
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
                     query[:num_actual_tokens],

@@ -56,3 +56,17 @@ def get_total_cp_world_size():
         # DCP might not be initialized in testing
         dcp_world_size = 1
     return dcp_world_size * pcp_world_size
+
+
+def get_dcp_world_size():
+    """DCP world size with a testing fallback.
+
+    The KV cache is sharded by DCP only (PCP uses a replicated cache and is
+    inert at decode), so cache sizing / slot-mapping use this rather than the
+    full ``pcp*dcp`` total.
+    """
+    try:
+        return get_dcp_group().world_size
+    except AssertionError:
+        # DCP might not be initialized in testing
+        return 1
