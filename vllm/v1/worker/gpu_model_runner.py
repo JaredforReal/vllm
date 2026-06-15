@@ -43,6 +43,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
+    get_pcp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -205,6 +206,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.pcp_manager import PCPManager
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -415,6 +417,20 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+@dataclass
+class _PCPStep:
+    """Per-step Prefill-Context-Parallel state: produced in _prepare_inputs,
+    consumed by _build_attention_metadata (-> metadata.cp) and execute_model
+    (hidden-state all-gather + restore). Module-level so the runner can
+    annotate ``self._pcp_split`` without a forward reference."""
+
+    num_decode_tokens: int
+    num_prefills: int
+    restore_idx: torch.Tensor | None = None
+    prefill_query_lens: torch.Tensor | None = None
+    split: object | None = None  # PCPSplitResult (numpy arrays)
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -464,6 +480,29 @@ class GPUModelRunner(
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
+        # Prefill Context Parallelism (PCP) topology. PCP slices each prefill
+        # request's tokens head-tail across ranks (see PCPManager); decode tokens
+        # are replicated. `pcp_world_size>1` selects the FlashAttentionCP backend
+        # (get_attn_backends_for_group) and triggers per-rank token slicing in
+        # _prepare_inputs + a hidden-state all-gather/restore in execute_model.
+        try:
+            self.pcp_world_size = get_pcp_group().world_size
+            self.pcp_rank = get_pcp_group().rank_in_group
+        except AssertionError:
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
+        self.pcp_manager: PCPManager | None = None
+        if self.pcp_world_size > 1:
+            self.pcp_manager = PCPManager(
+                pcp_world_size=self.pcp_world_size,
+                pcp_world_rank=self.pcp_rank,
+                dcp_world_size=self.dcp_world_size,
+                dcp_world_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            )
+        # Per-step PCP split result (set in _prepare_inputs, consumed in
+        # _build_attention_metadata + execute_model). None when PCP inactive.
+        self._pcp_split: _PCPStep | None = None
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
 
@@ -1697,6 +1736,91 @@ class GPUModelRunner(
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             prev_positions[i] = prev_req_id_to_index.get(req_id, -1)
 
+    def _apply_pcp_slicing(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        total_num_scheduled_tokens: int,
+    ) -> tuple[int, np.ndarray]:
+        """Slice this rank's tokens for Prefill Context Parallelism.
+
+        Pure-prefill batches are head-tail zigzag-sliced per PCP rank (decode
+        tokens would be replicated). Rewrites ``self.positions`` (GPU),
+        ``self.input_ids.cpu`` and ``self.query_start_loc`` (cpu+gpu) to the
+        per-rank layout and stores the split on ``self._pcp_split`` for
+        ``_build_attention_metadata`` + ``execute_model``. ``slot_mapping`` is
+        left on natural positions (the backend's all-gather+restore cache write
+        realigns the full natural KV to it).
+
+        P4 scope: pure-prefill and pure-decode batches only; mixed batches
+        raise (P4b -- needs decode-first reordering + interleaved dispatch).
+        """
+        if self.pcp_world_size <= 1 or self.pcp_manager is None:
+            self._pcp_split = None
+            cu = np.cumsum(num_scheduled_tokens[:num_reqs])
+            return total_num_scheduled_tokens, cu
+
+        sched = num_scheduled_tokens[:num_reqs]
+        num_decode_reqs = int((sched == 1).sum())
+        num_prefill_reqs = num_reqs - num_decode_reqs
+        if num_decode_reqs > 0 and num_prefill_reqs > 0:
+            raise NotImplementedError(
+                "PCP mixed prefill+decode batch is not supported yet (P4b); "
+                "use a pure-prefill or pure-decode batch."
+            )
+
+        if num_decode_reqs == num_reqs:
+            # Pure decode: tokens are replicated across PCP ranks -- no slicing.
+            # num_decode_tokens == num_reqs (each decode request is 1 token).
+            self._pcp_split = _PCPStep(
+                num_decode_tokens=num_reqs, num_prefills=0, restore_idx=None
+            )
+            cu = np.cumsum(sched)
+            return total_num_scheduled_tokens, cu
+
+        # Pure prefill: head-tail zigzag slice for this rank.
+        split = self.pcp_manager.split(sched, 0, 0, self.arange_np)
+        per_rank_tokens = split.pcp_tokens  # [num_reqs], this rank's per-req count
+        new_total = int(per_rank_tokens.sum())
+        # Per-token request index in the sliced layout ([req0 head+tail, req1, ...]).
+        sliced_req_indices: np.ndarray = np.repeat(
+            self.arange_np[:num_reqs], per_rank_tokens
+        )
+        # Absolute positions = num_computed[req] + relative head/tail position.
+        num_computed = self.input_batch.num_computed_tokens_cpu
+        sliced_positions = (
+            num_computed[sliced_req_indices] + split.positions[:new_total]
+        ).astype(np.int64)
+        # Re-gather input_ids at the sliced (absolute) positions.
+        token_indices = (
+            sliced_positions + sliced_req_indices * self.input_batch.max_model_len
+        )
+        token_indices_t = torch.as_tensor(token_indices, dtype=torch.long)
+        torch.index_select(
+            self.input_batch.token_ids_cpu_tensor.flatten(),
+            0,
+            token_indices_t,
+            out=self.input_ids.cpu[:new_total],
+        )
+        # Rewrite positions (GPU) and query_start_loc (cpu+gpu).
+        self.positions[:new_total] = sliced_positions
+        new_cu = np.cumsum(per_rank_tokens).astype(np.int32)
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1 : num_reqs + 1] = new_cu
+        self.query_start_loc.np[num_reqs + 1 :].fill(int(new_cu[-1]))
+        self.query_start_loc.copy_to_gpu()
+
+        self._pcp_split = _PCPStep(
+            num_decode_tokens=0,
+            num_prefills=num_reqs,
+            restore_idx=torch.as_tensor(
+                split.pcp_allgather_restore_idx, dtype=torch.int32
+            ),
+            prefill_query_lens=torch.as_tensor(per_rank_tokens, dtype=torch.int32),
+            split=split,
+        )
+        return new_total, new_cu
+
     def _prepare_input_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2104,6 +2228,14 @@ class GPUModelRunner(
             self.positions[:total_num_scheduled_tokens],
         )
 
+        # PCP: slice this rank's tokens (head-tail zigzag for prefill, decode
+        # replicated). slot_mapping above is kept on NATURAL positions (the
+        # backend's all-gather+restore cache write aligns the full natural KV
+        # with it); positions/input_ids/query_start_loc are rewritten per-rank.
+        total_num_scheduled_tokens, cu_num_tokens = self._apply_pcp_slicing(
+            num_reqs, num_scheduled_tokens, total_num_scheduled_tokens
+        )
+
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
             scheduler_output,
@@ -2343,6 +2475,10 @@ class GPUModelRunner(
             cm_base.dcp_local_seq_lens_cpu = self.dcp_local_seq_lens.cpu[
                 :num_reqs_padded
             ]
+
+        # PCP: carry the per-step split to the CP metadata builder.
+        if self.pcp_world_size > 1:
+            cm_base.pcp = self._pcp_split
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -4289,6 +4425,27 @@ class GPUModelRunner(
                 # Common case.
                 hidden_states = model_output
                 aux_hidden_states = None
+
+            # PCP: when this step ran prefill, each rank's hidden states are in
+            # per-rank (head/tail) layout. all-gather across the PCP group and
+            # index_select(restore_idx) to recover natural token order before
+            # logits. (Decode steps already produced full output via the LSE
+            # merge, so no restore is needed there.)
+            if (
+                self.pcp_world_size > 1
+                and self._pcp_split is not None
+                and self._pcp_split.num_prefills > 0
+            ):
+                pcp_group = get_pcp_group()
+                per_rank = hidden_states.shape[0]
+                gathered = pcp_group.all_gather(
+                    hidden_states[:per_rank].contiguous(), dim=0
+                )
+                assert self._pcp_split.restore_idx is not None
+                restore = self._pcp_split.restore_idx[: gathered.shape[0]].to(
+                    gathered.device
+                )
+                hidden_states = torch.index_select(gathered, 0, restore.long())
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -6712,6 +6869,11 @@ class GPUModelRunner(
             # layer.
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_backend = layers[layer_name].get_attn_backend()
+
+                # NOTE: the PCP impl/builder swap happens inside
+                # FlashAttentionBackend.get_impl_cls/get_builder_cls (gated on
+                # pcp_size>1) so it takes effect at Attention.__init__ (model
+                # load), not here. This grouping function only reads the backend.
 
                 if layer_name in self.kv_sharing_fast_prefill_eligible_layers:
                     attn_backend = create_fast_prefill_custom_backend(

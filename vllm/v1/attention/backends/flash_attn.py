@@ -3,7 +3,6 @@
 """Attention layer with FlashAttention."""
 
 import copy
-import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -49,7 +48,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
 )
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv, round_up
@@ -64,6 +63,21 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+
+
+def _pcp_active() -> bool:
+    """Whether Prefill Context Parallelism is active for this process.
+
+    Read lazily (PCP group is created in ``init_distributed_environment``,
+    before model loading) with a try/except for unit-test contexts where the
+    group is uninitialized.
+    """
+    from vllm.distributed.parallel_state import get_pcp_group
+
+    try:
+        return get_pcp_group().world_size > 1
+    except AssertionError:
+        return False
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -131,10 +145,25 @@ class FlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["FlashAttentionImpl"]:
+        # PCP: swap to the CP impl at Attention.__init__ time when prefill
+        # context parallelism is active. This is the ascend pattern
+        # (attention_v1.py:85-98) -- gated on the runtime PCP world size, so
+        # non-PCP runs are unaffected. Done here (not in the runner's grouping
+        # fn) so the per-layer impl is swapped at construction.
+        if _pcp_active():
+            from vllm.v1.attention.backends.flash_attn_cp import FlashAttentionCPImpl
+
+            return FlashAttentionCPImpl  # type: ignore[return-value]
         return FlashAttentionImpl
 
     @staticmethod
     def get_builder_cls() -> type["FlashAttentionMetadataBuilder"]:
+        if _pcp_active():
+            from vllm.v1.attention.backends.flash_attn_cp import (
+                FlashAttentionCPMetadataBuilder,
+            )
+
+            return FlashAttentionCPMetadataBuilder  # type: ignore[return-value]
         return FlashAttentionMetadataBuilder
 
     @staticmethod
@@ -273,6 +302,12 @@ class FlashAttentionMetadata:
     # PrefixLM bidirectional ranges for multimodal tokens.
     # Shape: (num_seqs, max_ranges, 2) int32, [start, end] per range.
     mm_prefix_range_tensor: torch.Tensor | None = None
+
+    # Context-Parallel metadata (only populated by the FlashAttentionCP backend
+    # builder; ``None`` for the stock backend). Loosely typed to avoid an import
+    # cycle (the CP metadata type lives in flash_attn_cp.py and imports this
+    # module); tightened once the backend is selected.
+    cp: object = None
 
 
 def _get_sliding_window_configs(
@@ -623,9 +658,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
 class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
-    # PCP (GQA) is supported: ``_forward_pcp`` unifies prefill, decode, and
-    # mixed batches over a total_cp-sharded KV cache.
-    supports_pcp: bool = True
 
     def __init__(
         self,
@@ -698,20 +730,6 @@ class FlashAttentionImpl(AttentionImpl):
         self._dcp_dtype: torch.dtype | None = None
         if vllm_config is not None and self.dcp_world_size > 1:
             self._dcp_dtype = vllm_config.model_config.dtype
-
-        # CP config consumed by the PCP path (stored on the impl, not just the
-        # builder, so _forward_pcp can build a CPContext without reaching back
-        # into parallel_config).
-        self.cp_kv_cache_interleave_size = (
-            vllm_config.parallel_config.cp_kv_cache_interleave_size
-            if vllm_config is not None
-            else 1
-        )
-        self.dcp_comm_backend = (
-            vllm_config.parallel_config.dcp_comm_backend
-            if vllm_config is not None
-            else "ag_rs"
-        )
 
     def forward(
         self,
@@ -822,26 +840,6 @@ class FlashAttentionImpl(AttentionImpl):
             k_descale = layer._k_scale.expand(descale_shape)
             v_descale = layer._v_scale.expand(descale_shape)
 
-            # PCP: the KV cache is sharded across the full CP group
-            # (``total_cp = pcp*dcp``, interleaved via the block_table slot
-            # kernel), so PCP is *not* inert at decode. ``_forward_pcp`` unifies
-            # prefill, decode, and mixed batches (it mirrors ``_forward_with_dcp``
-            # with the cache-shard partial attention LSE-merged across PCP
-            # instead of DCP).
-            if self.pcp_world_size > 1:
-                self._forward_pcp(
-                    query[:num_actual_tokens],
-                    key[:num_actual_tokens],
-                    value[:num_actual_tokens],
-                    key_cache,
-                    value_cache,
-                    output[:num_actual_tokens],
-                    attn_metadata,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                )
-                return output
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
@@ -964,163 +962,6 @@ class FlashAttentionImpl(AttentionImpl):
             layer._k_scale,
             layer._v_scale,
         )
-
-    def _forward_pcp(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        output: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
-        q_descale: torch.Tensor | None = None,
-        k_descale: torch.Tensor | None = None,
-        v_descale: torch.Tensor | None = None,
-    ) -> None:
-        """Unified PCP attention for prefill, decode, and mixed batches.
-
-        Mirrors ``_forward_with_dcp`` (which vLLM ships for DCP and which
-        handles mixed prefill+decode via per-request ``cu_seqlens``), with three
-        PCP substitutions:
-
-        1. The KV cache is sharded across the full CP group (``total_cp =
-           pcp*dcp``, interleaved via the block_table slot kernel), so the
-           *context* attention (Q vs paged cache) runs on each rank's 1/cp
-           shard and its partial ``(out, lse)`` are merged across PCP (+DCP)
-           via :func:`cp_merge_decode_out_lse`.
-        2. Q is gathered across DCP heads only when ``dcp>1`` -- PCP shards the
-           sequence, not heads, so for the common ``dcp==1`` case Q is used
-           as-is.
-        3. The *query* attention (Q vs the new in-memory KV, causal) is full on
-           every rank and is LSE-merged with the merged context via
-           ``merge_attn_states`` -- identical to the DCP path.
-
-        ``num_computed = seq_lens - query_lens`` is the per-request context
-        length (0 for a fresh prefill; ``seq_len-1`` for a decode token). A
-        fresh prefill has a zero-length context segment; flash_attn_varlen
-        returns ``lse=-inf`` for it, so the context contributes nothing and the
-        result reduces to plain causal prefill (the same property the DCP path
-        relies on).
-        """
-        assert self.vllm_flash_attn_version is not None, (
-            "FlashAttention version not detected."
-        )
-        from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
-        from vllm.v1.attention.cp import CPContext, cp_merge_decode_out_lse
-
-        ctx = CPContext(
-            pcp_size=self.pcp_world_size,
-            pcp_rank=self.pcp_rank,
-            dcp_size=self.dcp_world_size,
-            dcp_rank=self.dcp_rank,
-            pcp_group=get_pcp_group(),
-            dcp_group=get_dcp_group(),
-            interleave=self.cp_kv_cache_interleave_size,
-            dcp_comm_backend=self.dcp_comm_backend,
-        )
-
-        cu_seqlens_q = attn_metadata.query_start_loc
-        max_seqlen_q = attn_metadata.max_query_len
-        block_table = attn_metadata.block_table
-        seq_lens = attn_metadata.seq_lens
-        query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-        # Context length per request = tokens already cached before this query.
-        num_computed = seq_lens - query_lens
-
-        total_cp = self.total_cp_world_size
-        total_rank = self.total_cp_rank
-        interleave = self.cp_kv_cache_interleave_size
-        # Per-rank local shard of the context KV length (round-robin).
-        local_ctx_kv = get_dcp_local_seq_lens(
-            num_computed, total_cp, total_rank, interleave
-        )
-        # Workspace bound without a GPU->CPU sync.
-        max_local_ctx = (
-            (attn_metadata.max_seq_len + total_cp * interleave - 1)
-            // (total_cp * interleave)
-        ) * interleave
-
-        query = query.contiguous()
-        # Gather Q across DCP heads only (PCP shards the sequence, not heads).
-        if self.dcp_world_size > 1:
-            q_ctx = get_dcp_group().all_gather(query, dim=1)
-        else:
-            q_ctx = query
-
-        sliding_window_size = (
-            list(self.sliding_window) if self.sliding_window is not None else None
-        )
-
-        # 1. Context attention: Q vs the local paged-cache shard, non-causal.
-        #    Partial because the cache is sharded across total_cp.
-        context_attn_out, context_lse = flash_attn_varlen_func(
-            q=q_ctx,
-            k=key_cache,
-            v=value_cache,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=local_ctx_kv,
-            max_seqlen_k=max_local_ctx,
-            softmax_scale=self.scale,
-            causal=False,
-            alibi_slopes=self.alibi_slopes,
-            window_size=sliding_window_size,
-            block_table=block_table,
-            softcap=self.logits_soft_cap,
-            return_softmax_lse=True,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            num_splits=attn_metadata.max_num_splits,
-        )
-        # 2. Cross-PCP (+DCP) merge of the partial context (out, lse).
-        #    FA returns lse as [H, B]; cp_merge wants [B, H].
-        context_attn_out_cor, context_lse_cor = cp_merge_decode_out_lse(
-            ctx, context_attn_out, context_lse.transpose(0, 1), self.head_size
-        )
-        # [B, H, 1] -> [H, B] to match the query-attention lse below.
-        context_lse_cor = context_lse_cor.squeeze(-1).transpose(0, 1).contiguous()
-
-        # 3. Query attention: Q vs the new in-memory KV, causal. Full on every
-        #    rank (attention-only PCP keeps the whole new KV per rank).
-        query_attn_out, query_lse = flash_attn_varlen_func(
-            q=query,
-            k=key,
-            v=value,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            cu_seqlens_k=cu_seqlens_q,
-            max_seqlen_k=max_seqlen_q,
-            softmax_scale=self.scale,
-            causal=attn_metadata.causal,
-            alibi_slopes=self.alibi_slopes,
-            window_size=sliding_window_size,
-            softcap=self.logits_soft_cap,
-            return_softmax_lse=True,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            num_splits=attn_metadata.max_num_splits,
-        )
-        assert context_attn_out_cor.shape == query_attn_out.shape
-        assert context_lse_cor.shape == query_lse.shape
-        # 4. LSE-merge the full context with the local query result.
-        merge_attn_states(
-            output,
-            context_attn_out_cor,
-            context_lse_cor,
-            query_attn_out,
-            query_lse,
-        )
-        if os.environ.get("VLLM_PCP_DEBUG", "0") == "1":
-            assert torch.isfinite(output).all(), (
-                f"PCP attention output has non-finite values: "
-                f"nan={torch.isnan(output).sum().item()} "
-                f"inf={torch.isinf(output).sum().item()}"
-            )
 
     def _forward_with_dcp(
         self,

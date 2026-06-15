@@ -417,6 +417,12 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    pcp: object = None
+    """Per-step Prefill-Context-Parallel state (set by the runner when
+    ``pcp_world_size>1``; carries num_decode_tokens / num_prefills / the
+    all-gather restore index / per-rank prefill query lens). Opaque here to
+    avoid an import cycle; consumed by the FlashAttentionCP metadata builder."""
+
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
     request index to list of (start, end) token position ranges
