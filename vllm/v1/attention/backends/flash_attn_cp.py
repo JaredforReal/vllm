@@ -88,7 +88,12 @@ class FlashAttentionCPMetadataBuilder(FlashAttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlashAttentionMetadata:
+        # PCP uses the standard (non-AOT) FlashAttention path: the AOT path's
+        # build() returns None / a scheduler_metadata object that cannot carry
+        # the ``cp`` field, and PCP already requires eager mode (no cudagraph).
+        self.aot_schedule = False
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        assert metadata is not None  # aot_schedule=False -> non-None metadata
         metadata.cp = self._build_cp_metadata(common_attn_metadata)
         return metadata
 
