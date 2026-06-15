@@ -598,9 +598,8 @@ def resolve_kv_cache_block_sizes(
 
     - ``scheduler_block_size`` is the token-alignment invariant used by the
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size * dcp`` (the KV cache is sharded by DCP only;
-      PCP uses a replicated cache and is inert at decode). Multiple groups: LCM
-      of every group's block size — context parallelism is not supported here.
+      ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of every
+      group's block size — context parallelism is not supported here.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.hash_block_size`` override if set, else the GCD of group
@@ -614,8 +613,8 @@ def resolve_kv_cache_block_sizes(
     pcp = vllm_config.parallel_config.prefill_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
 
-    if len(groups) <= 1:  # Single group: block_size * dcp (PCP replicated)
-        bs = cache_config.block_size * dcp
+    if len(groups) <= 1:  # Single group: block_size * dcp * pcp
+        bs = cache_config.block_size * dcp * pcp
         return bs, bs
 
     if dcp != 1 or pcp != 1:

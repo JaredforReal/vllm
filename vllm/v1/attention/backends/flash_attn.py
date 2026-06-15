@@ -822,17 +822,31 @@ class FlashAttentionImpl(AttentionImpl):
             k_descale = layer._k_scale.expand(descale_shape)
             v_descale = layer._v_scale.expand(descale_shape)
 
-            # NOTE: PCP decode (Mode-2 LSE-merge over a total_cp-sharded cache)
-            # is implemented in ``_forward_decode_pcp`` but is NOT dispatched
-            # here -- it produced incorrect outputs (gsm8k ~0.0) and could not
-            # be diagnosed without multi-GPU runs. The cache is replicated
-            # across PCP ranks (sharded by DCP only, see block_table) and decode
-            # runs the normal path below against the full cache. Re-enable the
-            # sharded decode once diagnosed on H100.
+            # PCP: the KV cache is sharded across the full CP group
+            # (``total_cp = pcp*dcp``, interleaved via the block_table slot
+            # kernel), so PCP is *not* inert at decode. A pure-prefill batch
+            # runs the zigzag attention (``_forward_with_pcp``, full in-memory
+            # KV); a pure-decode batch runs Mode-2 (``_forward_decode_pcp``:
+            # each rank attends its decode Q to its local KV shard, then the
+            # per-rank (out, lse) are LSE-merged across PCP (+DCP)). Mixed
+            # prefill+decode batches are Phase E and fall through to the normal
+            # path only when neither gate matches.
+            if self.pcp_world_size > 1 and self._pcp_decode_active(attn_metadata):
+                self._forward_decode_pcp(
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    attn_metadata,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                return output
             if self.pcp_world_size > 1 and self._pcp_prefill_active(attn_metadata):
                 # Prefill: zigzag Q-shard attention against the full in-memory
                 # KV (nomask + mask per chunk, LSE-merged); outputs assembled
-                # by all-reduce.
+                # by all-gather + sum across the PCP group.
                 self._forward_with_pcp(
                     query[:num_actual_tokens],
                     key[:num_actual_tokens],
