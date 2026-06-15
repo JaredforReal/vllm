@@ -1142,9 +1142,22 @@ class FlashAttentionImpl(AttentionImpl):
                 output[off + chunk_start : off + chunk_start + chunk_len] = chunk_out
 
         # Assemble the full output across PCP ranks. Each rank filled only its
-        # own (disjoint) shard positions; all-reduce (sum) reconstructs the full
-        # output on every rank for the residual stream.
-        output.copy_(pcp_group.all_reduce(output.contiguous()))
+        # own (disjoint) shard positions (the rest is zero from ``zero_``); the
+        # per-rank full buffers are all-gathered and summed to reconstruct the
+        # full output on every rank for the residual stream. We use all-gather
+        # + local sum (rather than all_reduce) because all-gather on the PCP
+        # group is the proven collective (used by the MoE runner); all_reduce
+        # on this group is otherwise unused in vLLM.
+        num_tokens = output.shape[0]
+        gathered = pcp_group.all_gather(output.contiguous(), dim=0)
+        full = gathered.reshape(pcp_size, num_tokens, num_heads, head_size).sum(dim=0)
+        if os.environ.get("VLLM_PCP_DEBUG", "0") == "1":
+            assert torch.isfinite(full).all(), (
+                f"PCP prefill output has non-finite values: "
+                f"nan={torch.isnan(full).sum().item()} "
+                f"inf={torch.isinf(full).sum().item()}"
+            )
+        output.copy_(full)
 
     def _forward_decode_pcp(
         self,
