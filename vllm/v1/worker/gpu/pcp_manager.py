@@ -8,7 +8,6 @@ import torch
 
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
-from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -622,6 +621,8 @@ class PCPManager:
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             prompt_lens=None,
+            pcp_has_prefill=self._global_has_prefill,
+            pcp_row_plan=self.build_cp_row_plan(),
         )
 
     def prepare_attn(
@@ -692,21 +693,6 @@ class PCPManager:
             return hidden_states
         gathered = get_pcp_group().all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
-
-    def populate_forward_context(self) -> None:
-        """Stash the PCP metadata the attention forward / kv-cache update need.
-
-        Centralized here so the model runner stays a single call. Populates:
-          - ``pcp_has_prefill``: rank-invariant bool gating the cache-write
-            all-gather (when the global batch has any prefill, every rank
-            gathers the whole batch; otherwise writes stay local).
-          - ``pcp_row_plan``: per-step :class:`PCPRowPlan` for the sharded
-            PCP+DCP prefill path (None for warmup or pure-decode steps, which
-            is also how forward() tells the two paths apart).
-        """
-        kwargs = get_forward_context().additional_kwargs
-        kwargs["pcp_has_prefill"] = self._global_has_prefill
-        kwargs["pcp_row_plan"] = self.build_cp_row_plan()
 
     def build_cp_row_plan(self) -> "PCPRowPlan | None":
         """Build the per-step row plan for the sharded PCP+DCP attention path.

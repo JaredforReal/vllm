@@ -3,7 +3,7 @@
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import prod
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -37,6 +37,10 @@ from vllm.v1.worker.utils import (
     bind_kv_cache,
     prepare_kernel_block_sizes,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.pcp_manager import PCPRowPlan
+
 
 logger = init_logger(__name__)
 
@@ -520,6 +524,8 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
+    pcp_has_prefill: bool = False,
+    pcp_row_plan: "PCPRowPlan | None" = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -564,6 +570,8 @@ def build_attn_metadata(
             is_prefilling=group_is_prefilling,
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            pcp_has_prefill=pcp_has_prefill,
+            pcp_row_plan=pcp_row_plan,
             **common_attn_metadata_extra_kwargs,
         )
 

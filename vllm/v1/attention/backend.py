@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.attention.backends.utils import KVCacheLayoutType
     from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
+    from vllm.v1.worker.gpu.pcp_manager import PCPRowPlan
 
 from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
@@ -460,6 +461,14 @@ class CommonAttentionMetadata:
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
+
+    pcp_has_prefill: bool = False
+    """MRv2 PCP: rank-invariant "the global batch contains prefill". Gates the
+    cache-write all-gather; per-rank prefill-ness differs under DualChunkSwap."""
+
+    pcp_row_plan: "PCPRowPlan | None" = None
+    """MRv2 PCP: per-step plan for the sharded PCP+DCP attention path. None
+    unless PCP partitioned a prefill step onto a DCP-sharded cache."""
 
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
     """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows
