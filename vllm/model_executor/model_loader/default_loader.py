@@ -85,6 +85,7 @@ class DefaultModelLoader(BaseModelLoader):
             "enable_multithread_load",
             "num_threads",
             "enable_weights_track",
+            "disable_collective_weight_load",
         }
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
@@ -93,6 +94,15 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Unexpected extra config keys for load format "
                 f"{load_config.load_format}: "
                 f"{unexpected_keys}"
+            )
+
+        disable_collective_weight_load = extra_config.get(
+            "disable_collective_weight_load", False
+        )
+        if not isinstance(disable_collective_weight_load, bool):
+            raise ValueError(
+                f"disable_collective_weight_load must be a bool, got "
+                f"{type(disable_collective_weight_load).__name__}"
             )
 
         enable_multithread_load = extra_config.get("enable_multithread_load", False)
