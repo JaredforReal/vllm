@@ -264,15 +264,23 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
+            # Sub-engine loads on a subset of ranks (e.g. the spec-decode draft
+            # model under PP) must not broadcast: the broadcast group would not
+            # contain global rank 0. See issue #50959.
+            allow_collective = not extra_config.get(
+                "disable_collective_weight_load", False
+            )
             if self.load_config.load_format == "fastsafetensors":
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    allow_collective=allow_collective,
                 )
             elif self.load_config.load_format == "instanttensor":
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    allow_collective=allow_collective,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):

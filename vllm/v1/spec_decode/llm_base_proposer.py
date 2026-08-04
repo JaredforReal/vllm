@@ -65,6 +65,27 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+# Weight loaders that broadcast each tensor from global rank 0 to the rest of
+# a process group. They cannot run on a rank subset that excludes rank 0.
+_BROADCAST_WEIGHT_LOAD_FORMATS = ("fastsafetensors", "instanttensor")
+
+
+def should_disable_collective_weight_load(
+    load_format: str, pipeline_parallel_size: int
+) -> bool:
+    """Whether a draft-model load must skip the cross-rank broadcast.
+
+    The draft model loads only on the last PP stage, whose ranks do not include
+    global rank 0. ``fastsafetensors``/``instanttensor`` broadcast from rank 0,
+    so under PP a broadcast would deadlock (WORLD: non-draft ranks never enter
+    the load) or crash (any sub-group: rank 0 is absent). Disabling the
+    broadcast makes each last-stage rank read the draft independently. The
+    accelerated reader (e.g. fastsafetensors GDS) is still used per rank.
+    See issue #50959.
+    """
+    return pipeline_parallel_size > 1 and load_format in _BROADCAST_WEIGHT_LOAD_FORMATS
+
+
 class SpecDecodeBaseProposer:
     def __init__(
         self,
@@ -1306,6 +1327,33 @@ class SpecDecodeBaseProposer:
                 cache_config=replace(
                     base.cache_config,
                     cache_dtype=spec_cfg.kv_cache_dtype,
+                ),
+            )
+
+        # The draft model loads only on the last PP stage, whose ranks exclude
+        # global rank 0. Broadcast loaders (fastsafetensors/instanttensor) pin
+        # the source to rank 0, so under PP a broadcast would deadlock or crash.
+        # Keep the loader but disable its broadcast; each last-stage rank reads
+        # independently (still via the accelerated reader). See issue #50959.
+        if should_disable_collective_weight_load(
+            base.load_config.load_format,
+            base.parallel_config.pipeline_parallel_size,
+        ):
+            logger.warning_once(
+                "Disabling cross-rank weight broadcast for the spec-decode "
+                "draft model under pipeline parallelism: load-format '%s' "
+                "broadcasts from global rank 0, which is not on the last PP "
+                "stage that loads the draft. Each last-stage rank will read "
+                "the draft independently. See issue #50959.",
+                base.load_config.load_format,
+            )
+            extra = dict(base.load_config.model_loader_extra_config)
+            extra["disable_collective_weight_load"] = True
+            base = replace(
+                base,
+                load_config=replace(
+                    base.load_config,
+                    model_loader_extra_config=extra,
                 ),
             )
 
