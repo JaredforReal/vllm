@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import tempfile
+from types import SimpleNamespace
 
 import huggingface_hub.constants
 import pytest
+import torch.distributed as dist
 from huggingface_hub.utils import LocalEntryNotFoundError
 
+from vllm.model_executor.model_loader import weight_utils as wu
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     maybe_remap_kv_scale_name,
@@ -279,6 +282,39 @@ class TestKvCacheScaleMapper:
             combined._map_name("model.layers.0.self_attn.k_scale")
             == "model.layers.0.self_attn.attn.k_scale"
         )
+
+
+class TestGetWeightLoadProcessGroup:
+    """The weight-load broadcast domain must be the per-PP-stage TP group, never
+    WORLD, so a spec-decode draft load (last PP stage only) and per-stage target
+    loads do not deadlock waiting for ranks outside the stage (issue #50959)."""
+
+    def test_no_distributed(self, monkeypatch):
+        # dist not initialized -> None (callers take the no-collective path).
+        monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
+        assert wu._get_weight_load_process_group() is None
+
+    def test_tp_group_initialized(self, monkeypatch):
+        # dist initialized + TP group set -> the TP device group is returned.
+        monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+        fake_pg = object()
+        fake_tp = SimpleNamespace(device_group=fake_pg)
+        monkeypatch.setattr(wu, "get_tp_group", lambda: fake_tp)
+        assert wu._get_weight_load_process_group() is fake_pg
+
+    def test_tp_group_uninit_falls_back_to_world(self, monkeypatch):
+        # dist initialized but TP group not set -> defensive WORLD fallback.
+        monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+
+        def _raise():
+            raise AssertionError("tensor model parallel group is not initialized")
+
+        monkeypatch.setattr(wu, "get_tp_group", _raise)
+        # The helper returns torch.distributed.group.WORLD verbatim. It is a
+        # property that is None until a real group is initialized, so comparing
+        # identity against the same property read is robust without a process
+        # group.
+        assert wu._get_weight_load_process_group() is dist.group.WORLD
 
 
 if __name__ == "__main__":

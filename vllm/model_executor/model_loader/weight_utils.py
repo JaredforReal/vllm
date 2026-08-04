@@ -34,7 +34,7 @@ from vllm.config.load import (
     DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     LoadConfig,
 )
-from vllm.distributed import get_tensor_model_parallel_rank, get_world_group
+from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
@@ -1039,6 +1039,32 @@ def runai_safetensors_weights_iterator(
             yield name, tensor.clone()
 
 
+def _get_weight_load_process_group() -> "torch.distributed.ProcessGroup | None":
+    """Return the process group whose ranks share identical weight tensors.
+
+    Weight-loading broadcast collectives (fastsafetensors, instanttensor) must
+    span exactly the ranks that hold the same tensor bytes -- i.e. the
+    tensor-parallel subgroup for the current pipeline stage. Broadcasting over
+    the WORLD group deadlocks under pipeline parallelism, where each stage
+    loads only its own slice of weights (and spec-decode draft models load on
+    the last PP stage alone). See issue #50959.
+
+    Returns:
+        The tensor-parallel ``torch.distributed.ProcessGroup`` (``device_group``
+        of the global TP coordinator) when the distributed process group is
+        initialized. ``None`` when ``torch.distributed`` is not initialized
+        (single-process runs / unit tests), so callers take their no-collective
+        fallback path. As a defensive last resort, if dist is initialized but
+        the TP group is not set up, falls back to ``WORLD``.
+    """
+    if not torch.distributed.is_initialized():
+        return None
+    try:
+        return get_tp_group().device_group
+    except AssertionError:
+        return torch.distributed.group.WORLD
+
+
 def fastsafetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -1052,10 +1078,8 @@ def fastsafetensors_weights_iterator(
     """
     from fastsafetensors.parallel_loader import ParallelLoader
 
-    if torch.distributed.is_initialized():
-        pg = torch.distributed.group.WORLD
-    else:
-        pg = SingleGroup()
+    tp_pg = _get_weight_load_process_group()
+    pg = tp_pg if tp_pg is not None else SingleGroup()
 
     device = torch.device(f"cuda:{current_platform.current_device()}")
     hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
@@ -1124,13 +1148,8 @@ def instanttensor_weights_iterator(
     if not current_platform.is_cuda():
         raise ValueError("InstantTensor requires NVIDIA GPUs")
 
-    try:
-        world_group = get_world_group()
-    except AssertionError:
-        # Entering here only in unit tests where the world group is not initialized.
-        process_group = None
-    else:
-        process_group = world_group.device_group if world_group.world_size > 1 else None
+    tp_pg = _get_weight_load_process_group()
+    process_group = tp_pg if tp_pg is not None and tp_pg.size() > 1 else None
 
     device = current_platform.current_device()
 
