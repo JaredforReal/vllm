@@ -85,6 +85,7 @@ class DefaultModelLoader(BaseModelLoader):
             "enable_multithread_load",
             "num_threads",
             "enable_weights_track",
+            "disable_collective_weight_load",
         }
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
@@ -93,6 +94,15 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Unexpected extra config keys for load format "
                 f"{load_config.load_format}: "
                 f"{unexpected_keys}"
+            )
+
+        disable_collective_weight_load = extra_config.get(
+            "disable_collective_weight_load", False
+        )
+        if not isinstance(disable_collective_weight_load, bool):
+            raise ValueError(
+                f"disable_collective_weight_load must be a bool, got "
+                f"{type(disable_collective_weight_load).__name__}"
             )
 
         enable_multithread_load = extra_config.get("enable_multithread_load", False)
@@ -264,15 +274,23 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
+            # Sub-engine loads on a subset of ranks (e.g. the spec-decode draft
+            # model under PP) must not broadcast: the broadcast group would not
+            # contain global rank 0. See issue #50959.
+            allow_collective = not extra_config.get(
+                "disable_collective_weight_load", False
+            )
             if self.load_config.load_format == "fastsafetensors":
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    allow_collective=allow_collective,
                 )
             elif self.load_config.load_format == "instanttensor":
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    allow_collective=allow_collective,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):

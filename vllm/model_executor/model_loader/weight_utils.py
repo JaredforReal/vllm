@@ -1042,6 +1042,8 @@ def runai_safetensors_weights_iterator(
 def fastsafetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
+    *,
+    allow_collective: bool = True,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
     using fastsafetensor library.
@@ -1049,10 +1051,20 @@ def fastsafetensors_weights_iterator(
     Uses ParallelLoader for pipelined loading: the producer thread
     prepares metadata for the next shard while the consumer yields
     tensors from the current shard.
+
+    When ``allow_collective`` is True (default) and the distributed process
+    group is initialized, ParallelLoader broadcasts each tensor from global
+    rank 0 to the rest of the WORLD group so only one rank reads from disk.
+    Set it to False for sub-engine loads that run on a subset of ranks (e.g.
+    the spec-decode draft model, which loads only on the last PP stage):
+    those ranks do not include global rank 0, so a WORLD broadcast would
+    deadlock and any sub-group broadcast would crash fastsafetensors. With
+    ``allow_collective=False`` a ``SingleGroup`` is used and every rank reads
+    independently (GDS is still used per rank). See issue #50959.
     """
     from fastsafetensors.parallel_loader import ParallelLoader
 
-    if torch.distributed.is_initialized():
+    if allow_collective and torch.distributed.is_initialized():
         pg = torch.distributed.group.WORLD
     else:
         pg = SingleGroup()
@@ -1111,9 +1123,18 @@ def fastsafetensors_weights_iterator(
 def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
+    *,
+    allow_collective: bool = True,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
-    using instanttensor library."""
+    using instanttensor library.
+
+    ``allow_collective`` has the same semantics as in
+    :func:`fastsafetensors_weights_iterator`: False disables the cross-rank
+    broadcast (``process_group=None``) so sub-engine loads on a subset of
+    ranks (e.g. the spec-decode draft model under PP) read independently
+    instead of deadlocking or crashing. See issue #50959.
+    """
     try:
         import instanttensor
     except ImportError as e:
@@ -1124,13 +1145,19 @@ def instanttensor_weights_iterator(
     if not current_platform.is_cuda():
         raise ValueError("InstantTensor requires NVIDIA GPUs")
 
-    try:
-        world_group = get_world_group()
-    except AssertionError:
-        # Entering here only in unit tests where the world group is not initialized.
+    if not allow_collective:
         process_group = None
     else:
-        process_group = world_group.device_group if world_group.world_size > 1 else None
+        try:
+            world_group = get_world_group()
+        except AssertionError:
+            # Entering here only in unit tests where the world group
+            # is not initialized.
+            process_group = None
+        else:
+            process_group = (
+                world_group.device_group if world_group.world_size > 1 else None
+            )
 
     device = current_platform.current_device()
 

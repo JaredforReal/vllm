@@ -110,3 +110,26 @@ def test_draft_layer_iteration_is_deterministic(monkeypatch: pytest.MonkeyPatch)
         assert len(proposer.draft_attn_groups) == 1
         assert proposer.draft_attn_groups[0].layer_names == expected_order
         assert proposer.block_size == KERNEL_BLOCK_SIZE
+
+
+@pytest.mark.parametrize(
+    "load_format, pp_size, expected",
+    [
+        # No pipeline parallelism: broadcast is safe, never disabled.
+        ("fastsafetensors", 1, False),
+        ("instanttensor", 1, False),
+        # Under PP, broadcast loaders must be disabled (draft loads on the
+        # last PP stage, which excludes global rank 0). See issue #50959.
+        ("fastsafetensors", 2, True),
+        ("instanttensor", 4, True),
+        # Non-broadcast loaders are unaffected.
+        ("auto", 2, False),
+        ("safetensors", 2, False),
+        ("pt", 2, False),
+    ],
+)
+def test_should_disable_collective_weight_load(load_format, pp_size, expected):
+    assert (
+        llm_base_proposer.should_disable_collective_weight_load(load_format, pp_size)
+        == expected
+    )
