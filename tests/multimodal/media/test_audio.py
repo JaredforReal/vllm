@@ -197,6 +197,51 @@ def test_load_audio_auto_falls_back_without_torchcodec(dummy_audio_bytes):
     np.testing.assert_array_equal(ref_audio, audio)
 
 
+def test_audio_media_io_sr_decodes_at_target(dummy_audio_bytes):
+    """``AudioMediaIO(sr=...)`` decodes directly at the target rate so the
+    backend resamples during decode and the downstream AudioResampler no-ops."""
+    # Native rate of the asset is 16 kHz; request 22 050 Hz.
+    audio, sr = AudioMediaIO(sr=22050).load_bytes(dummy_audio_bytes)
+    assert sr == 22050
+    assert audio.shape[-1] > 0
+
+
+def test_audio_media_io_default_sr_is_native(dummy_audio_bytes):
+    """Without ``sr``, AudioMediaIO keeps the native rate (backward compat)."""
+    ref_audio, ref_sr = load_audio(BytesIO(dummy_audio_bytes), sr=None)
+    audio, sr = AudioMediaIO().load_bytes(dummy_audio_bytes)
+    assert sr == ref_sr
+    n = min(ref_audio.shape[-1], audio.shape[-1])
+    np.testing.assert_allclose(ref_audio[:n], audio[:n], atol=1e-4)
+
+
+def test_audio_media_io_sr_in_load_file(audio_assets: AudioTestAssets):
+    """``sr`` flows through ``load_file`` too, not just ``load_bytes``."""
+    path = audio_assets[0].get_local_path()
+    audio, sr = AudioMediaIO(sr=22050).load_file(path)
+    assert sr == 22050
+    assert audio.shape[-1] > 0
+
+
+def test_audio_media_io_sr_with_backend(dummy_audio_bytes):
+    """``sr`` and ``audio_backend`` compose: decode at target via torchcodec."""
+    audio, sr = AudioMediaIO(sr=22050, audio_backend="torchcodec").load_bytes(
+        dummy_audio_bytes
+    )
+    assert sr == 22050
+    assert audio.dtype == np.float32
+
+
+def test_audio_media_io_sr_does_not_consume_kwarg(dummy_audio_bytes):
+    """``sr`` is popped from kwargs and must not leak into load_audio args."""
+    io = AudioMediaIO(sr=22050, audio_backend="pyav")
+    assert io.sr == 22050
+    # ``load_bytes`` must still work; if `sr` leaked as a passthrough kwarg it
+    # would surface as a TypeError from load_audio.
+    audio, sr = io.load_bytes(dummy_audio_bytes)
+    assert sr == 22050
+
+
 def test_audio_media_io_audio_backend_kwarg(dummy_audio_bytes):
     """`audio_backend` selects the backend; unknown values fail at init."""
     audio, sr = AudioMediaIO(audio_backend="pyav").load_bytes(dummy_audio_bytes)

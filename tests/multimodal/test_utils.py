@@ -14,6 +14,7 @@ from vllm.multimodal.inputs import (
 from vllm.multimodal.utils import (
     argsort_mm_positions,
     encode_image_url,
+    get_model_audio_sample_rate,
     group_and_batch_mm_items,
 )
 
@@ -256,3 +257,37 @@ def test_group_and_batch_mm_items_split_by_shared_data():
 
     res = group_and_batch_mm_items([item1, item2, item3, item4, item5])
     assert [num_items for num_items, _ in res] == [2, 1, 1, 1]
+
+
+def test_get_model_audio_sample_rate_returns_sr(monkeypatch):
+    """Returns the feature extractor's sampling_rate as an int."""
+    from types import SimpleNamespace
+
+    fe = SimpleNamespace(sampling_rate=16000)
+    monkeypatch.setattr(
+        "vllm.transformers_utils.processor.cached_feature_extractor_from_config",
+        lambda model_config: fe,
+    )
+    assert get_model_audio_sample_rate(SimpleNamespace()) == 16000
+
+
+def test_get_model_audio_sample_rate_missing_attr(monkeypatch):
+    """Returns None when the feature extractor has no sampling_rate."""
+    from types import SimpleNamespace
+
+    fe = SimpleNamespace()  # no sampling_rate attribute
+    monkeypatch.setattr(
+        "vllm.transformers_utils.processor.cached_feature_extractor_from_config",
+        lambda model_config: fe,
+    )
+    assert get_model_audio_sample_rate(SimpleNamespace()) is None
+
+
+def test_get_model_audio_sample_rate_load_failure(monkeypatch):
+    """Returns None (not raise) when the feature extractor can't load, e.g.
+    a non-audio model or a missing checkpoint."""
+    monkeypatch.setattr(
+        "vllm.transformers_utils.processor.cached_feature_extractor_from_config",
+        lambda model_config: (_ for _ in ()).throw(RuntimeError("no FE")),
+    )
+    assert get_model_audio_sample_rate(object()) is None
