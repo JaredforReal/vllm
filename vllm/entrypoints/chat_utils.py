@@ -568,13 +568,35 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
         model_cls = get_model_cls(self.model_config)
         return cast(type[SupportsMultiModal], model_cls)
 
+    @cached_property
+    def _audio_decode_sr(self) -> int | None:
+        # The model's expected audio sample rate. Decoding at it directly lets
+        # the backend resample during decode, so the downstream AudioResampler
+        # is a no-op (and we avoid pulling a resample dependency). None keeps
+        # the native rate (current behavior) for models without an audio
+        # feature extractor.
+        from vllm.multimodal.utils import get_model_audio_sample_rate
+
+        return get_model_audio_sample_rate(self._model_config)
+
     @property
     def media_io_kwargs(self) -> dict[str, dict[str, Any]] | None:
-        return self._media_io_kwargs or (
+        base = self._media_io_kwargs or (
             self._model_config.multimodal_config.media_io_kwargs
             if self._model_config.multimodal_config
             else None
         )
+        sr = self._audio_decode_sr
+        if sr is None:
+            return base
+        # Inject the model's audio sr unless the user set their own.
+        audio = dict((base or {}).get("audio", {}))
+        if "sr" in audio:
+            return base
+        audio["sr"] = sr
+        kwargs = dict(base or {})
+        kwargs["audio"] = audio
+        return kwargs
 
     @property
     def allowed_local_media_path(self):

@@ -514,6 +514,14 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
             )
         self.audio_backend = backend
 
+        # Decode directly at the model's sample rate so the backend resamples
+        # during decode (torchcodec: C++ libswresample; PyAV: av.AudioResampler)
+        # and the downstream ``AudioResampler`` becomes a no-op. ``None`` keeps
+        # the native rate (current behavior). Plumb the model's audio sr here
+        # via ``--media-io-kwargs '{"audio": {"sr": 16000}}'`` until the
+        # processor→connector wiring auto-fills it.
+        self.sr = kwargs.pop("sr", None)
+
         # `kwargs` contains custom arguments from
         # --media-io-kwargs for this modality, merged with
         # per-request runtime media_io_kwargs via merge_kwargs().
@@ -525,7 +533,7 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
     def load_bytes(self, data: bytes) -> tuple[npt.NDArray, float]:
         return load_audio(
             BytesIO(data),
-            sr=None,
+            sr=self.sr,
             max_duration_s=envs.VLLM_MAX_AUDIO_DECODE_DURATION_S,
             max_decode_bytes=envs.VLLM_MAX_AUDIO_DECODE_BYTES,
             backend=self.audio_backend,
@@ -541,7 +549,7 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
     def load_file(self, filepath: Path) -> tuple[npt.NDArray, float]:
         return load_audio(
             filepath,
-            sr=None,
+            sr=self.sr,
             max_duration_s=envs.VLLM_MAX_AUDIO_DECODE_DURATION_S,
             max_decode_bytes=envs.VLLM_MAX_AUDIO_DECODE_BYTES,
             backend=self.audio_backend,
