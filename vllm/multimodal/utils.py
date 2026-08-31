@@ -34,6 +34,8 @@ from .media import (
 
 if TYPE_CHECKING:
     import torch.types
+
+    from vllm.config import ModelConfig
 else:
     torch = LazyLoader("torch", globals(), "torch")
 
@@ -305,6 +307,27 @@ def group_mm_kwargs_by_modality(
     pin_memory: bool = False,
 ) -> Generator[tuple[str, int, BatchedTensorInputs], None, None]:
     return group_and_batch_mm_kwargs(mm_kwargs, device=device, pin_memory=pin_memory)
+
+
+def get_model_audio_sample_rate(model_config: "ModelConfig") -> int | None:
+    """Best-effort lookup of the model's expected audio sample rate.
+
+    Reads it from the HF feature extractor so audio can be decoded at that rate
+    during IO — the backend then resamples during decode (torchcodec/PyAV) and
+    the downstream ``AudioResampler`` is a no-op, avoiding a separate resample
+    step. Returns ``None`` when the model has no audio feature extractor or its
+    rate is unset, so callers fall back to the native decode rate.
+    """
+    try:
+        from vllm.transformers_utils.processor import (
+            cached_feature_extractor_from_config,
+        )
+
+        feature_extractor = cached_feature_extractor_from_config(model_config)
+        sr = getattr(feature_extractor, "sampling_rate", None)
+    except Exception:
+        return None
+    return int(sr) if sr else None
 
 
 def fetch_audio(

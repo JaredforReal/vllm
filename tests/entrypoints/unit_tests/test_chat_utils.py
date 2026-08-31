@@ -2806,3 +2806,93 @@ async def test_resolve_items_does_not_leak_tasks_on_partial_failure():
         f"resolve_items left {len(leaked_tasks)} task(s) running after "
         f"raising: {leaked_tasks}"
     )
+
+
+# ---------------------------------------------------------------------------
+# media_io_kwargs: auto-inject the model's audio sample rate
+# ---------------------------------------------------------------------------
+
+
+def _sr_tracker(
+    media_io_kwargs: dict | None = None,
+    *,
+    mm_config_media_io_kwargs: dict | None = None,
+):
+    """Build a tracker with a stub model_config, avoiding HF model loading.
+
+    `mm_config_media_io_kwargs` controls the model's multimodal_config
+    media_io_kwargs (the server-config fallback)."""
+    from types import SimpleNamespace
+
+    from vllm.entrypoints.chat_utils import MultiModalItemTracker
+
+    model_config = SimpleNamespace()
+    model_config.multimodal_config = (
+        SimpleNamespace(media_io_kwargs=mm_config_media_io_kwargs)
+        if mm_config_media_io_kwargs is not None
+        else None
+    )
+    return MultiModalItemTracker(model_config, media_io_kwargs=media_io_kwargs)
+
+
+def test_media_io_kwargs_injects_model_audio_sr(monkeypatch):
+    """The model's audio sr is injected into the audio kwargs at decode time."""
+    monkeypatch.setattr(
+        "vllm.multimodal.utils.get_model_audio_sample_rate", lambda mc: 16000
+    )
+    tracker = _sr_tracker(
+        media_io_kwargs={
+            "audio": {"audio_backend": "torchcodec"},
+            "image": {"image_mode": "RGB"},
+        }
+    )
+    kwargs = tracker.media_io_kwargs
+    assert kwargs["audio"]["sr"] == 16000
+    # Existing audio kwargs are preserved.
+    assert kwargs["audio"]["audio_backend"] == "torchcodec"
+    # Other modalities are untouched.
+    assert kwargs["image"] == {"image_mode": "RGB"}
+
+
+def test_media_io_kwargs_user_sr_not_overridden(monkeypatch):
+    """A user-set ``sr`` wins over the model-derived one."""
+    monkeypatch.setattr(
+        "vllm.multimodal.utils.get_model_audio_sample_rate", lambda mc: 16000
+    )
+    tracker = _sr_tracker(media_io_kwargs={"audio": {"sr": 8000}})
+    assert tracker.media_io_kwargs["audio"]["sr"] == 8000
+
+
+def test_media_io_kwargs_no_model_sr_returns_base(monkeypatch):
+    """When the model exposes no audio sr, media_io_kwargs is unchanged."""
+    monkeypatch.setattr(
+        "vllm.multimodal.utils.get_model_audio_sample_rate", lambda mc: None
+    )
+    base = {"audio": {"audio_backend": "pyav"}}
+    tracker = _sr_tracker(media_io_kwargs=base)
+    assert tracker.media_io_kwargs == base
+
+
+def test_media_io_kwargs_sr_injected_even_without_user_kwargs(monkeypatch):
+    """With no user media_io_kwargs at all, the model sr is still injected so
+    decode happens at the target rate."""
+    monkeypatch.setattr(
+        "vllm.multimodal.utils.get_model_audio_sample_rate", lambda mc: 16000
+    )
+    tracker = _sr_tracker(media_io_kwargs=None, mm_config_media_io_kwargs=None)
+    assert tracker.media_io_kwargs == {"audio": {"sr": 16000}}
+
+
+def test_media_io_kwargs_sr_falls_back_to_mm_config(monkeypatch):
+    """When per-tracker kwargs are unset, the mm_config kwargs are used as the
+    base and the sr is injected into them."""
+    monkeypatch.setattr(
+        "vllm.multimodal.utils.get_model_audio_sample_rate", lambda mc: 16000
+    )
+    tracker = _sr_tracker(
+        media_io_kwargs=None,
+        mm_config_media_io_kwargs={"audio": {"audio_backend": "soundfile"}},
+    )
+    kwargs = tracker.media_io_kwargs
+    assert kwargs["audio"]["sr"] == 16000
+    assert kwargs["audio"]["audio_backend"] == "soundfile"
