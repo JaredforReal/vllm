@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FlashInfer sparse MLA attention backend."""
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -32,6 +33,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
+from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 if TYPE_CHECKING:
@@ -294,6 +296,12 @@ class FlashInferMLASparseTRTLLMMetadataBuilder(FlashInferMLASparseMetadataBuilde
         return common_attn_metadata.token_to_req_indices(self.req_id_per_token_buffer)
 
 
+# Prefill queries attend over the union of a group of consecutive tokens' top-k
+# with the FlashMLA head-group-mask kernel (see
+# vllm/models/deepseek_v32/nvidia/ops/grouped_sparse_prefill.py). Experimental.
+_GROUPED_SPARSE_PREFILL = os.environ.get("VLLM_DSA_GROUPED_SPARSE_PREFILL", "0") == "1"
+_GROUPED_PSEUDO_HEADS = 128
+
 # Global workspace buffer (lazily initialized)
 _fi_sparse_workspace: torch.Tensor | None = None
 
@@ -382,6 +390,18 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # for query and kv_cache (mixed bf16+fp8 is not supported).
         self.supports_quant_query_input = True
 
+    def _use_grouped_prefill(self, attn_metadata: FlashInferMLASparseMetadata) -> bool:
+        return (
+            _GROUPED_SPARSE_PREFILL
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.prefill is not None
+            and self.dcp_world_size <= 1
+            and not is_quantized_kv_cache(self.kv_cache_dtype)
+            and not self.need_to_return_lse_for_decode
+            and _GROUPED_PSEUDO_HEADS % self.num_heads == 0
+            and _GROUPED_PSEUDO_HEADS // self.num_heads <= 8
+        )
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -392,6 +412,99 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
 
+        num_actual_toks = q.shape[0]
+        # The dense-MHA prefill route calls forward_mqa with the decode tokens
+        # only; the grouped path applies when q also carries the prefill tokens.
+        if (
+            self._use_grouped_prefill(attn_metadata)
+            and num_actual_toks > attn_metadata.num_decode_tokens
+        ):
+            num_decode_toks = attn_metadata.num_decode_tokens
+            out = q.new_empty(num_actual_toks, self.num_heads, self.kv_lora_rank)
+            if num_decode_toks > 0:
+                decode_out, _ = self._forward_per_token(
+                    q[:num_decode_toks], kv_c_and_k_pe_cache, attn_metadata, layer
+                )
+                out[:num_decode_toks].copy_(decode_out)
+            out[num_decode_toks:].copy_(
+                self._forward_grouped_prefill(
+                    q[num_decode_toks:], kv_c_and_k_pe_cache, attn_metadata
+                )
+            )
+            return out, None
+        return self._forward_per_token(q, kv_c_and_k_pe_cache, attn_metadata, layer)
+
+    def _forward_grouped_prefill(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+    ) -> torch.Tensor:
+        """Prefill tokens: groups of consecutive tokens share one union index list.
+
+        ``q`` holds the prefill tokens only (decode tokens come first in the
+        batch). Each group of ``128 // num_heads`` tokens is presented to the
+        FlashMLA sparse prefill kernel as 128 pseudo-heads over the union of the
+        group's top-k rows, with a head-group mask restoring each token's own
+        top-k, so the result equals per-token sparse attention.
+        """
+        from vllm.models.deepseek_v32.nvidia.ops.grouped_sparse_prefill import (
+            build_grouped_sparse_prefill,
+        )
+
+        prefill = attn_metadata.prefill
+        assert prefill is not None and prefill.query_lens_cpu is not None
+        assert self.topk_indices_buffer is not None
+        num_decode_toks = attn_metadata.num_decode_tokens
+        num_prefill_toks = q.shape[0]
+        group = _GROUPED_PSEUDO_HEADS // self.num_heads
+        query_lens = prefill.query_lens_cpu.tolist()
+        assert sum(query_lens) == num_prefill_toks, (query_lens, num_prefill_toks)
+        topk = self.topk_indices_buffer[
+            num_decode_toks : num_decode_toks + num_prefill_toks
+        ]
+        meta = build_grouped_sparse_prefill(
+            topk, query_lens, attn_metadata.prefill_max_seq_len, group=group
+        )
+
+        kv_rows, block_stride_rows = flat_kv_row_view(
+            kv_c_and_k_pe_cache, attn_metadata.block_size
+        )
+        req_ids = (meta.req_of_group + attn_metadata.num_decodes).to(torch.int32)
+        union_rows = triton_convert_req_index_to_global_index(
+            req_ids,
+            attn_metadata.block_table,
+            meta.union,
+            BLOCK_SIZE=attn_metadata.block_size,
+            BLOCK_STRIDE_ROWS=block_stride_rows,
+            NUM_TOPK_TOKENS=meta.union_pad,
+        )
+        assert isinstance(union_rows, torch.Tensor)
+
+        # Gather the group tokens (padding slots repeat token 0; their pseudo-heads
+        # are fully masked and dropped below).
+        q_grouped = q.index_select(0, meta.tok_map.clamp(min=0).long()).view(
+            meta.num_groups, _GROUPED_PSEUDO_HEADS, q.shape[-1]
+        )
+        out, _, _ = flash_mla_sparse_fwd(
+            q_grouped,
+            kv_rows.view(-1, 1, kv_rows.shape[-1]),
+            union_rows.view(meta.num_groups, 1, meta.union_pad),
+            self.scale,
+            topk_length=meta.ulen,
+            head_group_mask=meta.mask,
+            head_group_size=self.num_heads,
+        )
+        out = out.view(meta.num_groups * group, self.num_heads, -1)
+        return out[meta.tok_map >= 0]
+
+    def _forward_per_token(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_actual_toks = q.shape[0]
 
         assert self.topk_indices_buffer is not None

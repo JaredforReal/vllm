@@ -202,6 +202,7 @@ return curr_o @ W_O
 import functools
 import itertools
 import math
+import os
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -1127,6 +1128,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             and self.impl.masked_mha_workspace_fits(prefill)  # type: ignore[attr-defined]
         )
+        # With grouped sparse prefill (FlashMLA head-group-mask kernel), the
+        # sparse MQA path beats masked MHA at every length, so keep only the
+        # dense MHA shortcut for prompts within the top-k budget.
+        if _GROUPED_SKIP_MASKED_MHA:
+            use_masked_mha = False
         return (prefill.use_dense_mha or use_masked_mha) and not (
             self._vllm_config.attention_config.sparse_mla_force_mqa
         )
@@ -1691,6 +1697,11 @@ def get_mla_dims(model_config: ModelConfig) -> MLADims:
 
 
 _MaskedMHARanges = tuple[tuple[int, int], ...]
+
+_GROUPED_SKIP_MASKED_MHA = (
+    os.environ.get("VLLM_DSA_GROUPED_SPARSE_PREFILL", "0") == "1"
+    and os.environ.get("VLLM_DSA_GROUPED_SKIP_MASKED_MHA", "0") == "1"
+)
 
 _MASKED_MHA_THRESHOLDS: dict[
     tuple[int, int],
