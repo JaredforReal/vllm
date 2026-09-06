@@ -367,7 +367,25 @@ class DeepseekV32Attention(MLAAttention):
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+        q_buf = None
+        if self._fp8_query:
+            ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+        else:
+            # bf16 query: the absorbed nope projection lands in the front of one
+            # [tokens, heads, kv_lora_rank + rope] buffer and fused_q RoPEs q_pe
+            # into its tail, so the sparse backend gets a contiguous packed
+            # query without a separate concat launch.
+            q_buf = torch.empty(
+                (
+                    num_tokens,
+                    self.num_local_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            ql_nope = q_buf[..., : self.kv_lora_rank]
+            torch.bmm(q_nope.transpose(0, 1), self.W_UK_T, out=ql_nope.transpose(0, 1))
 
         if self.indexer is not None and not self.skip_topk:
             index_q = self.indexer.wq_b(q_c)[0]
@@ -389,6 +407,7 @@ class DeepseekV32Attention(MLAAttention):
             has_indexer=has_indexer,
             index_rope_interleave=self._index_rope_interleave,
             quantize_mqa=self._fp8_query,
+            q_out=q_buf,
         )
 
         self._sparse_indexer_and_attn(
@@ -401,7 +420,6 @@ class DeepseekV32Attention(MLAAttention):
             index_weights_out,
             kv_c_out,
             k_pe_out,
-            ql_nope,
             mqa_q,
             output,
         )
@@ -419,7 +437,6 @@ class DeepseekV32Attention(MLAAttention):
         index_weights_out: torch.Tensor | None,
         kv_c: torch.Tensor | None,
         k_pe: torch.Tensor | None,
-        ql_nope: torch.Tensor,
         mqa_q: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
@@ -495,7 +512,11 @@ class DeepseekV32Attention(MLAAttention):
 
         if self._use_sparse_mha(attn_metadata):
             assert kv_c is not None and k_pe is not None
-            mha_q_pe = self.rotary_emb(positions, q_pe)[0] if self._fp8_query else mqa_q
+            mha_q_pe = (
+                self.rotary_emb(positions, q_pe)[0]
+                if self._fp8_query
+                else mqa_q[..., self.kv_lora_rank :]
+            )
             mha_q = torch.cat((q_nope, mha_q_pe), dim=-1)
             self.forward_impl(
                 mha_q,
@@ -509,22 +530,14 @@ class DeepseekV32Attention(MLAAttention):
 
         if self._fp8_kv_needs_view:
             kv_cache = kv_cache.view(torch.float8_e4m3fn)
-        if self._fp8_query:
-            # FlashInfer sparse: single packed fp8 query.
-            mqa_q_arg: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = mqa_q[
-                :num_actual
-            ]
-        else:
-            mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
+        # Packed query: fp8 [ql_nope; q_pe] (FlashInfer fp8 query) or bf16
+        # [ql_nope; q_pe] written by fused_q into one buffer.
+        mqa_q_arg = mqa_q[:num_actual]
 
         if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
-            if isinstance(mqa_q_arg, tuple):
-                mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
             mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
         elif not self.use_pcp and self.impl.dcp_world_size > 1:
             assert self.dcp_manager is not None
-            if isinstance(mqa_q_arg, tuple):
-                mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
             assert self.dcp_manager.query_gather is not None
             mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
         attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]

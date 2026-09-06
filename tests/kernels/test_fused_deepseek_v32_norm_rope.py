@@ -729,6 +729,75 @@ def test_fused_q_bf16_query(num_tokens: int, has_indexer: bool):
         torch.testing.assert_close(iw_out, iw_ref, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 7, 64, 1000])
+@pytest.mark.parametrize("alias_front", [False, True])
+def test_fused_q_bf16_query_packed(num_tokens: int, alias_front: bool):
+    """bf16-query path with ``q_out``: fused_q returns one packed
+    [tokens, heads, nope + rope] buffer (front = ql_nope, tail = RoPE'd q_pe),
+    copying ql_nope in unless it already aliases the front slice."""
+    torch.manual_seed(7)
+    dev = "cuda"
+    max_pos = 8192
+    pos = torch.arange(num_tokens, device=dev, dtype=torch.int64) % max_pos
+    q_pe = torch.randn(
+        num_tokens, NUM_HEADS, ROPE_DIM, device=dev, dtype=torch.bfloat16
+    )
+    q_out = torch.empty(
+        num_tokens, NUM_HEADS, KV_LORA + ROPE_DIM, device=dev, dtype=torch.bfloat16
+    )
+    if alias_front:
+        ql_nope = q_out[..., :KV_LORA]
+        ql_nope.copy_(torch.randn_like(ql_nope))
+    else:
+        ql_nope = torch.randn(
+            num_tokens, NUM_HEADS, KV_LORA, device=dev, dtype=torch.bfloat16
+        )
+    ql_nope_ref = ql_nope.clone()
+    q_scale = torch.tensor([0.37], device=dev, dtype=torch.float32)
+    q_cos_sin = make_cos_sin(max_pos, ROPE_DIM, dev)
+    index_q = torch.randn(
+        num_tokens, INDEX_HEADS, INDEX_HEAD_DIM, device=dev, dtype=torch.bfloat16
+    )
+    index_w = torch.randn(num_tokens, INDEX_HEADS, device=dev, dtype=torch.float32)
+    idx_cos_sin = make_cos_sin(max_pos, ROPE_DIM, dev)
+
+    iq_fp8, iw_out, mqa = K.fused_q(
+        pos,
+        q_pe,
+        q_cos_sin,
+        index_q,
+        idx_cos_sin,
+        ql_nope,
+        q_scale,
+        index_w,
+        INDEX_HEAD_DIM**-0.5,
+        INDEX_HEADS**-0.5,
+        has_indexer=True,
+        index_rope_interleave=True,
+        quantize_mqa=False,
+        q_out=q_out,
+    )
+    assert mqa is q_out
+    torch.testing.assert_close(mqa[..., :KV_LORA], ql_nope_ref, rtol=0, atol=0)
+    qpe_ref = rope(
+        q_pe.float(),
+        pos.unsqueeze(-1).expand(num_tokens, NUM_HEADS),
+        q_cos_sin,
+        interleave=True,
+    )
+    assert_bf16(mqa[..., KV_LORA:], qpe_ref, "packed bf16 q_pe RoPE")
+    iq_ref = rope(
+        index_q.float(),
+        pos.unsqueeze(-1).expand(num_tokens, INDEX_HEADS),
+        idx_cos_sin,
+        interleave=True,
+    )
+    q_ref, scale_ref = ue8m0_quant(iq_ref)
+    assert_fp8(iq_fp8, q_ref, "indexer-Q fp8 (packed bf16-query path)")
+    iw_ref = index_w * scale_ref * (INDEX_HEAD_DIM**-0.5) * (INDEX_HEADS**-0.5)
+    torch.testing.assert_close(iw_out, iw_ref, rtol=1e-3, atol=1e-3)
+
+
 def test_fused_q_triton_supports_large_token_count():
     """Keep the token count off CUDA grid-y in the Triton fallback.
 
