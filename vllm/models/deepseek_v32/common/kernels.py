@@ -610,7 +610,8 @@ def fused_norm_rope(
 @triton.jit
 def _fused_q_kernel(
     pos_ptr,
-    # MQA query PE: RoPE + FP8 pack into output tail
+    num_tokens,
+    # MQA query PE: RoPE (+ FP8 pack into the tail of mqa_q_fp8)
     q_pe_ptr,
     q_pe_stride0,
     q_pe_stride1,
@@ -618,7 +619,7 @@ def _fused_q_kernel(
     q_pe_cos_sin_ptr,
     q_pe_cos_sin_stride,
     Q_PE_HALF_ROT_DIM: tl.constexpr,
-    # Index Q RoPE
+    # Index Q RoPE + quantize
     index_q_ptr,
     index_q_stride0,
     index_q_stride1,
@@ -626,7 +627,6 @@ def _fused_q_kernel(
     index_q_cos_sin_ptr,
     index_q_cos_sin_stride,
     INDEX_Q_HALF_ROT_DIM: tl.constexpr,
-    # Index Q Quantize
     index_q_fp8_ptr,
     index_q_fp8_stride0,
     index_q_fp8_stride1,
@@ -641,8 +641,9 @@ def _fused_q_kernel(
     q_scale_ptr,
     QL_NOPE_DIM: tl.constexpr,
     QL_NOPE_BLOCK: tl.constexpr,
-    # bf16 MQA query RoPE output (when QUANTIZE_MQA is False); the NoPE part is
-    # consumed directly from ql_nope, so only the RoPE'd q_pe is written here.
+    # bf16 MQA query RoPE output (QUANTIZE_MQA=False). Written at
+    # ``rot_off`` within the head, so it may be a strided view into the tail of
+    # a [tokens, heads, nope+rope] buffer.
     q_pe_out_ptr,
     q_pe_out_stride0,
     q_pe_out_stride1,
@@ -653,177 +654,201 @@ def _fused_q_kernel(
     index_weights_head_scale,
     index_weights_out_ptr,
     index_weights_out_stride,
+    BLOCK_T: tl.constexpr,
     HAS_INDEXER: tl.constexpr,
     INDEX_ROPE_INTERLEAVE: tl.constexpr,
     QUANTIZE_MQA: tl.constexpr,
+    PACK_NOPE: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
-    tok_idx = tl.program_id(0).to(tl.int64)
-    pid = tl.program_id(1)
-    head_idx = tl.program_id(2)
+    """One program = BLOCK_T tokens x one head of one task.
+
+    Task index (program_id(1)): [0, NUM_Q_HEADS) RoPE the MQA q_pe head;
+    [NUM_Q_HEADS, +NUM_INDEX_Q_HEADS) RoPE+quantize an indexer head;
+    the rest (QUANTIZE_MQA or PACK_NOPE) pack a ql_nope head into the query
+    buffer.
+    """
+    tok0 = tl.program_id(0).to(tl.int64) * BLOCK_T
+    task = tl.program_id(1)
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    if pid == 2:
-        # ql_nope quantize + pack into the front of mqa_q_fp8. On the bf16
-        # query path ql_nope is consumed as-is (no pack), so skip entirely.
-        if not QUANTIZE_MQA:
-            return
-        if 2 * head_idx >= NUM_Q_HEADS:
-            return
+    toks = tok0 + tl.arange(0, BLOCK_T).to(tl.int64)
+    tok_mask = toks < num_tokens
+    pos = tl.load(pos_ptr + toks, mask=tok_mask, other=0)
 
-        scale = tl.load(q_scale_ptr)
-        for local_head in range(2):
-            q_head_idx = head_idx * 2 + local_head
-            if q_head_idx < NUM_Q_HEADS:
-                ql_nope_off = tl.arange(0, QL_NOPE_BLOCK)
-                ql_nope_mask = ql_nope_off < QL_NOPE_DIM
-                ql_nope = tl.load(
-                    ql_nope_ptr
-                    + tok_idx * ql_nope_stride0
-                    + q_head_idx * ql_nope_stride1
-                    + ql_nope_off,
-                    mask=ql_nope_mask,
-                ).to(tl.float32)
-                ql_nope_fp8 = (ql_nope / scale).to(tl.float8e4nv)
-                tl.store(
-                    mqa_q_fp8_ptr
-                    + tok_idx * mqa_q_fp8_stride0
-                    + q_head_idx * mqa_q_fp8_stride1
-                    + ql_nope_off,
-                    ql_nope_fp8,
-                    mask=ql_nope_mask,
-                )
-        return
-    elif pid == 0:
-        # q_pe RoPE + quantize + pack into the tail of mqa_q_fp8.
-        if 2 * head_idx >= NUM_Q_HEADS:
-            return
-
-        pos = tl.load(pos_ptr + tok_idx)
-        cos, sin = _get_cos_sin(
-            q_pe_cos_sin_ptr,
-            q_pe_cos_sin_stride,
-            pos,
-            Q_PE_HALF_ROT_DIM,
-        )
-
-        scale = tl.load(q_scale_ptr)
-        for local_head in range(2):
-            q_head_idx = head_idx * 2 + local_head
-            if q_head_idx < NUM_Q_HEADS:
-                rot_off = tl.arange(0, Q_PE_HALF_ROT_DIM)
-                x1 = tl.load(
-                    q_pe_ptr
-                    + tok_idx * q_pe_stride0
-                    + q_head_idx * q_pe_stride1
-                    + rot_off * 2,
-                ).to(tl.float32)
-                x2 = tl.load(
-                    q_pe_ptr
-                    + tok_idx * q_pe_stride0
-                    + q_head_idx * q_pe_stride1
-                    + rot_off * 2
-                    + 1
-                ).to(tl.float32)
-                r1 = x1 * cos - x2 * sin
-                r2 = x2 * cos + x1 * sin
-                if QUANTIZE_MQA:
-                    tl.store(
-                        mqa_q_fp8_ptr
-                        + tok_idx * mqa_q_fp8_stride0
-                        + q_head_idx * mqa_q_fp8_stride1
-                        + QL_NOPE_DIM
-                        + rot_off * 2,
-                        (r1 / scale).to(tl.float8e4nv),
-                    )
-                    tl.store(
-                        mqa_q_fp8_ptr
-                        + tok_idx * mqa_q_fp8_stride0
-                        + q_head_idx * mqa_q_fp8_stride1
-                        + QL_NOPE_DIM
-                        + rot_off * 2
-                        + 1,
-                        (r2 / scale).to(tl.float8e4nv),
-                    )
-                else:
-                    # bf16 query: write the RoPE'd q_pe unquantized.
-                    out_ty = q_pe_out_ptr.dtype.element_ty
-                    q_pe_dst = (
-                        q_pe_out_ptr
-                        + tok_idx * q_pe_out_stride0
-                        + q_head_idx * q_pe_out_stride1
-                    )
-                    tl.store(q_pe_dst + rot_off * 2, r1.to(out_ty))
-                    tl.store(q_pe_dst + rot_off * 2 + 1, r2.to(out_ty))
-        return
-    elif pid == 1:
-        # Index Q RoPE + fp8 quant, all in registers. The roped bf16 index_q is
-        # never consumed (only the fp8 below is), so we avoid an in-place
-        # store-then-reload round-trip.
-        if not HAS_INDEXER:
-            return
-        if head_idx >= NUM_INDEX_Q_HEADS:
-            return
-
-        pos = tl.load(pos_ptr + tok_idx)
-        index_q_block = tl.arange(0, INDEX_Q_HEAD_DIM)
-        iq_base = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
-        index_q = tl.load(iq_base + index_q_block).to(tl.float32)
-
-        # RoPE in registers (interleaved for GLM-5.2, NeoX for DeepSeek-V3.2),
-        # gathering the rotation partner from the read-only input.
-        in_rope = index_q_block < 2 * INDEX_Q_HALF_ROT_DIM
-        if INDEX_ROPE_INTERLEAVE:
-            cos_idx = index_q_block // 2
-            partner_offs = tl.where(in_rope, index_q_block ^ 1, index_q_block)
-            sign = tl.where(index_q_block % 2 == 0, -1.0, 1.0)
-        else:
-            cos_idx = index_q_block % INDEX_Q_HALF_ROT_DIM
-            partner_offs = tl.where(
-                in_rope, index_q_block ^ INDEX_Q_HALF_ROT_DIM, index_q_block
-            )
-            sign = tl.where(index_q_block < INDEX_Q_HALF_ROT_DIM, -1.0, 1.0)
-        cos_full = tl.load(
-            index_q_cos_sin_ptr + pos * index_q_cos_sin_stride + cos_idx,
-            mask=in_rope,
-            other=1.0,
-        ).to(tl.float32)
-        sin_full = tl.load(
-            index_q_cos_sin_ptr
-            + pos * index_q_cos_sin_stride
-            + INDEX_Q_HALF_ROT_DIM
-            + cos_idx,
-            mask=in_rope,
+    if task < NUM_Q_HEADS:
+        head_idx = task
+        rot_off = tl.arange(0, Q_PE_HALF_ROT_DIM)
+        cos = tl.load(
+            q_pe_cos_sin_ptr + pos[:, None] * q_pe_cos_sin_stride + rot_off[None, :],
+            mask=tok_mask[:, None],
             other=0.0,
         ).to(tl.float32)
-        partner = tl.load(iq_base + partner_offs).to(tl.float32)
-        roped = index_q * cos_full + sign * partner * sin_full
-        index_q = tl.where(in_rope, roped, index_q)
+        sin = tl.load(
+            q_pe_cos_sin_ptr
+            + pos[:, None] * q_pe_cos_sin_stride
+            + Q_PE_HALF_ROT_DIM
+            + rot_off[None, :],
+            mask=tok_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        src = q_pe_ptr + toks[:, None] * q_pe_stride0 + head_idx * q_pe_stride1
+        x1 = tl.load(src + rot_off[None, :] * 2, mask=tok_mask[:, None], other=0.0)
+        x2 = tl.load(src + rot_off[None, :] * 2 + 1, mask=tok_mask[:, None], other=0.0)
+        x1 = x1.to(tl.float32)
+        x2 = x2.to(tl.float32)
+        r1 = x1 * cos - x2 * sin
+        r2 = x2 * cos + x1 * sin
+        if QUANTIZE_MQA:
+            scale = tl.load(q_scale_ptr)
+            dst = (
+                mqa_q_fp8_ptr
+                + toks[:, None] * mqa_q_fp8_stride0
+                + head_idx * mqa_q_fp8_stride1
+                + QL_NOPE_DIM
+            )
+            tl.store(
+                dst + rot_off[None, :] * 2,
+                (r1 / scale).to(tl.float8e4nv),
+                mask=tok_mask[:, None],
+            )
+            tl.store(
+                dst + rot_off[None, :] * 2 + 1,
+                (r2 / scale).to(tl.float8e4nv),
+                mask=tok_mask[:, None],
+            )
+        else:
+            out_ty = q_pe_out_ptr.dtype.element_ty
+            dst = (
+                q_pe_out_ptr
+                + toks[:, None] * q_pe_out_stride0
+                + head_idx * q_pe_out_stride1
+            )
+            tl.store(dst + rot_off[None, :] * 2, r1.to(out_ty), mask=tok_mask[:, None])
+            tl.store(
+                dst + rot_off[None, :] * 2 + 1, r2.to(out_ty), mask=tok_mask[:, None]
+            )
+    elif task < NUM_Q_HEADS + NUM_INDEX_Q_HEADS:
+        if HAS_INDEXER:
+            head_idx = task - NUM_Q_HEADS
+            icols = tl.arange(0, INDEX_Q_HEAD_DIM)
+            iq_base = (
+                index_q_ptr
+                + toks[:, None] * index_q_stride0
+                + head_idx * index_q_stride1
+            )
+            index_q = tl.load(
+                iq_base + icols[None, :], mask=tok_mask[:, None], other=0.0
+            ).to(tl.float32)
 
-        # Index Q Quantize (from registers)
-        index_q_fp8, index_q_scale = _fp8_ue8m0_quantize(index_q)
-        tl.store(
-            index_q_fp8_ptr
-            + tok_idx * index_q_fp8_stride0
-            + head_idx * index_q_fp8_stride1
-            + index_q_block,
-            index_q_fp8,
-        )
+            # RoPE in registers (interleaved for GLM, NeoX for DeepSeek-V3.2),
+            # gathering the rotation partner from the read-only input.
+            in_rope = icols < 2 * INDEX_Q_HALF_ROT_DIM
+            if INDEX_ROPE_INTERLEAVE:
+                cos_idx = icols // 2
+                partner_offs = tl.where(in_rope, icols ^ 1, icols)
+                sign = tl.where(icols % 2 == 0, -1.0, 1.0)
+            else:
+                cos_idx = icols % INDEX_Q_HALF_ROT_DIM
+                partner_offs = tl.where(in_rope, icols ^ INDEX_Q_HALF_ROT_DIM, icols)
+                sign = tl.where(icols < INDEX_Q_HALF_ROT_DIM, -1.0, 1.0)
+            cs_mask = tok_mask[:, None] & in_rope[None, :]
+            cos_full = tl.load(
+                index_q_cos_sin_ptr
+                + pos[:, None] * index_q_cos_sin_stride
+                + cos_idx[None, :],
+                mask=cs_mask,
+                other=1.0,
+            ).to(tl.float32)
+            sin_full = tl.load(
+                index_q_cos_sin_ptr
+                + pos[:, None] * index_q_cos_sin_stride
+                + INDEX_Q_HALF_ROT_DIM
+                + cos_idx[None, :],
+                mask=cs_mask,
+                other=0.0,
+            ).to(tl.float32)
+            partner = tl.load(
+                iq_base + partner_offs[None, :], mask=tok_mask[:, None], other=0.0
+            ).to(tl.float32)
+            roped = index_q * cos_full + sign[None, :] * partner * sin_full
+            index_q = tl.where(in_rope[None, :], roped, index_q)
 
-        # Index weights update
-        index_weights = tl.load(
-            index_weights_ptr + tok_idx * index_weights_stride + head_idx
-        )
-        index_weights = index_weights.to(tl.float32)
-        index_weights *= index_q_scale
-        index_weights *= index_weights_softmax_scale
-        index_weights *= index_weights_head_scale
-        tl.store(
-            index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
-            index_weights,
-        )
+            # Per-(token, head) UE8M0 fp8 quantization from registers.
+            amax = tl.max(tl.abs(index_q), axis=1)
+            scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
+            scale = tl.math.exp2(tl.math.ceil(tl.math.log2(scale)))
+            index_q_fp8 = tl.div_rn(index_q, scale[:, None]).to(tl.float8e4nv)
+            tl.store(
+                index_q_fp8_ptr
+                + toks[:, None] * index_q_fp8_stride0
+                + head_idx * index_q_fp8_stride1
+                + icols[None, :],
+                index_q_fp8,
+                mask=tok_mask[:, None],
+            )
+
+            # Index weights: fold the quantization scale and the softmax/head scales.
+            index_weights = tl.load(
+                index_weights_ptr + toks * index_weights_stride + head_idx,
+                mask=tok_mask,
+                other=0.0,
+            ).to(tl.float32)
+            index_weights *= scale
+            index_weights *= index_weights_softmax_scale
+            index_weights *= index_weights_head_scale
+            tl.store(
+                index_weights_out_ptr + toks * index_weights_out_stride + head_idx,
+                index_weights,
+                mask=tok_mask,
+            )
+    else:
+        # ql_nope pack into the front of the MQA query buffer: fp8-quantized
+        # (QUANTIZE_MQA) or a plain copy (PACK_NOPE, bf16 query buffer).
+        head_idx = task - NUM_Q_HEADS - NUM_INDEX_Q_HEADS
+        ncols = tl.arange(0, QL_NOPE_BLOCK)
+        ncol_mask = ncols < QL_NOPE_DIM
+        mask = tok_mask[:, None] & ncol_mask[None, :]
+        if QUANTIZE_MQA:
+            scale = tl.load(q_scale_ptr)
+            ql_nope = tl.load(
+                ql_nope_ptr
+                + toks[:, None] * ql_nope_stride0
+                + head_idx * ql_nope_stride1
+                + ncols[None, :],
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            tl.store(
+                mqa_q_fp8_ptr
+                + toks[:, None] * mqa_q_fp8_stride0
+                + head_idx * mqa_q_fp8_stride1
+                + ncols[None, :],
+                (ql_nope / scale).to(tl.float8e4nv),
+                mask=mask,
+            )
+        elif PACK_NOPE:
+            ql_nope = tl.load(
+                ql_nope_ptr
+                + toks[:, None] * ql_nope_stride0
+                + head_idx * ql_nope_stride1
+                + ncols[None, :],
+                mask=mask,
+                other=0.0,
+            )
+            # q_pe_out points at the tail of the bf16 buffer; the head start
+            # is QL_NOPE_DIM elements before it.
+            tl.store(
+                q_pe_out_ptr
+                + toks[:, None] * q_pe_out_stride0
+                + head_idx * q_pe_out_stride1
+                - QL_NOPE_DIM
+                + ncols[None, :],
+                ql_nope,
+                mask=mask,
+            )
 
 
 def fused_q(
@@ -841,14 +866,18 @@ def fused_q(
     has_indexer: bool = True,
     index_rope_interleave: bool = False,
     quantize_mqa: bool = True,
+    q_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse the MQA-query and indexer-query RoPE/quantization.
 
     Returns ``(index_q_fp8, index_weights_out, mqa_q)``. When ``quantize_mqa``
     is True (FlashInfer sparse, fp8 query) ``mqa_q`` is a single fp8 tensor
-    packing ``[ql_nope; q_pe]``. When False (FlashMLA sparse, bf16 query) it is
-    the RoPE'd ``q_pe`` in bf16; the caller pairs it with ``ql_nope`` as the
-    ``(ql_nope, q_pe)`` tuple the backend expects.
+    packing ``[ql_nope; q_pe]``. When False (bf16 query) and ``q_out`` is None
+    it is the RoPE'd ``q_pe`` in bf16 and the caller pairs it with ``ql_nope``.
+    When False and ``q_out`` ([tokens, heads, nope + rope] bf16) is given, the
+    RoPE'd ``q_pe`` is written into its tail, ``ql_nope`` is copied into its
+    front unless it already aliases that front slice, and ``q_out`` is returned
+    as the packed bf16 MQA query.
     """
     assert positions.ndim == 1
     assert positions.dtype == torch.int64
@@ -859,19 +888,18 @@ def fused_q(
     assert q_scale.dtype == torch.float32 and q_scale.numel() == 1
     num_tokens = positions.shape[0]
     num_q_heads = q_pe.shape[1]
-    # Grid's 3rd dim must cover the MQA-pack heads (pid 0/2 iterate 2 heads
-    # each) and, when present, the indexer heads (pid 1).
-    mqa_grid_heads = (num_q_heads + 1) // 2
+    nope_dim = ql_nope.shape[2]
+    rope_dim = q_pe.shape[2]
     if not has_indexer:
-        # Shared layer: cached 1-element dummies; pid 1 skipped by HAS_INDEXER
-        # and never dereferences them.
+        # Shared layer: cached 1-element dummies; the indexer task is skipped
+        # by HAS_INDEXER and never dereferences them.
         index_q = _dummy((1, 1, 1), q_pe.dtype, q_pe.device)
         index_q_cos_sin_cache = q_pe_cos_sin_cache
         index_weights = _dummy((1, 1), torch.float32, q_pe.device)
     assert index_q is not None and index_q.ndim == 3
     assert index_q_cos_sin_cache is not None
     assert index_weights is not None
-    num_index_q_heads = index_q.shape[1]
+    num_index_q_heads = index_q.shape[1] if has_indexer else 0
     index_q_head_dim = index_q.shape[2]
     # fused_q is shared with the ROCm path, and the CuTeDSL module imports
     # cutlass at module scope, so only reach for it on CUDA.
@@ -890,19 +918,30 @@ def fused_q(
             quantize_mqa=quantize_mqa,
         ):
             cutedsl_kernel = fused_q_cutedsl
-    grid_heads = max(mqa_grid_heads, num_index_q_heads)
+    pack_nope = False
     if quantize_mqa:
         # fp8 path: pack [ql_nope; q_pe] into a single fp8 tensor.
         mqa_q_fp8 = torch.empty(
-            q_pe.shape[0],
-            q_pe.shape[1],
-            ql_nope.shape[2] + q_pe.shape[2],
+            num_tokens,
+            num_q_heads,
+            nope_dim + rope_dim,
             dtype=torch.float8_e4m3fn,
             device=q_pe.device,
         )
-        # Placeholder; pid 0 packs q_pe into mqa_q_fp8 instead.
+        # Placeholder; the q_pe task packs into mqa_q_fp8 instead.
         q_pe_out = mqa_q_fp8
         mqa_q = mqa_q_fp8
+    elif q_out is not None:
+        assert q_out.shape == (num_tokens, num_q_heads, nope_dim + rope_dim)
+        assert q_out.dtype == q_pe.dtype and q_out.stride(2) == 1
+        q_pe_out = q_out[..., nope_dim:]
+        mqa_q_fp8 = q_pe_out  # unused placeholder for the fp8 pack pointer
+        mqa_q = q_out
+        front = q_out[..., :nope_dim]
+        pack_nope = not (
+            ql_nope.data_ptr() == front.data_ptr()
+            and ql_nope.stride() == front.stride()
+        )
     else:
         # bf16 path: only the RoPE'd q_pe is produced; ql_nope used directly.
         q_pe_out = torch.empty_like(q_pe)
@@ -932,8 +971,16 @@ def fused_q(
         return index_q_fp8, index_weights_out, mqa_q
 
     use_pdl = current_platform.is_arch_support_pdl()
-    _fused_q_kernel[(num_tokens, 3, grid_heads)](
+    # Tasks: one per MQA head (RoPE), one per indexer head (RoPE + quant), and
+    # one per head for the ql_nope pack when the query is packed here.
+    num_tasks = num_q_heads + num_index_q_heads
+    if quantize_mqa or pack_nope:
+        num_tasks += num_q_heads
+    block_t = min(16, triton.next_power_of_2(num_tokens))
+    grid = (triton.cdiv(num_tokens, block_t), num_tasks)
+    _fused_q_kernel[grid](
         positions,
+        num_tokens,
         q_pe,
         q_pe.stride(0),
         q_pe.stride(1),
@@ -959,8 +1006,8 @@ def fused_q(
         mqa_q_fp8.stride(0),
         mqa_q_fp8.stride(1),
         q_scale,
-        ql_nope.shape[2],
-        triton.next_power_of_2(ql_nope.shape[2]),
+        nope_dim,
+        triton.next_power_of_2(nope_dim),
         q_pe_out,
         q_pe_out.stride(0),
         q_pe_out.stride(1),
@@ -970,15 +1017,14 @@ def fused_q(
         index_weights_head_scale,
         index_weights_out,
         index_weights_out.stride(0),
+        BLOCK_T=block_t,
         HAS_INDEXER=has_indexer,
         INDEX_ROPE_INTERLEAVE=index_rope_interleave,
         QUANTIZE_MQA=quantize_mqa,
+        PACK_NOPE=pack_nope,
         USE_PDL=use_pdl,
         launch_pdl=use_pdl,
-        # num_warps=1 is optimal here: each program is a single 128-element
-        # rope+quant, so the kernel is program-count/occupancy bound, not
-        # per-program compute bound (swept 1/2/4/8 — 1 wins or ties everywhere).
-        num_warps=1,
+        num_warps=4 if block_t >= 8 else 1,
     )
     return index_q_fp8, index_weights_out, mqa_q
 
