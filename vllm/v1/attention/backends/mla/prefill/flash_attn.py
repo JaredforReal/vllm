@@ -327,6 +327,13 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
                 qk_rope_head_dim=64,
                 v_head_dim=128,
             ),
+            # GLM-5.3-Flash NoPE MLA: same (256, 256) kernel dims as the
+            # (192, 64, 256) layout, without a RoPE part.
+            MLADimensions(
+                qk_nope_head_dim=256,
+                qk_rope_head_dim=0,
+                v_head_dim=256,
+            ),
         ]
 
     def __init__(
