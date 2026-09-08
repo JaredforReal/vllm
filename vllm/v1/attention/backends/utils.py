@@ -17,6 +17,7 @@ from typing_extensions import runtime_checkable
 
 from vllm.config import CacheConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import _layout_from_name
+from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d, np_to_pinned_tensor
@@ -1167,3 +1168,51 @@ def mamba_get_block_table_tensor(
         )
         indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
         return torch.gather(block_table, 1, indices_to_gather)
+
+
+@triton.jit(do_not_specialize=["num_reqs", "num_mapped_tokens", "num_tokens"])
+def _token_to_req_indices_kernel(
+    query_start_loc_ptr,
+    out_ptr,
+    num_reqs,
+    num_mapped_tokens,
+    num_tokens,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid < num_reqs:
+        start = tl.load(query_start_loc_ptr + pid)
+        end = tl.load(query_start_loc_ptr + pid + 1)
+        for i in range(start, end, BLOCK):
+            offs = i + tl.arange(0, BLOCK)
+            tl.store(out_ptr + offs, pid.to(tl.int32), mask=offs < end)
+    else:
+        offs = num_mapped_tokens + (pid - num_reqs) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(out_ptr + offs, 0, mask=offs < num_tokens)
+
+
+def fill_token_to_req_indices(
+    query_start_loc: torch.Tensor,
+    out: torch.Tensor,
+    num_mapped_tokens: int,
+    num_tokens: int,
+) -> None:
+    """Write the request index of every token in ``[0, num_mapped_tokens)`` and
+    zero the padding range ``[num_mapped_tokens, num_tokens)`` in one launch.
+
+    Equivalent to ``repeat_interleave(arange(num_reqs), query_lens)`` followed
+    by a zero fill, but driven by the device ``query_start_loc`` without any
+    intermediate tensors.
+    """
+    num_reqs = query_start_loc.shape[0] - 1
+    block = 256
+    grid = (num_reqs + triton.cdiv(max(num_tokens - num_mapped_tokens, 0), block),)
+    _token_to_req_indices_kernel[grid](
+        query_start_loc,
+        out,
+        num_reqs,
+        num_mapped_tokens,
+        num_tokens,
+        BLOCK=block,
+        num_warps=4,
+    )
