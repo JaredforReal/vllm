@@ -1880,6 +1880,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
             cudagraph_stats=cudagraph_stats,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
 
         if not self.is_last_pp_rank:
@@ -1910,6 +1911,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
         cudagraph_stats = self.execute_model_state.cudagraph_stats
+        num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
+        )
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2006,6 +2010,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+        num_drafts = self.num_speculative_steps
         if self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
@@ -2031,8 +2036,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler.sampling_states.seeds.gpu,
                     dp_sync=dp_sync,
                     mm_inputs=mm_inputs,
+                    num_speculative_tokens=num_spec_tokens_to_schedule,
                 )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            # Dynamic SD can return fewer than num_speculative_steps drafts;
+            # only those columns are valid for this step.
+            num_drafts = draft_tokens.shape[1]
+            self.req_states.draft_tokens[input_batch.idx_mapping, :num_drafts] = (
+                draft_tokens
+            )
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
@@ -2043,7 +2054,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                self.req_states.draft_tokens[input_batch.idx_mapping, :num_drafts],
             )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
@@ -2189,6 +2200,9 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     routed_experts: RoutedExpertsTensors | None
     cudagraph_stats: CUDAGraphStat | None
+    # Draft tokens the scheduler wants for the next step (dynamic SD may pick
+    # fewer than num_speculative_tokens).
+    num_spec_tokens_to_schedule: int
 
 
 class BatchReqState(NamedTuple):
