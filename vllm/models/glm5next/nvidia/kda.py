@@ -241,6 +241,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Lazily-built merged q|k|v conv weight (built on first forward, after
         # weights are loaded). See _forward.
         self._merged_conv_weight: torch.Tensor | None = None
+        # Lazily-built stacked [2, head_dim, P] f_b|g_b weight for one batched
+        # GEMM over the adjacent f_a|g_a columns of the merged projection.
+        self._fg_b_weight: torch.Tensor | None = None
 
         self.A_log = nn.Parameter(
             torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
@@ -292,15 +295,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
-        qkv, beta_raw, f_a, g_a = projected.split(
-            [
-                3 * self.local_projection_size,
-                self.local_num_heads,
-                self.head_dim,
-                self.head_dim,
-            ],
-            dim=-1,
-        )
+        qkv_size = 3 * self.local_projection_size
+        qkv = projected[:, :qkv_size]
+        beta_raw = projected[:, qkv_size : qkv_size + self.local_num_heads]
+        fg_start = qkv_size + self.local_num_heads
 
         # Beta stays raw (bf16) here: the recurrent kernel sigmoids it in fp32
         # at load (SIGMOID_BETA), and only the chunked prefill path needs the
@@ -308,12 +306,20 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # / spec-verify steps then skip the _cast_sigmoid kernel and its fp32
         # intermediate entirely.
         beta = beta_raw.unsqueeze(0)
-        g1 = self.f_b_proj(f_a)[0]
-        g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
 
-        g_proj_states = self.g_b_proj(g_a)[0]
+        # f_b and g_b are two [head_dim, P] BF16 projections of the adjacent
+        # f_a | g_a columns: run them as one batched GEMM straight on the
+        # strided [2, n, head_dim] view (no copy, one launch instead of two).
+        if self._fg_b_weight is None:
+            self._fg_b_weight = torch.stack(
+                [self.f_b_proj.weight.t(), self.g_b_proj.weight.t()]
+            ).contiguous()
+        fg_a = projected[:, fg_start : fg_start + 2 * self.head_dim]
+        fg_a = fg_a.view(num_tokens, 2, self.head_dim).transpose(0, 1)
+        fg = torch.bmm(fg_a, self._fg_b_weight)
+        g1 = fg[0].reshape(1, -1, self.local_num_heads, self.head_dim)
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
-        g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
+        g2 = fg[1].reshape(-1, self.local_num_heads, self.head_dim)
 
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),

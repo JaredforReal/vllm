@@ -18,6 +18,7 @@ expansion consequences via the pure-torch expand/append pair that the fused
 kernel is documented to replicate.
 """
 
+import pytest
 import torch
 
 # Bootstrap the glm5next package before entering the indexer module: its
@@ -35,6 +36,7 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import (  # noqa: E402
 import vllm.model_executor.layers.sparse_attn_indexer_kpool as indexer_mod
 from vllm.model_executor.layers.sparse_attn_indexer_kpool import (
     _decode_topk_seq_lens,
+    _fill_causal_indices,
     _fill_short_decode_causal_indices,
 )
 from vllm.platforms import current_platform
@@ -182,3 +184,16 @@ def test_tail_expansion_legacy_vs_fixed():
     assert legacy_tail[10, :2].tolist() == [556, 557]
 
     assert not torch.equal(legacy_tail, fixed_tail)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("width", [8, 1000, 2176])
+def test_fill_causal_indices_kernel_matches_torch(width: int):
+    """The single-launch CUDA fill must match the torch formulation (CPU path),
+    including rows whose position exceeds the row width."""
+    positions = torch.tensor([0, 3, 7, width - 1, width + 5], dtype=torch.int64)
+    ref = torch.full((positions.numel(), width), 99, dtype=torch.int32)
+    _fill_causal_indices(ref, positions)
+    got = torch.full_like(ref, 99, device="cuda")
+    _fill_causal_indices(got, positions.cuda())
+    assert torch.equal(got.cpu(), ref)

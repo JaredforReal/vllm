@@ -14,6 +14,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 
 if TYPE_CHECKING:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
@@ -192,7 +193,30 @@ def _decode_topk_seq_lens(
     return padded.reshape(n) + 1  # pad rows: -1 + 1 = 0 -> empty tail
 
 
+@triton.jit
+def _fill_causal_indices_kernel(
+    rows_ptr,
+    rows_stride,
+    positions_ptr,
+    width,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    pos = tl.load(positions_ptr + row).to(tl.int32)
+    vals = tl.where(cols <= pos, cols.to(tl.int32), -1)
+    tl.store(rows_ptr + row * rows_stride + cols, vals, mask=cols < width)
+
+
 def _fill_causal_indices(rows: torch.Tensor, positions: torch.Tensor) -> None:
+    """rows[t, j] = j for j <= positions[t], else -1 (one launch on CUDA)."""
+    if rows.is_cuda and rows.shape[0] > 0:
+        block = 1024
+        grid = (rows.shape[0], triton.cdiv(rows.shape[1], block))
+        _fill_causal_indices_kernel[grid](
+            rows, rows.stride(0), positions, rows.shape[1], BLOCK=block
+        )
+        return
     causal_range = torch.arange(rows.shape[1], device=rows.device, dtype=torch.int32)
     positions = positions.to(torch.int32)
     rows[:] = causal_range[None, :]
