@@ -555,6 +555,143 @@ class DeepseekV32IndexerMetadata:
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
 
 
+@triton.jit(do_not_specialize=["num_decodes", "actual_expanded", "num_decode_tokens"])
+def _expand_varlen_decode_kernel(
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    block_table_ptr,
+    block_table_stride,
+    out_seq_lens_ptr,
+    out_block_table_ptr,
+    out_block_table_stride,
+    out_decode_lens_ptr,
+    out_per_req_decode_lens_ptr,
+    out_indices_ptr,
+    num_decodes,
+    actual_expanded,
+    num_decode_tokens,
+    block_table_width,
+    HAS_INDICES: tl.constexpr,
+    BLOCK_BT: tl.constexpr,
+    BLOCK_PAD: tl.constexpr,
+):
+    """Flatten variable-length decode requests to one row per token.
+
+    Programs ``[0, num_decodes)`` expand their request; the remaining programs
+    fill the CUDA-graph padding rows ``[actual_expanded, num_decode_tokens)``.
+    """
+    pid = tl.program_id(0)
+    if pid < num_decodes:
+        start = tl.load(query_start_loc_ptr + pid)
+        end = tl.load(query_start_loc_ptr + pid + 1)
+        decode_len = end - start
+        tl.store(out_per_req_decode_lens_ptr + pid, decode_len)
+        seq_len = tl.load(seq_lens_ptr + pid)
+        for j in range(0, decode_len):
+            token = start + j
+            # Token j of the request attends to seq_len - decode_len + j + 1 KVs.
+            tl.store(out_seq_lens_ptr + token, seq_len - decode_len + j + 1)
+            tl.store(out_decode_lens_ptr + token, 1)
+            if HAS_INDICES:
+                tl.store(out_indices_ptr + token, pid)
+            src = block_table_ptr + pid * block_table_stride
+            dst = out_block_table_ptr + token * out_block_table_stride
+            for i in range(0, block_table_width, BLOCK_BT):
+                off = i + tl.arange(0, BLOCK_BT)
+                mask = off < block_table_width
+                tl.store(dst + off, tl.load(src + off, mask=mask), mask=mask)
+    else:
+        offs = (
+            actual_expanded + (pid - num_decodes) * BLOCK_PAD + tl.arange(0, BLOCK_PAD)
+        )
+        mask = offs < num_decode_tokens
+        tl.store(out_seq_lens_ptr + offs, 0, mask=mask)
+        tl.store(out_block_table_ptr + offs * out_block_table_stride, 0, mask=mask)
+        tl.store(out_decode_lens_ptr + offs, 1, mask=mask)
+        if HAS_INDICES:
+            tl.store(
+                out_indices_ptr + offs,
+                num_decodes + (offs - actual_expanded),
+                mask=mask,
+            )
+
+
+def expand_varlen_decode(
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    out_seq_lens: torch.Tensor,
+    out_block_table: torch.Tensor,
+    out_decode_lens: torch.Tensor,
+    out_per_req_decode_lens: torch.Tensor,
+    out_indices: torch.Tensor | None,
+    num_decodes: int,
+    actual_expanded: int,
+    num_decode_tokens: int,
+) -> None:
+    """One launch for the per-token decode metadata of a variable-length
+    (or CUDA-graph padded) decode batch: per-token KV lengths, per-token block
+    table rows, unit decode lengths, per-request decode lengths and, optionally,
+    the request id of each flattened row."""
+    block_pad = 256
+    num_pad_programs = triton.cdiv(
+        max(num_decode_tokens - actual_expanded, 0), block_pad
+    )
+    grid = (num_decodes + num_pad_programs,)
+    _expand_varlen_decode_kernel[grid](
+        query_start_loc,
+        seq_lens,
+        block_table,
+        block_table.stride(0),
+        out_seq_lens,
+        out_block_table,
+        out_block_table.stride(0),
+        out_decode_lens,
+        out_per_req_decode_lens,
+        out_indices if out_indices is not None else out_decode_lens,
+        num_decodes,
+        actual_expanded,
+        num_decode_tokens,
+        block_table.shape[1],
+        HAS_INDICES=out_indices is not None,
+        BLOCK_BT=256,
+        BLOCK_PAD=block_pad,
+        num_warps=4,
+    )
+
+
+@triton.jit(do_not_specialize=["num_reqs", "num_actual_tokens", "num_tokens"])
+def _kpool_tail_slot_mapping_kernel(
+    slot_mapping_ptr,
+    block_table_ptr,
+    block_table_stride,
+    query_start_loc_ptr,
+    positions_ptr,
+    out_ptr,
+    num_reqs,
+    num_actual_tokens,
+    num_tokens,
+    kpool,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid < num_reqs:
+        start = tl.load(query_start_loc_ptr + pid)
+        # Tokens past the last request's boundary (if any) also map to it.
+        end = tl.load(query_start_loc_ptr + pid + 1)
+        end = tl.where(pid == num_reqs - 1, num_actual_tokens, end)
+        own_block = tl.load(block_table_ptr + pid * block_table_stride).to(tl.int64)
+        for i in range(start, end, BLOCK):
+            offs = i + tl.arange(0, BLOCK)
+            mask = offs < end
+            pos = tl.load(positions_ptr + offs, mask=mask, other=0).to(tl.int64)
+            tl.store(out_ptr + offs, own_block * kpool + pos % kpool, mask=mask)
+    else:
+        offs = num_actual_tokens + (pid - num_reqs) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < num_tokens
+        tl.store(out_ptr + offs, tl.load(slot_mapping_ptr + offs, mask=mask), mask=mask)
+
+
 def compute_kpool_tail_slot_mapping(
     slot_mapping: torch.Tensor,
     block_table: torch.Tensor,
@@ -567,10 +704,30 @@ def compute_kpool_tail_slot_mapping(
 ) -> torch.Tensor:
     """Map every token to its request's one circular tail block."""
     if out is None:
-        out = slot_mapping.clone()
+        out = torch.empty_like(slot_mapping)
     else:
         assert out.shape == slot_mapping.shape
-        out.copy_(slot_mapping)
+    if slot_mapping.is_cuda and slot_mapping.dim() == 1 and num_reqs > 0:
+        block = 256
+        num_tokens = slot_mapping.shape[0]
+        num_actual_tokens = min(num_actual_tokens, num_tokens)
+        grid = (num_reqs + triton.cdiv(num_tokens - num_actual_tokens, block),)
+        _kpool_tail_slot_mapping_kernel[grid](
+            slot_mapping,
+            block_table,
+            block_table.stride(0),
+            query_start_loc,
+            positions,
+            out,
+            num_reqs,
+            num_actual_tokens,
+            num_tokens,
+            kpool,
+            BLOCK=block,
+            num_warps=4,
+        )
+        return out
+    out.copy_(slot_mapping)
     if num_actual_tokens == 0:
         return out
     tokens = torch.arange(num_actual_tokens, device=slot_mapping.device)
@@ -1137,12 +1294,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata = None
         if num_decodes > 0:
-            torch.diff(
-                common_attn_metadata.query_start_loc[: num_decodes + 1],
-                out=self.decode_lens_buffer[:num_decodes],
-            )
-            decode_lens = self.decode_lens_buffer[:num_decodes]
-            self.per_req_decode_lens_buffer[:num_decodes].copy_(decode_lens)
             decode_lens_cpu = torch.diff(
                 common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
             )
@@ -1176,6 +1327,22 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 and max_decode_len <= next_n
                 and step_next_n_ok
             )
+            # DCP still expands the global lengths on the torch path, which
+            # reads the per-request decode lengths before the fused kernel
+            # would write them, so keep the unfused path there.
+            fuse_decode_expansion = (
+                not use_native and seq_lens.is_cuda and dcp_local_seq_lens is None
+            )
+            if fuse_decode_expansion:
+                # Per-request decode lengths are written by the fused kernel.
+                decode_lens = self.per_req_decode_lens_buffer[:num_decodes]
+            else:
+                torch.diff(
+                    common_attn_metadata.query_start_loc[: num_decodes + 1],
+                    out=self.decode_lens_buffer[:num_decodes],
+                )
+                decode_lens = self.decode_lens_buffer[:num_decodes]
+                self.per_req_decode_lens_buffer[:num_decodes].copy_(decode_lens)
 
             global_seq_lens_for_decode = self._prepare_global_decode_seq_lens(
                 global_seq_lens=global_seq_lens_for_decode,
@@ -1188,27 +1355,55 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
 
             decode_indices = None
-            if self.supports_varlen:
-                decode_indices = self._build_varlen_decode_indices(
-                    decode_lens=decode_lens,
-                    decode_lens_cpu=decode_lens_cpu,
-                    num_decode_tokens=num_decode_tokens,
+            if fuse_decode_expansion:
+                # Flattened (per-token) decode rows: one fused launch builds the
+                # per-token KV lengths, block-table rows, decode lengths, the
+                # per-request decode lengths and (SM100 varlen) request ids.
+                actual_expanded = int(decode_lens_cpu.sum().item())
+                if self.supports_varlen:
+                    decode_indices = self.decode_indices_buffer[:num_decode_tokens]
+                expand_varlen_decode(
+                    common_attn_metadata.query_start_loc[: num_decodes + 1],
+                    seq_lens,
+                    block_table,
+                    self.decode_seq_lens_buffer,
+                    self.expanded_block_table_buffer,
+                    self.decode_lens_buffer,
+                    self.per_req_decode_lens_buffer,
+                    decode_indices,
+                    num_decodes,
+                    actual_expanded,
+                    num_decode_tokens,
                 )
+                seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
+                block_table = self.expanded_block_table_buffer[:num_decode_tokens]
+                decode_lens = self.decode_lens_buffer[:num_decode_tokens]
+                batch_size = num_decode_tokens
+                requires_padding = False
+            else:
+                if self.supports_varlen:
+                    decode_indices = self._build_varlen_decode_indices(
+                        decode_lens=decode_lens,
+                        decode_lens_cpu=decode_lens_cpu,
+                        num_decode_tokens=num_decode_tokens,
+                    )
 
-            seq_lens, block_table, decode_lens, batch_size, requires_padding = (
-                self._prepare_decode_tensors(
-                    seq_lens=seq_lens,
-                    block_table=block_table,
-                    decode_lens=decode_lens,
-                    decode_lens_cpu=decode_lens_cpu,
-                    query_start_loc=common_attn_metadata.query_start_loc[:num_decodes],
-                    num_decodes=num_decodes,
-                    num_decode_tokens=num_decode_tokens,
-                    use_native=use_native,
-                    next_n=next_n,
-                    max_decode_len=max_decode_len,
+                seq_lens, block_table, decode_lens, batch_size, requires_padding = (
+                    self._prepare_decode_tensors(
+                        seq_lens=seq_lens,
+                        block_table=block_table,
+                        decode_lens=decode_lens,
+                        decode_lens_cpu=decode_lens_cpu,
+                        query_start_loc=common_attn_metadata.query_start_loc[
+                            :num_decodes
+                        ],
+                        num_decodes=num_decodes,
+                        num_decode_tokens=num_decode_tokens,
+                        use_native=use_native,
+                        next_n=next_n,
+                        max_decode_len=max_decode_len,
+                    )
                 )
-            )
 
             if self.compress_ratio > 1:
                 kernel_block_size = self.kernel_block_size
