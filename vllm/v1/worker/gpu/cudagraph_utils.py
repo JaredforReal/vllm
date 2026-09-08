@@ -232,16 +232,20 @@ class CudaGraphManager:
         # draft tokens. The scheduler might use a smaller number so we need
         # to capture graphs for all possible values during decode.
         speculative_config = self.vllm_config.speculative_config
+        # decode_query_len = num_speculative_steps + num_new_sampled_tokens
+        # _per_step for the target model and the draft prefill pass. Recover
+        # num_new_sampled_tokens_per_step from the values the manager already
+        # has. Draft decode steps run one token per request whatever the
+        # per-step draft count is (decode_query_len == 1), so they keep a
+        # single query length.
+        num_new_sampled_tokens_per_step = (
+            self.decode_query_len - self.vllm_config.num_speculative_tokens
+        )
         if (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
+            and num_new_sampled_tokens_per_step >= 1
         ):
-            # decode_query_len = num_speculative_steps + num_new_sampled_tokens
-            # _per_step. Recover num_new_sampled_tokens_per_step
-            # from the values the manager already has.
-            num_new_sampled_tokens_per_step = (
-                self.decode_query_len - self.vllm_config.num_speculative_tokens
-            )
             dense_schedule = build_dynamic_sd_schedule_lookup(
                 speculative_config.num_speculative_tokens_per_batch_size,
                 vllm_max_batch_size=self.max_num_reqs,
