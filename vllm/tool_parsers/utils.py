@@ -11,9 +11,12 @@ from json import JSONDecodeError, JSONDecoder
 from typing import Any, TypeAlias
 
 import partial_json_parser
+import regex as re
 from openai.types.responses import (
+    CustomTool,
     FunctionTool,
     NamespaceTool,
+    ToolChoiceCustom,
     ToolChoiceFunction,
 )
 from openai.types.responses.tool import Tool as ResponsesTool
@@ -182,11 +185,109 @@ def flat_namespace_tool_name(namespace: str, name: str) -> str:
     return f"{namespace}{_NAMESPACE_TOOL_SEPARATOR}{name}"
 
 
+# Custom tools (`type: "custom"`) take free-form text instead of JSON
+# arguments. Chat-template models only know function calls, so a custom tool
+# is presented to the model as a function with a single string parameter and
+# the parsed argument is mapped back to the custom tool call `input`.
+CUSTOM_TOOL_INPUT_PARAM = "input"
+
+
+def custom_tool_as_function_dict(tool: CustomTool) -> dict[str, Any]:
+    input_schema: dict[str, Any] = {
+        "type": "string",
+        "description": "The raw text input for the tool.",
+    }
+    fmt = tool.format
+    if fmt is not None and fmt.type == "grammar":
+        if fmt.syntax == "regex":
+            input_schema["pattern"] = fmt.definition
+        input_schema["description"] += (
+            f" It must conform to this {fmt.syntax} grammar:\n{fmt.definition}"
+        )
+    function: dict[str, Any] = {
+        "type": "function",
+        "name": tool.name,
+        "parameters": {
+            "type": "object",
+            "properties": {CUSTOM_TOOL_INPUT_PARAM: input_schema},
+            "required": [CUSTOM_TOOL_INPUT_PARAM],
+        },
+    }
+    if tool.description is not None:
+        function["description"] = tool.description
+    return function
+
+
+def custom_tool_names(tools: list[ResponsesTool] | None) -> frozenset[str]:
+    if not tools:
+        return frozenset()
+    return frozenset(tool.name for tool in tools if isinstance(tool, CustomTool))
+
+
+def _decode_json_string_prefix(raw: str) -> str | None:
+    """Decode the longest complete prefix of an unterminated JSON string body."""
+    i = 0
+    safe_end = 0
+    while i < len(raw):
+        char = raw[i]
+        if char == '"':
+            break
+        if char == "\\":
+            step = 6 if raw[i + 1 : i + 2] == "u" else 2
+            if i + step > len(raw):
+                break
+            i += step
+        else:
+            i += 1
+        safe_end = i
+    try:
+        decoded = json.loads(f'"{raw[:safe_end]}"')
+    except ValueError:
+        return None
+    # Never split a surrogate pair across two deltas.
+    if decoded and "\ud800" <= decoded[-1] <= "\udbff":
+        decoded = decoded[:-1]
+    return decoded
+
+
+_CUSTOM_TOOL_INPUT_PREFIX_RE = re.compile(
+    r'\s*\{\s*"' + re.escape(CUSTOM_TOOL_INPUT_PARAM) + r'"\s*:\s*"'
+)
+
+
+def custom_tool_input_from_arguments(
+    arguments: str, *, partial: bool = False
+) -> str | None:
+    """Recover the custom tool `input` from function-call style arguments.
+
+    With ``partial=True`` the arguments may be an incomplete JSON prefix; the
+    input text decoded so far is returned, or ``None`` when it cannot be
+    determined yet. Complete arguments that do not carry the expected
+    single-parameter object are returned verbatim.
+    """
+    if partial:
+        match = _CUSTOM_TOOL_INPUT_PREFIX_RE.match(arguments)
+        if match is None:
+            return None
+        return _decode_json_string_prefix(arguments[match.end() :])
+    try:
+        parsed = json.loads(arguments)
+    except ValueError:
+        return arguments
+    if isinstance(parsed, dict) and isinstance(
+        parsed.get(CUSTOM_TOOL_INPUT_PARAM), str
+    ):
+        return parsed[CUSTOM_TOOL_INPUT_PARAM]
+    return arguments
+
+
 def iter_response_function_tool_info(
     tool: ResponsesTool,
 ) -> list[tuple[str, dict[str, Any] | None]]:
     if isinstance(tool, FunctionTool):
         return [(tool.name, tool.parameters)]
+    if isinstance(tool, CustomTool):
+        return [(tool.name, custom_tool_as_function_dict(tool)["parameters"])]
     if not isinstance(tool, NamespaceTool):
         return []
 
@@ -218,6 +319,8 @@ def iter_response_function_tool_dicts(
                 function_tools.append(tool_dict)
         elif isinstance(tool, FunctionTool):
             function_tools.append(tool.model_dump())
+        elif isinstance(tool, CustomTool):
+            function_tools.append(custom_tool_as_function_dict(tool))
     return function_tools
 
 
@@ -277,7 +380,7 @@ def find_tool_properties(
     if not tools:
         return {}
     for tool in tools:
-        if isinstance(tool, (FunctionTool, NamespaceTool)):
+        if isinstance(tool, (FunctionTool, NamespaceTool, CustomTool)):
             for name, params in iter_response_function_tool_info(tool):
                 if name == tool_name:
                     return (params or {}).get("properties", {})
@@ -298,7 +401,7 @@ def find_tool_name(
     if not tools:
         return False
     for tool in tools:
-        if isinstance(tool, (FunctionTool, NamespaceTool)):
+        if isinstance(tool, (FunctionTool, NamespaceTool, CustomTool)):
             for name, _ in iter_response_function_tool_info(tool):
                 if name == tool_name:
                     return True
@@ -354,7 +457,7 @@ def _get_json_schema_from_tools(
     fn_tool_schemas: list[dict[str, Any]] = []
     fn_tools: list[Tool] = []
     for tool in tools:
-        if isinstance(tool, (FunctionTool, NamespaceTool)):
+        if isinstance(tool, (FunctionTool, NamespaceTool, CustomTool)):
             fn_tool_schemas.extend(
                 _get_tool_schema_from_name_and_params(name, params)
                 for name, params in iter_response_function_tool_info(tool)
@@ -379,20 +482,23 @@ def _get_json_schema_from_tools(
 
 
 def get_json_schema_from_tools(
-    tool_choice: str | ToolChoiceFunction | ChatCompletionNamedToolChoiceParam,
+    tool_choice: str
+    | ToolChoiceFunction
+    | ToolChoiceCustom
+    | ChatCompletionNamedToolChoiceParam,
     tools: list[Tool] | None,
 ) -> str | dict | None:
     # tool_choice: "none"
     if tool_choice in ("none", None) or tools is None:
         return None
-    # tool_choice: Forced Function (Responses)
+    # tool_choice: Forced Function / Custom tool (Responses)
     if (not isinstance(tool_choice, str)) and isinstance(
-        tool_choice, ToolChoiceFunction
+        tool_choice, (ToolChoiceFunction, ToolChoiceCustom)
     ):
         tool_name = tool_choice.name
         responses_tool_map: dict[str, dict[str, Any] | None] = {}
         for tool in tools:
-            if not isinstance(tool, (FunctionTool, NamespaceTool)):
+            if not isinstance(tool, (FunctionTool, NamespaceTool, CustomTool)):
                 continue
             for name, params in iter_response_function_tool_info(tool):
                 responses_tool_map[name] = params

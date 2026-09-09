@@ -694,3 +694,65 @@ def test_kimi_k3_forced_tool_choice_builds_single_mandatory_call():
     response_only = _k3_response("no call here")
     assert _is_grammar_accept_string(grammar, ok)
     assert not _is_grammar_accept_string(grammar, response_only)
+
+
+def _custom_tool(name: str, fmt: dict | None = None):
+    from openai.types.responses import CustomTool
+
+    return CustomTool(type="custom", name=name, description="d", format=fmt)
+
+
+def test_glm_custom_tool_text_format_is_single_string_argument():
+    tag = get_model_structural_tag(
+        "glm_4_7",
+        tools=[_custom_tool("emit", {"type": "text"})],
+        tool_choice="required",
+        reasoning=False,
+    )
+    grammar = Grammar.from_structural_tag(tag)
+    assert _is_grammar_accept_string(
+        grammar,
+        "<tool_call>emit<arg_key>input</arg_key>"
+        "<arg_value>ls -la</arg_value></tool_call>",
+    )
+
+
+def test_glm_custom_tool_lark_grammar_constrains_input():
+    from openai.types.responses import ToolChoiceCustom
+
+    tag = get_model_structural_tag(
+        "glm_4_7",
+        tools=[
+            _custom_tool(
+                "emit",
+                {"type": "grammar", "syntax": "lark", "definition": 'start: "pwd"'},
+            )
+        ],
+        tool_choice=ToolChoiceCustom(type="custom", name="emit"),
+        reasoning=False,
+    )
+    dumped = tag.model_dump()
+    assert dumped["format"]["content"]["type"] == "grammar"
+    grammar = Grammar.from_structural_tag(tag)
+    prefix = "<tool_call>emit<arg_key>input</arg_key><arg_value>"
+    accepted = f"{prefix}pwd</arg_value></tool_call>"
+    rejected = f"{prefix}rm -rf</arg_value></tool_call>"
+    assert _is_grammar_accept_string(grammar, accepted)
+    assert not _is_grammar_accept_string(grammar, rejected)
+
+
+def test_glm_custom_tool_grammar_only_applies_to_matching_tool():
+    grammar_tool = _custom_tool(
+        "emit", {"type": "grammar", "syntax": "lark", "definition": 'start: "pwd"'}
+    )
+    tag = get_model_structural_tag(
+        "glm_4_7",
+        tools=[grammar_tool, _custom_tool("re_emit", {"type": "text"})],
+        tool_choice="required",
+        reasoning=False,
+    )
+    tags = {
+        t["begin"]: t["content"]["type"] for t in tag.model_dump()["format"]["tags"]
+    }
+    assert tags["<tool_call>emit<arg_key>input</arg_key><arg_value>"] == "grammar"
+    assert tags["<tool_call>re_emit"] == "json_schema"
