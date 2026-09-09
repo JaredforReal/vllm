@@ -124,3 +124,48 @@ class TestProcessorCompoundDeltas:
         types = [e.type for e in events]
         assert "response.reasoning_text.delta" in types
         assert "response.output_text.delta" in types
+
+
+def _done_items(events: list) -> list:
+    return [e.item for e in events if e.type == "response.output_item.done"]
+
+
+class TestProcessorFinalItems:
+    """The final response reuses the streamed items, so every
+    `output_item.done` item must be recorded verbatim in `state.output_items`."""
+
+    def test_output_items_match_done_events(self):
+        processor = SimpleStreamingEventProcessor()
+        events = _run_through_processor(
+            processor,
+            DeltaMessage(
+                reasoning="think",
+                content="answer",
+                tool_calls=[_make_tool_call(0, name="f", arguments="{}")],
+            ),
+        )
+        events.extend(processor.close_current())
+
+        done_items = _done_items(events)
+        assert done_items == processor.state.output_items
+        assert [item.type for item in done_items] == [
+            "reasoning",
+            "message",
+            "function_call",
+        ]
+        assert done_items[0].id.startswith("rs_")
+        assert done_items[1].id.startswith("msg_")
+        assert done_items[2].id.startswith("fc_")
+
+    def test_arguments_done_always_emitted(self):
+        """OpenAI emits function_call_arguments.done even for empty arguments."""
+        processor = SimpleStreamingEventProcessor()
+        events = _run_through_processor(
+            processor, DeltaMessage(tool_calls=[_make_tool_call(0, name="f")])
+        )
+        events.extend(processor.close_current())
+
+        done = [e for e in events if e.type == "response.function_call_arguments.done"]
+        assert len(done) == 1
+        assert done[0].arguments == ""
+        assert done[0].item_id == processor.state.output_items[0].id

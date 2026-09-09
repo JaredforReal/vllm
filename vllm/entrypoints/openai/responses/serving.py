@@ -15,7 +15,6 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseStatus,
-    response_text_delta_event,
 )
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from pydantic import TypeAdapter
@@ -796,14 +795,15 @@ class OpenAIServingResponses(GenerateBaseServing):
             if final_output.finish_reason == "length":
                 status = "incomplete"
 
-            # TODO: Build final response items from the accumulated streaming
-            # parser results instead of reparsing the complete output.
-            output = self._make_response_output_items(
-                request,
-                final_output,
-                tokenizer,
-                parser=context.response_parser,
-            )
+            if context.streamed_output_items is not None:
+                output = context.streamed_output_items
+            else:
+                output = self._make_response_output_items(
+                    request,
+                    final_output,
+                    tokenizer,
+                    parser=context.response_parser,
+                )
 
             if request.enable_response_messages:
                 input_messages = context.input_messages
@@ -940,33 +940,6 @@ class OpenAIServingResponses(GenerateBaseServing):
                 )
             )
         return out
-
-    def _create_stream_response_logprobs(
-        self,
-        token_ids: Sequence[int],
-        logprobs: SampleLogprobs | None,
-        tokenizer: TokenizerLike,
-        top_logprobs: int | None = None,
-    ) -> list[response_text_delta_event.Logprob]:
-        lgs = self._create_response_logprobs(
-            token_ids=token_ids,
-            logprobs=logprobs,
-            tokenizer=tokenizer,
-            top_logprobs=top_logprobs,
-        )
-        return [
-            response_text_delta_event.Logprob(
-                token=lg.token,
-                logprob=lg.logprob,
-                top_logprobs=[
-                    response_text_delta_event.LogprobTopLogprob(
-                        token=tl.token, logprob=tl.logprob
-                    )
-                    for tl in lg.top_logprobs
-                ],
-            )
-            for lg in lgs
-        ]
 
     def _make_response_output_items(
         self,
@@ -1172,18 +1145,17 @@ class OpenAIServingResponses(GenerateBaseServing):
             [StreamingResponsesResponse], StreamingResponsesResponse
         ],
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
+        assert isinstance(context, SimpleContext)
         processor = SimpleStreamingEventProcessor(tools=request.tools)
 
         hide_stream_metadata = not request.include_reasoning and self.parser is not None
 
-        def _get_logprobs(
-            output: CompletionOutput,
-        ) -> list[response_text_delta_event.Logprob]:
-            if not request.is_include_output_logprobs():
+        def _get_logprobs(output: CompletionOutput) -> list[Logprob]:
+            if not request.is_include_output_logprobs() or hide_stream_metadata:
                 return []
-            if hide_stream_metadata:
+            if not output.logprobs:
                 return []
-            return self._create_stream_response_logprobs(
+            return self._create_response_logprobs(
                 token_ids=output.token_ids,
                 logprobs=output.logprobs,
                 tokenizer=tokenizer,
@@ -1215,6 +1187,8 @@ class OpenAIServingResponses(GenerateBaseServing):
                 continue
 
             for dm in split_delta(delta_message):
+                if dm.reasoning is not None and not request.include_reasoning:
+                    continue
                 target_state, tool_call = processor.resolve_target_state(dm)
                 if target_state == _StateType.NONE:
                     continue
@@ -1230,6 +1204,19 @@ class OpenAIServingResponses(GenerateBaseServing):
 
         for event in processor.close_current():
             yield _increment_sequence_number_and_return(event)
+
+        context.streamed_output_items = processor.state.output_items
+        final_res = context.final_output
+        if self.enable_log_outputs and self.request_logger and final_res is not None:
+            final_output = final_res.outputs[0]
+            self.request_logger.log_outputs(
+                request_id=request.request_id,
+                outputs=final_output.text,
+                output_token_ids=final_output.token_ids,
+                finish_reason=final_output.finish_reason,
+                is_streaming=True,
+                delta=False,
+            )
 
     async def _process_harmony_streaming_events(
         self,

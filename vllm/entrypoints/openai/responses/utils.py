@@ -50,6 +50,62 @@ from vllm.utils import random_uuid
 logger = init_logger(__name__)
 
 
+def make_reasoning_item(
+    text: str,
+    *,
+    item_id: str | None = None,
+    status: str | None = None,
+) -> ResponseReasoningItem:
+    return ResponseReasoningItem(
+        id=item_id or f"rs_{random_uuid()}",
+        summary=[],
+        type="reasoning",
+        content=[ResponseReasoningTextContent(text=text, type="reasoning_text")],
+        status=status,  # type: ignore[arg-type]
+    )
+
+
+def make_output_message(
+    text: str,
+    *,
+    item_id: str | None = None,
+    logprobs: list[Logprob] | None = None,
+) -> ResponseOutputMessage:
+    return ResponseOutputMessage(
+        id=item_id or f"msg_{random_uuid()}",
+        content=[
+            ResponseOutputText(
+                text=text,
+                annotations=[],
+                type="output_text",
+                logprobs=logprobs,
+            )
+        ],
+        role="assistant",
+        status="completed",
+        type="message",
+    )
+
+
+def make_function_call_item(
+    name: str,
+    arguments: str,
+    *,
+    call_id: str | None = None,
+    item_id: str | None = None,
+    namespace: str | None = None,
+) -> ResponseFunctionToolCall:
+    return ResponseFunctionToolCall(
+        id=item_id or f"fc_{random_uuid()}",
+        call_id=call_id or make_tool_call_id(),
+        type="function_call",
+        status="completed",
+        name=name,
+        namespace=namespace,
+        arguments=arguments,
+    )
+
+
 def build_response_output_items(
     reasoning: str | None,
     content: str | None,
@@ -61,51 +117,25 @@ def build_response_output_items(
     tool_call_name_map = build_responses_tool_call_name_map(tools)
 
     if reasoning:
-        outputs.append(
-            ResponseReasoningItem(
-                id=f"rs_{random_uuid()}",
-                summary=[],
-                type="reasoning",
-                content=[
-                    ResponseReasoningTextContent(text=reasoning, type="reasoning_text")
-                ],
-                status=None,
-            )
-        )
+        outputs.append(make_reasoning_item(reasoning))
 
     if content:
-        outputs.append(
-            ResponseOutputMessage(
-                id=f"msg_{random_uuid()}",
-                content=[
-                    ResponseOutputText(
-                        text=content,
-                        annotations=[],
-                        type="output_text",
-                        logprobs=logprobs,
-                    )
-                ],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-        )
+        outputs.append(make_output_message(content, logprobs=logprobs))
 
     if tool_calls:
         for idx, tool_call in enumerate(tool_calls):
+            call_id = tool_call.id or make_tool_call_id(
+                func_name=tool_call.name, idx=idx
+            )
             call_name = resolve_responses_tool_call_name(
                 tool_call.name, tool_call_name_map=tool_call_name_map
             )
             outputs.append(
-                ResponseFunctionToolCall(
-                    id=f"fc_{random_uuid()}",
-                    call_id=tool_call.id
-                    or make_tool_call_id(func_name=tool_call.name, idx=idx),
-                    type="function_call",
-                    status="completed",
-                    name=call_name.name,
+                make_function_call_item(
+                    call_name.name,
+                    tool_call.arguments,
+                    call_id=call_id,
                     namespace=call_name.namespace,
-                    arguments=tool_call.arguments,
                 )
             )
 
