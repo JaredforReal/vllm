@@ -199,6 +199,8 @@ you can use the [official OpenAI Python client](https://github.com/openai/openai
 
 Code example: [examples/tool_calling/openai_responses_client_with_tools.py](../../../examples/tool_calling/openai_responses_client_with_tools.py)
 
+Requesting `include: ["reasoning.encrypted_content"]` adds an opaque `encrypted_content` token to each reasoning item so that clients running with `store=false` can replay their reasoning items in later requests; combined with `include_reasoning: false` the item carries only the token. The token is a compressed encoding of the reasoning text, not an encrypted secret.
+
 #### Extra parameters
 
 The following extra parameters in the request object are supported:

@@ -469,6 +469,11 @@ class ResponsesRequest(OpenAIBaseModel):
             and "message.output_text.logprobs" in self.include
         )
 
+    def is_include_encrypted_reasoning(self) -> bool:
+        return (
+            self.include is not None and "reasoning.encrypted_content" in self.include
+        )
+
     @model_validator(mode="before")
     @classmethod
     def check_cache_salt_support(cls, data: Any) -> Any:

@@ -978,7 +978,6 @@ class OpenAIServingResponses(GenerateBaseServing):
                 model_output_token_ids=final_output.token_ids,
             )
             if not request.include_reasoning:
-                reasoning = None
                 logprobs = None
             return build_response_output_items(
                 reasoning=reasoning,
@@ -986,6 +985,8 @@ class OpenAIServingResponses(GenerateBaseServing):
                 tool_calls=tool_calls,
                 logprobs=logprobs,
                 tools=request.tools,
+                encrypt_reasoning=request.is_include_encrypted_reasoning(),
+                include_reasoning_text=request.include_reasoning,
             )
 
         # Fallback when no parser is configured
@@ -1146,7 +1147,13 @@ class OpenAIServingResponses(GenerateBaseServing):
         ],
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
         assert isinstance(context, SimpleContext)
-        processor = SimpleStreamingEventProcessor(tools=request.tools)
+        encrypt_reasoning = request.is_include_encrypted_reasoning()
+        processor = SimpleStreamingEventProcessor(
+            tools=request.tools,
+            encrypt_reasoning=encrypt_reasoning,
+            include_reasoning_text=request.include_reasoning,
+        )
+        skip_reasoning = not request.include_reasoning and not encrypt_reasoning
 
         hide_stream_metadata = not request.include_reasoning and self.parser is not None
 
@@ -1187,7 +1194,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 continue
 
             for dm in split_delta(delta_message):
-                if dm.reasoning is not None and not request.include_reasoning:
+                if dm.reasoning is not None and skip_reasoning:
                     continue
                 target_state, tool_call = processor.resolve_target_state(dm)
                 if target_state == _StateType.NONE:

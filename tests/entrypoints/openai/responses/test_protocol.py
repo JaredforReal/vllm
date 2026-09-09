@@ -60,3 +60,7 @@ def test_custom_tool_call_input_item_is_parsed() -> None:
     )
     assert isinstance(request.input[1], ResponseCustomToolCall)
     assert request.tool_choice.type == "custom"
+    assert request.is_include_encrypted_reasoning() is False
+    assert ResponsesRequest(
+        input="hi", include=["reasoning.encrypted_content"]
+    ).is_include_encrypted_reasoning()

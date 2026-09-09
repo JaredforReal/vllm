@@ -17,6 +17,10 @@ from openai.types.responses.response_reasoning_item import (
 )
 
 from vllm.entrypoints.generate.base.protocol import FunctionCall
+from vllm.entrypoints.openai.responses.encrypted_content import (
+    decode_encrypted_content,
+    encode_encrypted_content,
+)
 from vllm.entrypoints.openai.responses.utils import (
     _construct_message_from_response_item,
     build_response_output_items,
@@ -353,8 +357,8 @@ class TestReasoningItemContentPriority:
         formatted = _single_chat_message(item)
         assert formatted["reasoning"] == ""
 
-    def test_encrypted_content_raises(self):
-        """Encrypted content should raise VLLMValidationError."""
+    def test_invalid_encrypted_content_raises(self):
+        """Foreign or corrupted encrypted content is rejected as input."""
         item = ResponseReasoningItem(
             id="reasoning_6",
             summary=[
@@ -907,6 +911,36 @@ class TestConstructInputMessagesInstructionsLeak:
         assert msgs[1] == {"role": "user", "content": "hello"}
 
 
+class TestEncryptedContentReplay:
+    def test_reasoning_round_trip(self):
+        (item,) = build_response_output_items(
+            reasoning="hidden thoughts",
+            content=None,
+            tool_calls=None,
+            encrypt_reasoning=True,
+        )
+        assert isinstance(item, ResponseReasoningItem)
+        assert item.encrypted_content
+        payload = decode_encrypted_content(
+            item.encrypted_content, expected_type="reasoning"
+        )
+        assert payload == {"type": "reasoning", "text": "hidden thoughts"}
+
+        # Replaying the item without plain content restores the reasoning.
+        replay = make_reasoning_item(encrypted_content=item.encrypted_content)
+        assert _single_chat_message(replay) == {
+            "role": "assistant",
+            "reasoning": "hidden thoughts",
+        }
+
+    def test_wrong_item_type_is_rejected(self):
+        token = encode_encrypted_content({"type": "compaction", "summary": "s"})
+        with pytest.raises(VLLMValidationError):
+            construct_chat_messages_with_tool_call(
+                [make_reasoning_item(encrypted_content=token)]
+            )
+
+
 class TestCustomToolItems:
     def test_custom_tool_call_output_items(self):
         from openai.types.responses import CustomTool
@@ -969,3 +1003,31 @@ class TestCustomToolItems:
             "content": "/workspace",
             "tool_call_id": "call_a",
         }
+
+
+class TestHiddenReasoningItems:
+    def test_encrypted_only_item_when_text_hidden(self):
+        (item,) = build_response_output_items(
+            reasoning="hidden",
+            content=None,
+            tool_calls=None,
+            encrypt_reasoning=True,
+            include_reasoning_text=False,
+        )
+        assert isinstance(item, ResponseReasoningItem)
+        assert item.content is None
+        assert (
+            decode_encrypted_content(item.encrypted_content, expected_type="reasoning")[
+                "text"
+            ]
+            == "hidden"
+        )
+
+    def test_reasoning_dropped_when_hidden_and_not_encrypted(self):
+        items = build_response_output_items(
+            reasoning="hidden",
+            content="shown",
+            tool_calls=None,
+            include_reasoning_text=False,
+        )
+        assert [item.type for item in items] == ["message"]
