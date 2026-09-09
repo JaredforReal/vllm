@@ -170,6 +170,21 @@ class TestProcessorFinalItems:
         assert done[0].arguments == ""
         assert done[0].item_id == processor.state.output_items[0].id
 
+    def test_encrypted_reasoning_round_trips(self):
+        from vllm.entrypoints.openai.responses.encrypted_content import (
+            decode_encrypted_content,
+        )
+
+        processor = SimpleStreamingEventProcessor(encrypt_reasoning=True)
+        _run_through_processor(processor, DeltaMessage(reasoning="secret plan"))
+        processor.close_current()
+
+        (item,) = processor.state.output_items
+        payload = decode_encrypted_content(
+            item.encrypted_content, expected_type="reasoning"
+        )
+        assert payload["text"] == "secret plan"
+
 
 class TestProcessorCustomTools:
     def _custom_tool(self):
@@ -224,3 +239,26 @@ class TestProcessorCustomTools:
         (item,) = _done_items(events)
         assert item.type == "function_call"
         assert item.arguments == '{"input":"x"}'
+
+
+class TestHiddenReasoning:
+    def test_encrypted_only_reasoning_item(self):
+        """include_reasoning=false with reasoning.encrypted_content keeps an
+        opaque reasoning item but streams no reasoning text."""
+        processor = SimpleStreamingEventProcessor(
+            encrypt_reasoning=True, include_reasoning_text=False
+        )
+        events = _run_through_processor(
+            processor, DeltaMessage(reasoning="secret", content="visible")
+        )
+        events.extend(processor.close_current())
+
+        types = [e.type for e in events]
+        assert "response.reasoning_text.delta" not in types
+        assert "response.reasoning_part.added" not in types
+        reasoning, message = processor.state.output_items
+        assert reasoning.type == "reasoning"
+        assert reasoning.content is None
+        assert reasoning.encrypted_content
+        assert message.type == "message"
+        assert _done_items(events) == [reasoning, message]

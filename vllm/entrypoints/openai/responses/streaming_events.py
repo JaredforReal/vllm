@@ -837,6 +837,8 @@ class SimpleStreamingState:
     tool_call_index: int | None = None
     tool_call_is_custom: bool = False
     custom_tool_input: str = ""
+    encrypt_reasoning: bool = False
+    include_reasoning_text: bool = True
     current_state: _StateType = field(default_factory=lambda: _StateType.NONE)
     output_items: list[ResponseOutputItem] = field(default_factory=list)
 
@@ -980,6 +982,8 @@ def emit_simple_reasoning_open(
             status="in_progress",
         ),
     )
+    if not state.include_reasoning_text:
+        return [added]
     return [
         added,
         ResponseReasoningPartAddedEvent(
@@ -1001,6 +1005,8 @@ def emit_simple_reasoning_delta(
     delta: str,
 ) -> list[StreamingResponsesResponse]:
     state.accumulated_text += delta
+    if not state.include_reasoning_text:
+        return []
     return [
         ResponseReasoningTextDeltaEvent(
             type="response.reasoning_text.delta",
@@ -1020,7 +1026,11 @@ def emit_simple_reasoning_done(
         state.accumulated_text,
         item_id=state.current_item_id,
         status="completed",
+        encrypt=state.encrypt_reasoning,
+        include_text=state.include_reasoning_text,
     )
+    if not state.include_reasoning_text:
+        return [state.finish_item(item)]
     assert item.content is not None
     part = item.content[0]
     return [
@@ -1261,8 +1271,13 @@ class SimpleStreamingEventProcessor:
         self,
         state: SimpleStreamingState | None = None,
         tools: list[Tool] | None = None,
+        *,
+        encrypt_reasoning: bool = False,
+        include_reasoning_text: bool = True,
     ) -> None:
         self.state = state or SimpleStreamingState()
+        self.state.encrypt_reasoning = encrypt_reasoning
+        self.state.include_reasoning_text = include_reasoning_text
         self.tool_call_name_map = build_responses_tool_call_name_map(tools)
         self.custom_tool_names = custom_tool_names(tools)
 

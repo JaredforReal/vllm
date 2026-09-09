@@ -41,6 +41,10 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionToolsParam,
 )
+from vllm.entrypoints.openai.responses.encrypted_content import (
+    decode_encrypted_content,
+    encode_encrypted_content,
+)
 from vllm.entrypoints.openai.responses.protocol import ResponseInputOutputItem
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -63,12 +67,30 @@ def make_reasoning_item(
     *,
     item_id: str | None = None,
     status: str | None = None,
+    encrypt: bool = False,
+    include_text: bool = True,
 ) -> ResponseReasoningItem:
+    """Build a reasoning item.
+
+    ``include_text=False`` omits the plain reasoning text (vLLM's
+    ``include_reasoning=false``); with ``encrypt=True`` the item then only
+    carries the opaque ``encrypted_content`` clients replay to keep the
+    reasoning in context.
+    """
+    encrypted_content = None
+    if encrypt:
+        encrypted_content = encode_encrypted_content(
+            {"type": "reasoning", "text": text}
+        )
+    content = None
+    if include_text:
+        content = [ResponseReasoningTextContent(text=text, type="reasoning_text")]
     return ResponseReasoningItem(
         id=item_id or f"rs_{random_uuid()}",
         summary=[],
         type="reasoning",
-        content=[ResponseReasoningTextContent(text=text, type="reasoning_text")],
+        content=content,
+        encrypted_content=encrypted_content,
         status=status,  # type: ignore[arg-type]
     )
 
@@ -138,13 +160,22 @@ def build_response_output_items(
     tool_calls: list[FunctionCall] | None,
     logprobs: list[Logprob] | None = None,
     tools: list[Tool] | None = None,
+    *,
+    encrypt_reasoning: bool = False,
+    include_reasoning_text: bool = True,
 ) -> list[ResponseOutputItem]:
     outputs: list[ResponseOutputItem] = []
     tool_call_name_map = build_responses_tool_call_name_map(tools)
     custom_tools = custom_tool_names(tools)
 
-    if reasoning:
-        outputs.append(make_reasoning_item(reasoning))
+    if reasoning and (include_reasoning_text or encrypt_reasoning):
+        outputs.append(
+            make_reasoning_item(
+                reasoning,
+                encrypt=encrypt_reasoning,
+                include_text=include_reasoning_text,
+            )
+        )
 
     if content:
         outputs.append(make_output_message(content, logprobs=logprobs))
@@ -346,10 +377,10 @@ def _construct_message_from_response_item(
     elif isinstance(item, ResponseReasoningItem):
         reasoning = ""
         if item.encrypted_content:
-            raise VLLMValidationError(
-                "Encrypted content is not supported.",
-                parameter="input",
+            payload = decode_encrypted_content(
+                item.encrypted_content, expected_type="reasoning"
             )
+            reasoning = str(payload.get("text", ""))
         elif item.content and len(item.content) >= 1:
             reasoning = item.content[0].text
         elif len(item.summary) >= 1:
