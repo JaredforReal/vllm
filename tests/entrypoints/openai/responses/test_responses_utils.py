@@ -16,8 +16,10 @@ from openai.types.responses.response_reasoning_item import (
     Summary,
 )
 
+from vllm.entrypoints.generate.base.protocol import FunctionCall
 from vllm.entrypoints.openai.responses.utils import (
     _construct_message_from_response_item,
+    build_response_output_items,
     construct_chat_messages_with_tool_call,
     construct_input_messages,
     should_continue_final_message,
@@ -903,3 +905,67 @@ class TestConstructInputMessagesInstructionsLeak:
         assert len(msgs) == 2
         assert msgs[0] == {"role": "system", "content": "be helpful"}
         assert msgs[1] == {"role": "user", "content": "hello"}
+
+
+class TestCustomToolItems:
+    def test_custom_tool_call_output_items(self):
+        from openai.types.responses import CustomTool
+
+        tools = [
+            CustomTool(type="custom", name="emit_command", format={"type": "text"})
+        ]
+        items = build_response_output_items(
+            reasoning=None,
+            content=None,
+            tool_calls=[
+                FunctionCall(
+                    id="call_a", name="emit_command", arguments='{"input": "pwd"}'
+                ),
+                FunctionCall(id="call_b", name="get_weather", arguments='{"c": 1}'),
+            ],
+            tools=tools,
+        )
+        assert [item.type for item in items] == ["custom_tool_call", "function_call"]
+        assert items[0].input == "pwd"
+        assert items[0].call_id == "call_a"
+        assert items[0].id.startswith("ctc_")
+        assert items[1].arguments == '{"c": 1}'
+
+    def test_custom_tool_call_replay_becomes_tool_call_message(self):
+        messages = construct_chat_messages_with_tool_call(
+            build_response_output_items(
+                reasoning="why",
+                content=None,
+                tool_calls=[
+                    FunctionCall(
+                        id="call_a", name="emit_command", arguments='{"input": "pwd"}'
+                    )
+                ],
+                tools=[
+                    __import__(
+                        "openai.types.responses", fromlist=["CustomTool"]
+                    ).CustomTool(type="custom", name="emit_command")
+                ],
+            )
+            + [
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_a",
+                    "output": [{"type": "input_text", "text": "/workspace"}],
+                }
+            ]
+        )
+        assert len(messages) == 2
+        assistant, tool = messages
+        assert assistant["reasoning"] == "why"
+        (tool_call,) = assistant["tool_calls"]
+        assert tool_call["id"] == "call_a"
+        assert tool_call["function"] == {
+            "name": "emit_command",
+            "arguments": '{"input": "pwd"}',
+        }
+        assert tool == {
+            "role": "tool",
+            "content": "/workspace",
+            "tool_call_id": "call_a",
+        }

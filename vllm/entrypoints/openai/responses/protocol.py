@@ -14,6 +14,9 @@ from openai.types.responses import (
     ResponseCodeInterpreterCallInterpretingEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
+    ResponseCustomToolCall,
+    ResponseCustomToolCallInputDeltaEvent,
+    ResponseCustomToolCallInputDoneEvent,
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseMcpCallArgumentsDeltaEvent,
@@ -507,6 +510,7 @@ class ResponsesRequest(OpenAIBaseModel):
 
         Specifically handles:
         - function_call -> ResponseFunctionToolCall
+        - custom_tool_call -> ResponseCustomToolCall
         - reasoning     -> ResponseReasoningItem (auto-generates id)
         - message(role=assistant) -> ResponseOutputMessage (auto-generates
           id/status and annotations)
@@ -543,6 +547,16 @@ class ResponsesRequest(OpenAIBaseModel):
                 except ValidationError:
                     logger.debug(
                         "Failed to parse function_call to ResponseFunctionToolCall, "
+                        "leaving for Pydantic validation"
+                    )
+                    processed_input.append(item)
+
+            elif item_type == "custom_tool_call":
+                try:
+                    processed_input.append(ResponseCustomToolCall(**item))
+                except ValidationError:
+                    logger.debug(
+                        "Failed to parse custom_tool_call to ResponseCustomToolCall, "
                         "leaving for Pydantic validation"
                     )
                     processed_input.append(item)
@@ -608,9 +622,9 @@ class ResponsesRequest(OpenAIBaseModel):
         tools = data.get("tools")
         tool_choice = data.get("tool_choice", "auto")
         has_tools = tools is not None and len(tools) > 0
-        is_named_tool_choice = (
-            isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
-        )
+        is_named_tool_choice = isinstance(tool_choice, dict) and tool_choice.get(
+            "type"
+        ) in ("function", "custom")
 
         if not has_tools:
             if tool_choice in ("auto", "none"):
@@ -871,6 +885,8 @@ StreamingResponsesResponse: TypeAlias = (
     | ResponseReasoningTextDoneEvent
     | ResponseReasoningPartAddedEvent
     | ResponseReasoningPartDoneEvent
+    | ResponseCustomToolCallInputDeltaEvent
+    | ResponseCustomToolCallInputDoneEvent
     | ResponseCodeInterpreterCallInProgressEvent
     | ResponseCodeInterpreterCallCodeDeltaEvent
     | ResponseWebSearchCallInProgressEvent

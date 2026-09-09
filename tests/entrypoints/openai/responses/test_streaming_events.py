@@ -169,3 +169,58 @@ class TestProcessorFinalItems:
         assert len(done) == 1
         assert done[0].arguments == ""
         assert done[0].item_id == processor.state.output_items[0].id
+
+
+class TestProcessorCustomTools:
+    def _custom_tool(self):
+        from openai.types.responses import CustomTool
+
+        return CustomTool(type="custom", name="emit_command", format={"type": "text"})
+
+    def test_custom_tool_input_streams_decoded_text(self):
+        processor = SimpleStreamingEventProcessor(tools=[self._custom_tool()])
+        events = []
+        for chunk in ['{"inp', 'ut": "pw', "d \\n", 'ls"}']:
+            events.extend(
+                _run_through_processor(
+                    processor,
+                    DeltaMessage(
+                        tool_calls=[
+                            _make_tool_call(0, name="emit_command", arguments=chunk)
+                        ]
+                    ),
+                )
+            )
+        events.extend(processor.close_current())
+
+        types = [e.type for e in events]
+        assert "response.function_call_arguments.delta" not in types
+        deltas = [
+            e.delta for e in events if e.type == "response.custom_tool_call_input.delta"
+        ]
+        assert "".join(deltas) == "pwd \nls"
+        (done,) = [
+            e for e in events if e.type == "response.custom_tool_call_input.done"
+        ]
+        assert done.input == "pwd \nls"
+
+        (item,) = _done_items(events)
+        assert item.type == "custom_tool_call"
+        assert item.id.startswith("ctc_")
+        assert item.name == "emit_command"
+        assert item.input == "pwd \nls"
+        assert item.call_id == done.item_id or item.call_id
+        assert processor.state.output_items == [item]
+
+    def test_function_tool_with_same_shape_is_not_custom(self):
+        processor = SimpleStreamingEventProcessor(tools=[self._custom_tool()])
+        events = _run_through_processor(
+            processor,
+            DeltaMessage(
+                tool_calls=[_make_tool_call(0, name="other", arguments='{"input":"x"}')]
+            ),
+        )
+        events.extend(processor.close_current())
+        (item,) = _done_items(events)
+        assert item.type == "function_call"
+        assert item.arguments == '{"input":"x"}'
