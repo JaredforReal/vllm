@@ -11,6 +11,7 @@ from typing import Any, Final, cast
 
 from fastapi import Request
 from openai.types.responses import (
+    ResponseCompactionItem,
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputText,
@@ -38,8 +39,12 @@ from vllm.entrypoints.openai.responses.context import (
     ParsableContext,
     SimpleContext,
 )
+from vllm.entrypoints.openai.responses.encrypted_content import (
+    encode_encrypted_content,
+)
 from vllm.entrypoints.openai.responses.harmony import harmony_to_response_output
 from vllm.entrypoints.openai.responses.protocol import (
+    CompactedResponse,
     InputTokensDetails,
     OutputTokensDetails,
     ResponseCompletedEvent,
@@ -47,6 +52,7 @@ from vllm.entrypoints.openai.responses.protocol import (
     ResponseInProgressEvent,
     ResponseInputOutputItem,
     ResponseInputOutputMessage,
+    ResponsesCompactRequest,
     ResponsesRequest,
     ResponsesResponse,
     ResponseUsage,
@@ -578,6 +584,83 @@ class OpenAIServingResponses(GenerateBaseServing):
             model_name,
             tokenizer,
             request_metadata,
+        )
+
+    COMPACTION_INSTRUCTION: Final = (
+        "Summarize the conversation so far into a compact, self-contained "
+        "state that lets you continue it without the original messages. "
+        "Preserve every fact, number, identifier, decision, tool result, "
+        "and pending user request exactly. Reply with the summary only."
+    )
+
+    async def create_compaction(
+        self,
+        request: ResponsesCompactRequest,
+        raw_request: Request | None = None,
+    ) -> CompactedResponse | ErrorResponse:
+        """Compact a conversation into an opaque `compaction` item.
+
+        The model writes a summary of ``input`` (plus the stored history of
+        ``previous_response_id``); the summary is returned as an
+        ``encrypted_content`` token that later requests replay as input.
+        """
+        user_items: list[ResponseInputOutputItem]
+        if request.input is None:
+            user_items = []
+        elif isinstance(request.input, str):
+            user_items = [{"role": "user", "content": request.input}]
+        else:
+            user_items = [
+                item
+                for item in request.input
+                if isinstance(item, dict) and item.get("role") == "user"
+            ]
+        conversation: list[ResponseInputOutputItem] = (
+            list(request.input) if isinstance(request.input, list) else user_items
+        )
+        summary_request = ResponsesRequest(
+            model=request.model,
+            input=[
+                *conversation,
+                {"role": "user", "content": self.COMPACTION_INSTRUCTION},
+            ],
+            instructions=request.instructions,
+            previous_response_id=request.previous_response_id,
+            max_output_tokens=request.max_output_tokens,
+            include_reasoning=False,
+            store=False,
+            request_id=f"{request.request_id}_compact",
+        )
+        response = await self.create_responses(summary_request, raw_request)
+        if isinstance(response, ErrorResponse):
+            return response
+        assert isinstance(response, ResponsesResponse)
+
+        summary = "".join(
+            content.text
+            for item in response.output
+            if isinstance(item, ResponseOutputMessage)
+            for content in item.content
+            if isinstance(content, ResponseOutputText)
+        )
+        if response.status != "completed" or not summary.strip():
+            return self.create_error_response(
+                err_type="server_error",
+                message="The model did not produce a compaction summary.",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        compaction_item = ResponseCompactionItem(
+            id=f"cmp_{random_uuid()}",
+            type="compaction",
+            encrypted_content=encode_encrypted_content(
+                {"type": "compaction", "summary": summary}
+            ),
+        )
+        return CompactedResponse(
+            id=request.request_id,
+            created_at=response.created_at,
+            output=[*user_items, compaction_item],
+            usage=response.usage,
         )
 
     async def _render_next_turn(

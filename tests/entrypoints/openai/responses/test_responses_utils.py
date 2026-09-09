@@ -22,6 +22,7 @@ from vllm.entrypoints.openai.responses.encrypted_content import (
     encode_encrypted_content,
 )
 from vllm.entrypoints.openai.responses.utils import (
+    COMPACTION_SUMMARY_PREFIX,
     _construct_message_from_response_item,
     build_response_output_items,
     construct_chat_messages_with_tool_call,
@@ -939,6 +940,22 @@ class TestEncryptedContentReplay:
             construct_chat_messages_with_tool_call(
                 [make_reasoning_item(encrypted_content=token)]
             )
+
+    def test_compaction_item_becomes_system_message(self):
+        token = encode_encrypted_content(
+            {"type": "compaction", "summary": "code is 9137"}
+        )
+        messages = construct_chat_messages_with_tool_call(
+            [
+                {"type": "compaction", "id": "cmp_1", "encrypted_content": token},
+                {"role": "user", "content": "what is the code?"},
+            ]
+        )
+        assert messages[0] == {
+            "role": "system",
+            "content": COMPACTION_SUMMARY_PREFIX + "code is 9137",
+        }
+        assert messages[1]["role"] == "user"
 
 
 class TestCustomToolItems:

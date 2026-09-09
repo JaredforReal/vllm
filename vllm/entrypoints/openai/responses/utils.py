@@ -14,6 +14,7 @@ from openai.types.chat.chat_completion_message_tool_call_param import (
     Function as FunctionCallTool,
 )
 from openai.types.responses import (
+    ResponseCompactionItem,
     ResponseCustomToolCall,
     ResponseFunctionToolCall,
     ResponseOutputItem,
@@ -60,6 +61,11 @@ from vllm.tool_parsers.utils import (
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
+
+COMPACTION_SUMMARY_PREFIX = (
+    "The earlier part of this conversation was compacted. "
+    "Summary of the compacted conversation:\n\n"
+)
 
 
 def make_reasoning_item(
@@ -430,6 +436,21 @@ def _construct_message_from_response_item(
             content=_tool_output_text(item.get("output")),
             tool_call_id=item.get("call_id"),
         )
+    elif isinstance(item, ResponseCompactionItem) or (
+        isinstance(item, dict) and item.get("type") == "compaction"
+    ):
+        encrypted_content = (
+            item.get("encrypted_content")
+            if isinstance(item, dict)
+            else item.encrypted_content
+        )
+        payload = decode_encrypted_content(
+            encrypted_content or "", expected_type="compaction"
+        )
+        return {
+            "role": "system",
+            "content": COMPACTION_SUMMARY_PREFIX + str(payload.get("summary", "")),
+        }
     elif isinstance(item, dict) and item.get("role") == "assistant":
         content = item.get("content")
         text: str | None = None
