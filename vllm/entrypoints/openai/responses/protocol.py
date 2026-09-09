@@ -820,6 +820,36 @@ class ResponsesResponse(OpenAIBaseModel):
         )
 
 
+class ResponsesCompactRequest(OpenAIBaseModel):
+    """Request body of `POST /v1/responses/compact`.
+
+    Compaction asks the model to summarize the conversation so far; the summary
+    is returned as an opaque `compaction` item that can be replayed as input.
+    """
+
+    model: str | None = None
+    input: str | list[ResponseInputOutputItem] | None = None
+    instructions: str | None = None
+    previous_response_id: str | None = None
+    max_output_tokens: int | None = None
+
+    request_id: str = Field(
+        default_factory=lambda: f"resp_{random_uuid()}",
+        description=(
+            "The request_id related to this request. If the caller does "
+            "not set it, a random_uuid will be generated."
+        ),
+    )
+
+
+class CompactedResponse(OpenAIBaseModel):
+    id: str
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    object: Literal["response.compaction"] = "response.compaction"
+    output: list[ResponseInputOutputItem]
+    usage: ResponseUsage | None = None
+
+
 # TODO: this code can be removed once
 # https://github.com/openai/openai-python/issues/2634 has been resolved
 class ResponseReasoningPartDoneEvent(OpenAIBaseModel):

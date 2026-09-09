@@ -25,7 +25,7 @@ We currently support the following OpenAI APIs:
     - *Note: `user` parameter is ignored.*
     - *Note:* Setting the `parallel_tool_calls` parameter to `false` ensures vLLM only returns zero or one tool call per request. Setting it to `true` (the default) allows returning more than one tool call per request. There is no guarantee more than one tool call will be returned if this is set to `true`, as that behavior is model dependent and not all models are designed to support parallel tool calls.
 - [Chat Completions batch API](#chat-api) (`/v1/chat/completions/batch`)
-- [Responses API](#responses-api) (`/v1/responses`, `/v1/responses/{response_id}`, `/v1/responses/{response_id}/cancel`)
+- [Responses API](#responses-api) (`/v1/responses`, `/v1/responses/{response_id}`, `/v1/responses/{response_id}/cancel`, `/v1/responses/compact`)
     - Only applicable to [text generation models](../../models/generative_models.md).
 - [Embeddings API](../../models/pooling_models/embed.md#openai-compatible-embeddings-api) (`/v1/embeddings`)
     - Only applicable to [embedding models](../../models/pooling_models/embed.md).
@@ -200,6 +200,8 @@ you can use the [official OpenAI Python client](https://github.com/openai/openai
 Code example: [examples/tool_calling/openai_responses_client_with_tools.py](../../../examples/tool_calling/openai_responses_client_with_tools.py)
 
 Requesting `include: ["reasoning.encrypted_content"]` adds an opaque `encrypted_content` token to each reasoning item so that clients running with `store=false` can replay their reasoning items in later requests; combined with `include_reasoning: false` the item carries only the token. The token is a compressed encoding of the reasoning text, not an encrypted secret.
+
+`POST /v1/responses/compact` asks the model to summarize the `input` conversation and returns the user messages followed by a single `compaction` item; pass the returned items as `input` of a later request to continue with the compacted context.
 
 #### Extra parameters
 
