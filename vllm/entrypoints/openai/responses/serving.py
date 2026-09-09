@@ -11,11 +11,11 @@ from typing import Any, Final, cast
 
 from fastapi import Request
 from openai.types.responses import (
+    ResponseCompactionItem,
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseStatus,
-    response_text_delta_event,
 )
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from pydantic import TypeAdapter
@@ -39,8 +39,12 @@ from vllm.entrypoints.openai.responses.context import (
     ParsableContext,
     SimpleContext,
 )
+from vllm.entrypoints.openai.responses.encrypted_content import (
+    encode_encrypted_content,
+)
 from vllm.entrypoints.openai.responses.harmony import harmony_to_response_output
 from vllm.entrypoints.openai.responses.protocol import (
+    CompactedResponse,
     InputTokensDetails,
     OutputTokensDetails,
     ResponseCompletedEvent,
@@ -48,6 +52,7 @@ from vllm.entrypoints.openai.responses.protocol import (
     ResponseInProgressEvent,
     ResponseInputOutputItem,
     ResponseInputOutputMessage,
+    ResponsesCompactRequest,
     ResponsesRequest,
     ResponsesResponse,
     ResponseUsage,
@@ -581,6 +586,83 @@ class OpenAIServingResponses(GenerateBaseServing):
             request_metadata,
         )
 
+    COMPACTION_INSTRUCTION: Final = (
+        "Summarize the conversation so far into a compact, self-contained "
+        "state that lets you continue it without the original messages. "
+        "Preserve every fact, number, identifier, decision, tool result, "
+        "and pending user request exactly. Reply with the summary only."
+    )
+
+    async def create_compaction(
+        self,
+        request: ResponsesCompactRequest,
+        raw_request: Request | None = None,
+    ) -> CompactedResponse | ErrorResponse:
+        """Compact a conversation into an opaque `compaction` item.
+
+        The model writes a summary of ``input`` (plus the stored history of
+        ``previous_response_id``); the summary is returned as an
+        ``encrypted_content`` token that later requests replay as input.
+        """
+        user_items: list[ResponseInputOutputItem]
+        if request.input is None:
+            user_items = []
+        elif isinstance(request.input, str):
+            user_items = [{"role": "user", "content": request.input}]
+        else:
+            user_items = [
+                item
+                for item in request.input
+                if isinstance(item, dict) and item.get("role") == "user"
+            ]
+        conversation: list[ResponseInputOutputItem] = (
+            list(request.input) if isinstance(request.input, list) else user_items
+        )
+        summary_request = ResponsesRequest(
+            model=request.model,
+            input=[
+                *conversation,
+                {"role": "user", "content": self.COMPACTION_INSTRUCTION},
+            ],
+            instructions=request.instructions,
+            previous_response_id=request.previous_response_id,
+            max_output_tokens=request.max_output_tokens,
+            include_reasoning=False,
+            store=False,
+            request_id=f"{request.request_id}_compact",
+        )
+        response = await self.create_responses(summary_request, raw_request)
+        if isinstance(response, ErrorResponse):
+            return response
+        assert isinstance(response, ResponsesResponse)
+
+        summary = "".join(
+            content.text
+            for item in response.output
+            if isinstance(item, ResponseOutputMessage)
+            for content in item.content
+            if isinstance(content, ResponseOutputText)
+        )
+        if response.status != "completed" or not summary.strip():
+            return self.create_error_response(
+                err_type="server_error",
+                message="The model did not produce a compaction summary.",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        compaction_item = ResponseCompactionItem(
+            id=f"cmp_{random_uuid()}",
+            type="compaction",
+            encrypted_content=encode_encrypted_content(
+                {"type": "compaction", "summary": summary}
+            ),
+        )
+        return CompactedResponse(
+            id=request.request_id,
+            created_at=response.created_at,
+            output=[*user_items, compaction_item],
+            usage=response.usage,
+        )
+
     async def _render_next_turn(
         self,
         request: ResponsesRequest,
@@ -796,14 +878,15 @@ class OpenAIServingResponses(GenerateBaseServing):
             if final_output.finish_reason == "length":
                 status = "incomplete"
 
-            # TODO: Build final response items from the accumulated streaming
-            # parser results instead of reparsing the complete output.
-            output = self._make_response_output_items(
-                request,
-                final_output,
-                tokenizer,
-                parser=context.response_parser,
-            )
+            if context.streamed_output_items is not None:
+                output = context.streamed_output_items
+            else:
+                output = self._make_response_output_items(
+                    request,
+                    final_output,
+                    tokenizer,
+                    parser=context.response_parser,
+                )
 
             if request.enable_response_messages:
                 input_messages = context.input_messages
@@ -941,33 +1024,6 @@ class OpenAIServingResponses(GenerateBaseServing):
             )
         return out
 
-    def _create_stream_response_logprobs(
-        self,
-        token_ids: Sequence[int],
-        logprobs: SampleLogprobs | None,
-        tokenizer: TokenizerLike,
-        top_logprobs: int | None = None,
-    ) -> list[response_text_delta_event.Logprob]:
-        lgs = self._create_response_logprobs(
-            token_ids=token_ids,
-            logprobs=logprobs,
-            tokenizer=tokenizer,
-            top_logprobs=top_logprobs,
-        )
-        return [
-            response_text_delta_event.Logprob(
-                token=lg.token,
-                logprob=lg.logprob,
-                top_logprobs=[
-                    response_text_delta_event.LogprobTopLogprob(
-                        token=tl.token, logprob=tl.logprob
-                    )
-                    for tl in lg.top_logprobs
-                ],
-            )
-            for lg in lgs
-        ]
-
     def _make_response_output_items(
         self,
         request: ResponsesRequest,
@@ -1005,7 +1061,6 @@ class OpenAIServingResponses(GenerateBaseServing):
                 model_output_token_ids=final_output.token_ids,
             )
             if not request.include_reasoning:
-                reasoning = None
                 logprobs = None
             return build_response_output_items(
                 reasoning=reasoning,
@@ -1013,6 +1068,8 @@ class OpenAIServingResponses(GenerateBaseServing):
                 tool_calls=tool_calls,
                 logprobs=logprobs,
                 tools=request.tools,
+                encrypt_reasoning=request.is_include_encrypted_reasoning(),
+                include_reasoning_text=request.include_reasoning,
             )
 
         # Fallback when no parser is configured
@@ -1172,18 +1229,23 @@ class OpenAIServingResponses(GenerateBaseServing):
             [StreamingResponsesResponse], StreamingResponsesResponse
         ],
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
-        processor = SimpleStreamingEventProcessor(tools=request.tools)
+        assert isinstance(context, SimpleContext)
+        encrypt_reasoning = request.is_include_encrypted_reasoning()
+        processor = SimpleStreamingEventProcessor(
+            tools=request.tools,
+            encrypt_reasoning=encrypt_reasoning,
+            include_reasoning_text=request.include_reasoning,
+        )
+        skip_reasoning = not request.include_reasoning and not encrypt_reasoning
 
         hide_stream_metadata = not request.include_reasoning and self.parser is not None
 
-        def _get_logprobs(
-            output: CompletionOutput,
-        ) -> list[response_text_delta_event.Logprob]:
-            if not request.is_include_output_logprobs():
+        def _get_logprobs(output: CompletionOutput) -> list[Logprob]:
+            if not request.is_include_output_logprobs() or hide_stream_metadata:
                 return []
-            if hide_stream_metadata:
+            if not output.logprobs:
                 return []
-            return self._create_stream_response_logprobs(
+            return self._create_response_logprobs(
                 token_ids=output.token_ids,
                 logprobs=output.logprobs,
                 tokenizer=tokenizer,
@@ -1215,6 +1277,8 @@ class OpenAIServingResponses(GenerateBaseServing):
                 continue
 
             for dm in split_delta(delta_message):
+                if dm.reasoning is not None and skip_reasoning:
+                    continue
                 target_state, tool_call = processor.resolve_target_state(dm)
                 if target_state == _StateType.NONE:
                     continue
@@ -1230,6 +1294,19 @@ class OpenAIServingResponses(GenerateBaseServing):
 
         for event in processor.close_current():
             yield _increment_sequence_number_and_return(event)
+
+        context.streamed_output_items = processor.state.output_items
+        final_res = context.final_output
+        if self.enable_log_outputs and self.request_logger and final_res is not None:
+            final_output = final_res.outputs[0]
+            self.request_logger.log_outputs(
+                request_id=request.request_id,
+                outputs=final_output.text,
+                output_token_ids=final_output.token_ids,
+                finish_reason=final_output.finish_reason,
+                is_streaming=True,
+                delta=False,
+            )
 
     async def _process_harmony_streaming_events(
         self,

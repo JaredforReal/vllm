@@ -14,6 +14,11 @@ from openai.types.responses import (
     ResponseCodeInterpreterCallInterpretingEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
+    ResponseCustomToolCall,
+    ResponseCustomToolCallInputDeltaEvent,
+    ResponseCustomToolCallInputDoneEvent,
+    ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseFunctionCallArgumentsDoneEvent,
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseMcpCallArgumentsDeltaEvent,
@@ -30,6 +35,8 @@ from openai.types.responses import (
     ResponseReasoningTextDoneEvent,
     ResponseStatus,
     ResponseTextConfig,
+    ResponseTextDeltaEvent,
+    ResponseTextDoneEvent,
     ResponseWebSearchCallCompletedEvent,
     ResponseWebSearchCallInProgressEvent,
     ResponseWebSearchCallSearchingEvent,
@@ -466,6 +473,11 @@ class ResponsesRequest(OpenAIBaseModel):
             and "message.output_text.logprobs" in self.include
         )
 
+    def is_include_encrypted_reasoning(self) -> bool:
+        return (
+            self.include is not None and "reasoning.encrypted_content" in self.include
+        )
+
     @model_validator(mode="before")
     @classmethod
     def check_cache_salt_support(cls, data: Any) -> Any:
@@ -507,6 +519,7 @@ class ResponsesRequest(OpenAIBaseModel):
 
         Specifically handles:
         - function_call -> ResponseFunctionToolCall
+        - custom_tool_call -> ResponseCustomToolCall
         - reasoning     -> ResponseReasoningItem (auto-generates id)
         - message(role=assistant) -> ResponseOutputMessage (auto-generates
           id/status and annotations)
@@ -543,6 +556,16 @@ class ResponsesRequest(OpenAIBaseModel):
                 except ValidationError:
                     logger.debug(
                         "Failed to parse function_call to ResponseFunctionToolCall, "
+                        "leaving for Pydantic validation"
+                    )
+                    processed_input.append(item)
+
+            elif item_type == "custom_tool_call":
+                try:
+                    processed_input.append(ResponseCustomToolCall(**item))
+                except ValidationError:
+                    logger.debug(
+                        "Failed to parse custom_tool_call to ResponseCustomToolCall, "
                         "leaving for Pydantic validation"
                     )
                     processed_input.append(item)
@@ -608,9 +631,9 @@ class ResponsesRequest(OpenAIBaseModel):
         tools = data.get("tools")
         tool_choice = data.get("tool_choice", "auto")
         has_tools = tools is not None and len(tools) > 0
-        is_named_tool_choice = (
-            isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
-        )
+        is_named_tool_choice = isinstance(tool_choice, dict) and tool_choice.get(
+            "type"
+        ) in ("function", "custom")
 
         if not has_tools:
             if tool_choice in ("auto", "none"):
@@ -801,6 +824,36 @@ class ResponsesResponse(OpenAIBaseModel):
         )
 
 
+class ResponsesCompactRequest(OpenAIBaseModel):
+    """Request body of `POST /v1/responses/compact`.
+
+    Compaction asks the model to summarize the conversation so far; the summary
+    is returned as an opaque `compaction` item that can be replayed as input.
+    """
+
+    model: str | None = None
+    input: str | list[ResponseInputOutputItem] | None = None
+    instructions: str | None = None
+    previous_response_id: str | None = None
+    max_output_tokens: int | None = None
+
+    request_id: str = Field(
+        default_factory=lambda: f"resp_{random_uuid()}",
+        description=(
+            "The request_id related to this request. If the caller does "
+            "not set it, a random_uuid will be generated."
+        ),
+    )
+
+
+class CompactedResponse(OpenAIBaseModel):
+    id: str
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    object: Literal["response.compaction"] = "response.compaction"
+    output: list[ResponseInputOutputItem]
+    usage: ResponseUsage | None = None
+
+
 # TODO: this code can be removed once
 # https://github.com/openai/openai-python/issues/2634 has been resolved
 class ResponseReasoningPartDoneEvent(OpenAIBaseModel):
@@ -871,6 +924,12 @@ StreamingResponsesResponse: TypeAlias = (
     | ResponseReasoningTextDoneEvent
     | ResponseReasoningPartAddedEvent
     | ResponseReasoningPartDoneEvent
+    | ResponseTextDeltaEvent
+    | ResponseTextDoneEvent
+    | ResponseFunctionCallArgumentsDeltaEvent
+    | ResponseFunctionCallArgumentsDoneEvent
+    | ResponseCustomToolCallInputDeltaEvent
+    | ResponseCustomToolCallInputDoneEvent
     | ResponseCodeInterpreterCallInProgressEvent
     | ResponseCodeInterpreterCallCodeDeltaEvent
     | ResponseWebSearchCallInProgressEvent

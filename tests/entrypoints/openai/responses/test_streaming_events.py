@@ -124,3 +124,141 @@ class TestProcessorCompoundDeltas:
         types = [e.type for e in events]
         assert "response.reasoning_text.delta" in types
         assert "response.output_text.delta" in types
+
+
+def _done_items(events: list) -> list:
+    return [e.item for e in events if e.type == "response.output_item.done"]
+
+
+class TestProcessorFinalItems:
+    """The final response reuses the streamed items, so every
+    `output_item.done` item must be recorded verbatim in `state.output_items`."""
+
+    def test_output_items_match_done_events(self):
+        processor = SimpleStreamingEventProcessor()
+        events = _run_through_processor(
+            processor,
+            DeltaMessage(
+                reasoning="think",
+                content="answer",
+                tool_calls=[_make_tool_call(0, name="f", arguments="{}")],
+            ),
+        )
+        events.extend(processor.close_current())
+
+        done_items = _done_items(events)
+        assert done_items == processor.state.output_items
+        assert [item.type for item in done_items] == [
+            "reasoning",
+            "message",
+            "function_call",
+        ]
+        assert done_items[0].id.startswith("rs_")
+        assert done_items[1].id.startswith("msg_")
+        assert done_items[2].id.startswith("fc_")
+
+    def test_arguments_done_always_emitted(self):
+        """OpenAI emits function_call_arguments.done even for empty arguments."""
+        processor = SimpleStreamingEventProcessor()
+        events = _run_through_processor(
+            processor, DeltaMessage(tool_calls=[_make_tool_call(0, name="f")])
+        )
+        events.extend(processor.close_current())
+
+        done = [e for e in events if e.type == "response.function_call_arguments.done"]
+        assert len(done) == 1
+        assert done[0].arguments == ""
+        assert done[0].item_id == processor.state.output_items[0].id
+
+    def test_encrypted_reasoning_round_trips(self):
+        from vllm.entrypoints.openai.responses.encrypted_content import (
+            decode_encrypted_content,
+        )
+
+        processor = SimpleStreamingEventProcessor(encrypt_reasoning=True)
+        _run_through_processor(processor, DeltaMessage(reasoning="secret plan"))
+        processor.close_current()
+
+        (item,) = processor.state.output_items
+        payload = decode_encrypted_content(
+            item.encrypted_content, expected_type="reasoning"
+        )
+        assert payload["text"] == "secret plan"
+
+
+class TestProcessorCustomTools:
+    def _custom_tool(self):
+        from openai.types.responses import CustomTool
+
+        return CustomTool(type="custom", name="emit_command", format={"type": "text"})
+
+    def test_custom_tool_input_streams_decoded_text(self):
+        processor = SimpleStreamingEventProcessor(tools=[self._custom_tool()])
+        events = []
+        for chunk in ['{"inp', 'ut": "pw', "d \\n", 'ls"}']:
+            events.extend(
+                _run_through_processor(
+                    processor,
+                    DeltaMessage(
+                        tool_calls=[
+                            _make_tool_call(0, name="emit_command", arguments=chunk)
+                        ]
+                    ),
+                )
+            )
+        events.extend(processor.close_current())
+
+        types = [e.type for e in events]
+        assert "response.function_call_arguments.delta" not in types
+        deltas = [
+            e.delta for e in events if e.type == "response.custom_tool_call_input.delta"
+        ]
+        assert "".join(deltas) == "pwd \nls"
+        (done,) = [
+            e for e in events if e.type == "response.custom_tool_call_input.done"
+        ]
+        assert done.input == "pwd \nls"
+
+        (item,) = _done_items(events)
+        assert item.type == "custom_tool_call"
+        assert item.id.startswith("ctc_")
+        assert item.name == "emit_command"
+        assert item.input == "pwd \nls"
+        assert item.call_id == done.item_id or item.call_id
+        assert processor.state.output_items == [item]
+
+    def test_function_tool_with_same_shape_is_not_custom(self):
+        processor = SimpleStreamingEventProcessor(tools=[self._custom_tool()])
+        events = _run_through_processor(
+            processor,
+            DeltaMessage(
+                tool_calls=[_make_tool_call(0, name="other", arguments='{"input":"x"}')]
+            ),
+        )
+        events.extend(processor.close_current())
+        (item,) = _done_items(events)
+        assert item.type == "function_call"
+        assert item.arguments == '{"input":"x"}'
+
+
+class TestHiddenReasoning:
+    def test_encrypted_only_reasoning_item(self):
+        """include_reasoning=false with reasoning.encrypted_content keeps an
+        opaque reasoning item but streams no reasoning text."""
+        processor = SimpleStreamingEventProcessor(
+            encrypt_reasoning=True, include_reasoning_text=False
+        )
+        events = _run_through_processor(
+            processor, DeltaMessage(reasoning="secret", content="visible")
+        )
+        events.extend(processor.close_current())
+
+        types = [e.type for e in events]
+        assert "response.reasoning_text.delta" not in types
+        assert "response.reasoning_part.added" not in types
+        reasoning, message = processor.state.output_items
+        assert reasoning.type == "reasoning"
+        assert reasoning.content is None
+        assert reasoning.encrypted_content
+        assert message.type == "message"
+        assert _done_items(events) == [reasoning, message]

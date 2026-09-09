@@ -25,7 +25,7 @@ We currently support the following OpenAI APIs:
     - *Note: `user` parameter is ignored.*
     - *Note:* Setting the `parallel_tool_calls` parameter to `false` ensures vLLM only returns zero or one tool call per request. Setting it to `true` (the default) allows returning more than one tool call per request. There is no guarantee more than one tool call will be returned if this is set to `true`, as that behavior is model dependent and not all models are designed to support parallel tool calls.
 - [Chat Completions batch API](#chat-api) (`/v1/chat/completions/batch`)
-- [Responses API](#responses-api) (`/v1/responses`, `/v1/responses/{response_id}`, `/v1/responses/{response_id}/cancel`)
+- [Responses API](#responses-api) (`/v1/responses`, `/v1/responses/{response_id}`, `/v1/responses/{response_id}/cancel`, `/v1/responses/compact`)
     - Only applicable to [text generation models](../../models/generative_models.md).
 - [Embeddings API](../../models/pooling_models/embed.md#openai-compatible-embeddings-api) (`/v1/embeddings`)
     - Only applicable to [embedding models](../../models/pooling_models/embed.md).
@@ -198,6 +198,29 @@ Our Responses API is compatible with [OpenAI's Responses API](https://platform.o
 you can use the [official OpenAI Python client](https://github.com/openai/openai-python) to interact with it.
 
 Code example: [examples/tool_calling/openai_responses_client_with_tools.py](../../../examples/tool_calling/openai_responses_client_with_tools.py)
+
+#### Stateless conversations
+
+Agent clients such as Codex run with `store=false` and replay the full item history
+(messages, `reasoning`, `function_call` / `function_call_output`) on every request.
+vLLM supports this without server-side state:
+
+- `include: ["reasoning.encrypted_content"]` adds an opaque `encrypted_content` token to
+  every reasoning item; replaying the item restores the reasoning text in context. Combine it
+  with `include_reasoning: false` to keep the reasoning text out of the response entirely
+  while still being able to replay it. The token is a compressed, versioned encoding rather
+  than an encrypted secret, so it can be replayed against any vLLM replica.
+- `POST /v1/responses/compact` asks the model to summarize `input` and returns the user
+  messages followed by a single `compaction` item. Pass the returned items as `input` of later
+  requests to continue the conversation with the compacted context.
+- Custom tools (`{"type": "custom", ...}`) are presented to chat-template models as a function
+  with a single string `input` parameter and returned as `custom_tool_call` items (streamed as
+  `response.custom_tool_call_input.delta`). A `format` of `{"type": "grammar", "syntax": "lark"}`
+  is enforced through structural tags on models whose tool-call syntax carries raw text
+  (currently the GLM XML format); `regex` grammars are passed as a JSON-schema `pattern`.
+
+Server-side state (`store=true` together with `previous_response_id`) additionally requires
+`VLLM_ENABLE_RESPONSES_API_STORE=1`.
 
 #### Extra parameters
 

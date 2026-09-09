@@ -199,6 +199,10 @@ class SimpleContext(ConversationContext):
         self.input_messages: list[ResponseRawMessageAndToken] = []
         self.kv_transfer_params: dict[str, Any] | None = None
         self.ec_transfer_params: dict[str, Any] | None = None
+        # Output items emitted by the streaming path; the final response
+        # reuses them so `response.output_item.done` and `response.completed`
+        # describe identical items.
+        self.streamed_output_items: list[ResponseOutputItem] | None = None
 
     def append_output(self, output) -> None:
         self.last_output = output
@@ -351,14 +355,14 @@ class ParsableContext(ConversationContext):
                 enable_auto_tools=self.enable_auto_tools,
                 model_output_token_ids=completion.token_ids,
             )
-            if not self.request.include_reasoning:
-                reasoning = None
             self.response_messages.extend(
                 build_response_output_items(
                     reasoning=reasoning,
                     content=content,
                     tool_calls=tool_calls,
                     tools=self.request.tools,
+                    encrypt_reasoning=self.request.is_include_encrypted_reasoning(),
+                    include_reasoning_text=self.request.include_reasoning,
                 )
             )
         elif completion.text:
