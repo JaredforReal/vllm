@@ -4,10 +4,11 @@
 from collections.abc import Callable, Sequence
 from typing import Any, Literal, TypeAlias
 
-from openai.types.responses import FunctionTool
+from openai.types.responses import CustomTool, FunctionTool
 from openai.types.responses.response import ToolChoice as ResponsesToolChoice
 from openai.types.responses.tool import Tool as ResponsesTool
 from openai.types.responses.tool_choice_allowed import ToolChoiceAllowed
+from openai.types.responses.tool_choice_custom import ToolChoiceCustom
 from openai.types.responses.tool_choice_function import ToolChoiceFunction
 from xgrammar import StructuralTag, normalize_tool_choice
 from xgrammar import get_model_structural_tag as get_xgrammar_model_structural_tag
@@ -33,6 +34,10 @@ from xgrammar.structural_tag import (
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionToolsParam,
+)
+from vllm.tool_parsers.utils import (
+    CUSTOM_TOOL_INPUT_PARAM,
+    custom_tool_as_function_dict,
 )
 
 ToolChoice: TypeAlias = (
@@ -143,12 +148,77 @@ def get_model_structural_tag(
             f"tokens and cannot apply token_suffix={token_suffix!r}"
         )
 
-    return get_xgrammar_model_structural_tag(
+    structural_tag = get_xgrammar_model_structural_tag(
         model=model,
         tools=dumped_tools,
         tool_choice=dumped_tool_choice,
         reasoning=reasoning,
     )
+    return _apply_custom_tool_grammars(structural_tag, tools)
+
+
+def _custom_tool_grammar_tag(tag: dict[str, Any], grammar: str) -> dict[str, Any]:
+    """Constrain the single string argument of a custom tool with a grammar.
+
+    Only the GLM XML argument style (``<arg_key>k</arg_key><arg_value>v</arg_value>``)
+    carries the raw text verbatim, so the grammar can replace the JSON-schema
+    string there. Other styles keep the unconstrained string schema.
+    """
+    content = tag["content"]
+    if content.get("style") != "glm_xml":
+        return tag
+    ends = tag["end"] if isinstance(tag["end"], list) else [tag["end"]]
+    return {
+        "type": "tag",
+        "begin": (
+            f"{tag['begin']}<arg_key>{CUSTOM_TOOL_INPUT_PARAM}</arg_key><arg_value>"
+        ),
+        "content": {"type": "grammar", "grammar": grammar},
+        "end": [f"</arg_value>{end}" for end in ends],
+    }
+
+
+def _tag_begins_tool_call(begin: str, name: str) -> bool:
+    """True if ``begin`` (e.g. ``<tool_call>get_weather``) names ``name``."""
+    if not begin.endswith(name):
+        return False
+    prefix = begin[: -len(name)]
+    return not prefix or not (prefix[-1].isalnum() or prefix[-1] in "_-.")
+
+
+def _apply_custom_tool_grammars(
+    structural_tag: StructuralTag,
+    tools: Sequence[ChatCompletionToolsParam | ResponsesTool],
+) -> StructuralTag:
+    grammars: dict[str, str] = {}
+    for tool in tools:
+        if not isinstance(tool, CustomTool) or tool.format is None:
+            continue
+        fmt = tool.format
+        if fmt.type == "grammar" and fmt.syntax == "lark":
+            from vllm.v1.structured_output.utils import convert_lark_to_ebnf
+
+            grammars[tool.name] = convert_lark_to_ebnf(fmt.definition)
+    if not grammars:
+        return structural_tag
+
+    def visit(node: Any) -> Any:
+        if isinstance(node, list):
+            return [visit(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        if (
+            node.get("type") == "tag"
+            and isinstance(node.get("begin"), str)
+            and isinstance(node.get("content"), dict)
+            and node["content"].get("type") == "json_schema"
+        ):
+            for name, grammar in grammars.items():
+                if _tag_begins_tool_call(node["begin"], name):
+                    return _custom_tool_grammar_tag(node, grammar)
+        return {key: visit(value) for key, value in node.items()}
+
+    return StructuralTag.model_validate(visit(structural_tag.model_dump()))
 
 
 def _dump_tool_for_xgrammar(
@@ -164,6 +234,10 @@ def _dump_tool_for_xgrammar(
             function["parameters"] = tool.parameters
         if tool.strict is not None:
             function["strict"] = tool.strict
+        return {"type": "function", "function": function}
+    if isinstance(tool, CustomTool):
+        function = custom_tool_as_function_dict(tool)
+        del function["type"]
         return {"type": "function", "function": function}
     dumped_tool = tool.model_dump(mode="json", exclude_none=True)
     if isinstance(tool, ChatCompletionToolsParam):
@@ -185,7 +259,7 @@ def _dump_tool_choice_for_xgrammar(
     if isinstance(tool_choice, ChatCompletionNamedToolChoiceParam):
         return tool_choice.model_dump(mode="json", exclude_none=True)
 
-    if isinstance(tool_choice, ToolChoiceFunction):
+    if isinstance(tool_choice, (ToolChoiceFunction, ToolChoiceCustom)):
         return {
             "type": "function",
             "function": {"name": tool_choice.name},

@@ -10,6 +10,7 @@ from vllm.tool_parsers.utils import (
     UnexpectedAstError,
     coerce_to_schema_type,
     contains_broken_string_literal,
+    custom_tool_input_from_arguments,
     escape_ctrl_chars_in_strings,
     escape_nested_quotes_in_strings,
     extract_types_from_schema,
@@ -764,3 +765,33 @@ class TestRenameReservedKwargs:
             "path": "x",
             "from": 1,
         }
+
+
+class TestCustomToolInputFromArguments:
+    @staticmethod
+    def _extract(arguments: str, *, partial: bool = False) -> str | None:
+        return custom_tool_input_from_arguments(arguments, partial=partial)
+
+    @pytest.mark.parametrize(
+        ("arguments", "expected"),
+        [
+            ('{"input": "pw', "pw"),
+            ('{"input": "pwd"}', "pwd"),
+            ('{"input": "a\\', "a"),
+            ('{"input": "a\\n', "a\n"),
+            ('{"input": "a\\u00', "a"),
+            ('{"input": "a\\u00e9b', "aéb"),
+            ('{"input": "\\ud83d', ""),
+            ('{"input": "\\ud83d\\ude00x', "\U0001f600x"),
+            ('{"in', None),
+            ("", None),
+        ],
+    )
+    def test_partial_prefix_decoding(self, arguments, expected):
+        assert self._extract(arguments, partial=True) == expected
+
+    def test_complete_arguments(self):
+        assert self._extract('{"input": "line1\\nline2"}') == "line1\nline2"
+        # Unexpected shapes fall back to the raw arguments.
+        assert self._extract('{"cmd": "pwd"}') == '{"cmd": "pwd"}'
+        assert self._extract("not json") == "not json"
