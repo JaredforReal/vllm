@@ -199,6 +199,10 @@ class SimpleContext(ConversationContext):
         self.input_messages: list[ResponseRawMessageAndToken] = []
         self.kv_transfer_params: dict[str, Any] | None = None
         self.ec_transfer_params: dict[str, Any] | None = None
+        # Output items emitted by the streaming path; the final response
+        # reuses them so `response.output_item.done` and `response.completed`
+        # describe identical items.
+        self.streamed_output_items: list[ResponseOutputItem] | None = None
 
     def append_output(self, output) -> None:
         self.last_output = output
