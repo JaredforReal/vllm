@@ -21,6 +21,10 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import (
+    NULL_BLOCK_ID,
+    mamba_get_block_table_tensor,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -221,3 +225,61 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
+def test_full_cudagraph_pure_spec_staging_contents(num_speculative_tokens: int):
+    """A pure spec-decode batch (real requests first, cudagraph padding last)
+    is staged into the persistent buffers by one kernel; the staged contents
+    must equal the reference per-tensor slice/pad construction."""
+    device = torch.device("cuda")
+    builder = _create_gdn_builder(num_speculative_tokens, full_cuda_graph=True)
+    builder = GDNAttentionMetadataBuilder(
+        builder.kv_cache_spec, builder.layer_names, builder.vllm_config, device
+    )
+    k1 = num_speculative_tokens + 1
+    # 3 real spec-decode requests (the last one with a shorter query) plus one
+    # zero-length padding request.
+    query_lens = [k1, k1, k1 - 1, 0]
+    seq_lens = [80, 96, 40, 1]
+    num_spec_decodes = 3
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=seq_lens, query_lens=query_lens), BLOCK_SIZE, device
+    )
+    num_accepted = torch.tensor([1, k1, 2, 1], dtype=torch.int32, device=device)
+    drafts = torch.tensor([num_speculative_tokens] * 3 + [-1], dtype=torch.int32)
+    meta = builder.build(
+        0, common, num_accepted_tokens=num_accepted, num_decode_draft_tokens_cpu=drafts
+    )
+    torch.cuda.synchronize()
+    batch_size = common.num_reqs
+    num_tokens = sum(query_lens)
+
+    assert meta.num_spec_decodes == num_spec_decodes
+    assert meta.num_prefills == 0 and meta.num_decodes == 0
+    assert meta.spec_sequence_masks is not None
+    assert meta.spec_sequence_masks.tolist() == [True] * 3 + [False]
+    assert meta.spec_token_indx is not None
+    assert meta.spec_token_indx.tolist() == list(range(num_tokens))
+    assert meta.non_spec_token_indx is not None
+    assert meta.non_spec_token_indx.numel() == 0
+    assert meta.spec_query_start_loc is not None
+    qsl = common.query_start_loc.tolist()
+    assert meta.spec_query_start_loc.tolist() == qsl[: num_spec_decodes + 1] + [
+        qsl[num_spec_decodes]
+    ] * (batch_size - num_spec_decodes)
+    assert meta.num_accepted_tokens is not None
+    assert meta.num_accepted_tokens.tolist() == [1, k1, 2] + [1]
+    assert meta.spec_state_indices_tensor is not None
+    assert meta.spec_state_indices_tensor.shape == (batch_size, k1)
+    expected_states = mamba_get_block_table_tensor(
+        common.block_table_tensor,
+        common.seq_lens,
+        builder.kv_cache_spec,
+        builder.vllm_config.cache_config.mamba_cache_mode,
+    )[:num_spec_decodes, :k1].expand(num_spec_decodes, k1)
+    assert torch.equal(
+        meta.spec_state_indices_tensor[:num_spec_decodes], expected_states
+    )
+    assert (meta.spec_state_indices_tensor[num_spec_decodes:] == NULL_BLOCK_ID).all()
