@@ -101,8 +101,12 @@ def run_kernel(inputs: dict, state: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# 4096 x 16 heads = 65536 flattened programs: exceeds the CUDA grid.z limit
+# (65535) and exercises the split (NK, NV * HV, N) launch.
 @pytest.mark.parametrize(
-    ("num_seqs", "query_len"), [(1, 1), (7, 1), (3, 3)], ids=["1x1", "7x1", "3x3"]
+    ("num_seqs", "query_len"),
+    [(1, 1), (7, 1), (3, 3), (4096, 1)],
+    ids=["1x1", "7x1", "3x3", "4096x1"],
 )
 @torch.inference_mode()
 def test_fused_recurrent_kda_matches_reference(num_seqs: int, query_len: int):
