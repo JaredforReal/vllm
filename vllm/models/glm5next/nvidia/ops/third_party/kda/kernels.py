@@ -26,6 +26,7 @@ from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 
 from .fused_recurrent import (
     fused_recurrent_gated_delta_rule_fwd_kernel,
+    fwd_kernel_grid,
     token_stride,
 )
 
@@ -95,7 +96,7 @@ def fused_recurrent_kda_fwd(
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
-    grid = (NK, NV, N * HV)
+    grid, split_batch_head_grid = fwd_kernel_grid(NK, NV, HV, N)
     fused_recurrent_gated_delta_rule_fwd_kernel[grid](
         q=q,
         k=k,
@@ -137,6 +138,7 @@ def fused_recurrent_kda_fwd(
         SAFE_GATE=True,
         LOWER_BOUND=lower_bound if lower_bound is not None else -5.0,
         num_warps=num_warps,
+        SPLIT_BATCH_HEAD_GRID=split_batch_head_grid,
         num_stages=num_stages,
     )
 

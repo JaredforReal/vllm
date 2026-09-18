@@ -32,6 +32,23 @@ def token_stride(x: torch.Tensor) -> int:
     return st[1]
 
 
+# CUDA limits grid.y / grid.z to 65535; the flattened (sequence, head) index
+# overflows z for large decode batches (e.g. 1024 seqs x 64 KDA heads at TP1).
+MAX_GRID_YZ = 65535
+
+
+def fwd_kernel_grid(NK: int, NV: int, HV: int, N: int) -> tuple[tuple[int, ...], bool]:
+    """Grid for ``fused_recurrent_gated_delta_rule_fwd_kernel``.
+
+    Returns ``((NK, NV, N * HV), False)`` when the flattened batch*head index
+    fits grid.z, else ``((NK, NV * HV, N), True)`` so the kernel splits the
+    y index back into (v-block, head).
+    """
+    if N * HV > MAX_GRID_YZ:
+        return (NK, NV * HV, N), True
+    return (NK, NV, N * HV), False
+
+
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
@@ -86,9 +103,17 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     COMPUTE_GATE: tl.constexpr,  # g holds raw logits; KDA gate computed in-kernel
     SAFE_GATE: tl.constexpr,  # bounded gate variant (only branch implemented)
     LOWER_BOUND: tl.constexpr,
+    # grid = (NK, NV * HV, N) instead of (NK, NV, N * HV) when N * HV would
+    # exceed the CUDA grid.z limit (65535).
+    SPLIT_BATCH_HEAD_GRID: tl.constexpr,
 ):
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hv = i_nh // HV, i_nh % HV
+    if SPLIT_BATCH_HEAD_GRID:
+        i_k, i_vh, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        NV: tl.constexpr = tl.cdiv(V, BV)
+        i_v, i_hv = i_vh % NV, i_vh // NV
+    else:
+        i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
         bos, eos = (
@@ -260,7 +285,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
-    grid = (NK, NV, N * HV)
+    grid, split_batch_head_grid = fwd_kernel_grid(NK, NV, HV, N)
     fused_recurrent_gated_delta_rule_fwd_kernel[grid](
         q=q,
         k=k,
@@ -302,6 +327,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         SAFE_GATE=True,
         LOWER_BOUND=-5.0,
         num_warps=num_warps,
+        SPLIT_BATCH_HEAD_GRID=split_batch_head_grid,
         num_stages=num_stages,
     )
     o = o.squeeze(0)
