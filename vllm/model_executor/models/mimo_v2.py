@@ -6,6 +6,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -19,6 +20,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -166,6 +168,21 @@ class MiMoV2MoE(nn.Module):
             torch.empty(config.n_routed_experts, dtype=self.gate_dtype)
         )
 
+        # Experimental: fused decode-path router (Triton GEMM + sigmoid + bias
+        # + topk). Active only for bf16 gates and modular MoE backends.
+        self.fused_router = None
+        if envs.VLLM_MIMO_V2_FUSED_ROUTER and not self.enable_eplb:
+            from vllm.model_executor.models.mimo_v2_fused.router import (
+                MimoFusedRouter,
+            )
+
+            self.fused_router = MimoFusedRouter(
+                top_k=config.num_experts_per_tok,
+                global_num_experts=config.n_routed_experts,
+                gate=self.gate,
+                renormalize=config.norm_topk_prob,
+            )
+
         self.experts = FusedMoEFactory(
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -183,6 +200,15 @@ class MiMoV2MoE(nn.Module):
             topk_group=config.topk_group,
             scoring_func="sigmoid",
             router_logits_dtype=self.gate_dtype,
+            router=self.fused_router,
+        )
+
+        # Whether the experts consume precomputed topk (modular) or compute
+        # routing internally from logits (monolithic) — gate skip is only
+        # valid for modular backends.
+        self._moe_is_modular = (
+            self.fused_router is not None
+            and not self.experts.routed_experts.quant_method.is_monolithic
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -194,11 +220,16 @@ class MiMoV2MoE(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        if self.gate_dtype is not None:
+        # Fused router path: the router recomputes logits from hidden_states
+        # internally, so the standalone gate GEMM is dead work. Only skip it
+        # when the MoE backend is modular (consumes precomputed topk).
+        if self.fused_router is not None and self._moe_is_modular:
+            router_logits = hidden_states
+        elif self.gate_dtype is not None:
             gate_input = hidden_states.to(self.gate_dtype)
+            router_logits = self.gate(gate_input)
         else:
-            gate_input = hidden_states
-        router_logits = self.gate(gate_input)
+            router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -286,6 +317,27 @@ class MiMoV2Attention(nn.Module):
             },
         )
 
+        # Experimental fused partial-RoPE + v-scale kernel (decode path).
+        rot_dim = getattr(self.rotary_emb, "rotary_dim", self.head_dim)
+        self._fused_rope_ok = (
+            envs.VLLM_MIMO_V2_FUSED_ROPE
+            and hasattr(self.rotary_emb, "cos_sin_cache")
+            and self.rotary_emb.cos_sin_cache.dtype == torch.bfloat16
+            and rot_dim % 2 == 0
+            and rot_dim & (rot_dim - 1) == 0  # pow2 for tl.arange
+            and (self.head_dim - rot_dim) & (self.head_dim - rot_dim - 1) == 0
+            and self.v_head_dim & (self.v_head_dim - 1) == 0
+        )
+        # Experimental skinny GEMM for o_proj at decode batch sizes (M<=16).
+        o_w = self.o_proj.weight
+        self._skinny_gemm_ok = (
+            envs.VLLM_MIMO_V2_SKINNY_GEMM
+            and not self.o_proj.bias
+            and o_w.dtype == torch.bfloat16
+            and o_w.shape[0] % 128 == 0
+            and o_w.shape[1] % 64 == 0
+        )
+
         self.attention_sink_bias = (
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
             if add_swa_attention_sink_bias
@@ -341,14 +393,40 @@ class MiMoV2Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        if self._fused_rope_ok:
+            from vllm.model_executor.models.mimo_v2_fused import (
+                fused_rope_scale,
+            )
 
-        # Apply v_scale before attention
-        if self.v_scale is not None:
-            v = v * self.v_scale
+            q, k, v = fused_rope_scale(
+                qkv,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                float(self.v_scale) if self.v_scale is not None else 1.0,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.v_head_dim,
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+            q, k = self.rotary_emb(positions, q, k)
+
+            # Apply v_scale before attention
+            if self.v_scale is not None:
+                v = v * self.v_scale
 
         attn_output = self.attn(q, k, v)
+
+        if self._skinny_gemm_ok and attn_output.shape[0] <= 16:
+            from vllm.model_executor.models.mimo_v2_fused import (
+                skinny_gemm_bf16,
+            )
+
+            out = skinny_gemm_bf16(attn_output, self.o_proj.weight)
+            if self.o_proj.reduce_results:
+                out = tensor_model_parallel_all_reduce(out)
+            return out
 
         output, _ = self.o_proj(attn_output)
         return output
