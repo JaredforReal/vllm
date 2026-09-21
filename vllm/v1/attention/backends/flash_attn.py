@@ -85,6 +85,35 @@ from vllm.v1.worker.cp_utils import (
 
 logger = init_logger(__name__)
 
+# Narrowest KV tile the FA3/FA4 forward kernels use. A sliding window no wider
+# than this spans a single tile, so split-KV cannot help it.
+_FA_KV_TILE = 128
+
+
+def small_window_num_splits(kv_cache_spec: "AttentionSpec") -> int | None:
+    """Pin the KV split count for windows that fit in one KV tile.
+
+    The FA4 (cute-DSL) split-KV heuristic sizes the KV range it will load from
+    ``max_seqlen_k`` whenever a window bound is zero, because its clamp tests
+    truthiness (``window_size_right or max_seqlen_k``) and the right bound of a
+    *causal* sliding window is legitimately 0. A 128-token window is then
+    scheduled as though it spanned the whole sequence: on a 176K context that is
+    ~128 splits per layer, nearly all of them empty, plus a combine pass over
+    128 fp32 partials and a prepare-scheduler launch.
+
+    A window that fits in one KV tile has nothing to split, so ask for a single
+    split and skip both extra kernels. Larger windows keep the heuristic, which
+    sizes them correctly once a bound is non-zero.
+
+    Returns the split count to force, or None to leave the heuristic alone.
+    NOTE: the sizing bug itself belongs upstream in
+    vllm-project/flash-attention; this only stops vLLM from paying for it.
+    """
+    window = getattr(kv_cache_spec, "sliding_window", None)
+    if window is not None and window <= _FA_KV_TILE:
+        return 1
+    return None
+
 FA4_DENSE_FLOAT_DTYPES = (torch.bfloat16, torch.float16)
 FA4_DENSE_Q_TILE = 128
 FA4_DENSE_NUM_BLOCKS = 256
@@ -648,6 +677,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.block_size = kv_cache_spec.block_size
 
         self.max_num_splits = 0  # No upper bound on the number of splits.
+
+        # See small_window_num_splits(): a window narrower than one KV tile is
+        # otherwise scheduled as if it spanned the whole sequence.
+        self.small_window_num_splits = small_window_num_splits(kv_cache_spec)
+
         self.aot_schedule = get_flash_attn_version() == 3
         head_size_v = getattr(kv_cache_spec, "head_size_v", None)
         fa_version = get_flash_attn_version(
@@ -815,6 +849,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         if envs.VLLM_BATCH_INVARIANT:
             max_num_splits = 1
+
+        if self.small_window_num_splits is not None:
+            # Independent of CUDA graphs: the window spans at most one KV tile
+            # at any batch size, so splitting it is always wasted work.
+            max_num_splits = self.small_window_num_splits
 
         use_cascade = common_prefix_len > 0
         max_dcp_context_kv_len = 0
