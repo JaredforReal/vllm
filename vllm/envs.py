@@ -213,6 +213,7 @@ if TYPE_CHECKING:
     VLLM_MIMO_V2_FUSED_ROPE: bool = False
     VLLM_MIMO_V2_SKINNY_GEMM: bool = False
     VLLM_MIMO_V2_FUSED_SPEC_PREP: bool = False
+    VLLM_MIMO_V2_FUSED_MOE_TAIL: bool = False
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
@@ -1612,6 +1613,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MIMO_V2_FUSED_SPEC_PREP": lambda: bool(
         int(os.getenv("VLLM_MIMO_V2_FUSED_SPEC_PREP", "0"))
+    ),
+    "VLLM_MIMO_V2_FUSED_MOE_TAIL": lambda: bool(
+        int(os.getenv("VLLM_MIMO_V2_FUSED_MOE_TAIL", "0"))
     ),
     # Skip cudagraph/DP padding tokens in the MoE path by forcing their expert
     # ids to -1 so the dispatch and experts drop them. Requires a MoE kernel that

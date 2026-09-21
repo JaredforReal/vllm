@@ -107,7 +107,15 @@ class MiMoV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        norm_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # residual/norm_weight are accepted for signature compatibility with
+        # MiMoV2MoE (MoE-tail fusion); the dense MLP never fuses.
+        del residual, norm_weight
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -158,6 +166,7 @@ class MiMoV2MoE(nn.Module):
 
         dtype = getattr(config, "moe_router_dtype", "float32")
         self.gate_dtype = str_dtype_to_torch_dtype(dtype)
+        self.rms_eps = config.layernorm_epsilon
         self.gate = nn.Linear(
             config.hidden_size,
             config.n_routed_experts,
@@ -183,6 +192,16 @@ class MiMoV2MoE(nn.Module):
                 renormalize=config.norm_topk_prob,
             )
 
+        # Experimental: flashinfer MoE tail fusion (finalize + all-reduce +
+        # residual + RMSNorm in one PDL-chained launch).
+        runner_cls = None
+        if envs.VLLM_MIMO_V2_FUSED_MOE_TAIL:
+            from vllm.model_executor.models.mimo_v2_fused.moe_tail import (
+                MiMoTailRunner,
+            )
+
+            runner_cls = MiMoTailRunner
+
         self.experts = FusedMoEFactory(
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -201,7 +220,11 @@ class MiMoV2MoE(nn.Module):
             scoring_func="sigmoid",
             router_logits_dtype=self.gate_dtype,
             router=self.fused_router,
+            runner_cls=runner_cls,
         )
+
+        # Whether this MoE's runner can hand the decode tail to the fused op.
+        self._tail_fused = getattr(self.experts, "tail_fusion_enabled", False)
 
         # Whether the experts consume precomputed topk (modular) or compute
         # routing internally from logits (monolithic) — gate skip is only
@@ -211,7 +234,12 @@ class MiMoV2MoE(nn.Module):
             and not self.experts.routed_experts.quant_method.is_monolithic
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        norm_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert hidden_states.dim() <= 2, "MiMoV2MoE only supports 1D or 2D inputs"
         is_input_1d = hidden_states.dim() == 1
         num_tokens, hidden_dim = hidden_states.shape
@@ -219,6 +247,18 @@ class MiMoV2MoE(nn.Module):
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
+
+        # Fused MoE tail: one opaque custom op does MoE + finalize +
+        # all-reduce + residual + RMSNorm with the *next* layer's norm weight.
+        if self._tail_fused:
+            assert residual is not None and norm_weight is not None
+            return self.experts.forward_fused_tail(
+                hidden_states,
+                self._router_logits(hidden_states),
+                residual,
+                norm_weight,
+                self.rms_eps,
+            )
 
         # Fused router path: the router recomputes logits from hidden_states
         # internally, so the standalone gate GEMM is dead work. Only skip it
@@ -241,6 +281,13 @@ class MiMoV2MoE(nn.Module):
             final_hidden_states = final_hidden_states[:num_tokens]
 
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
+
+    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.gate_dtype is not None:
+            gate_input = hidden_states.to(self.gate_dtype)
+        else:
+            gate_input = hidden_states
+        return self.gate(gate_input)
 
 
 class MiMoV2Attention(nn.Module):
@@ -511,12 +558,16 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        next_norm_weight: torch.Tensor | None = None,
+        input_prenormed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        else:
+        elif not input_prenormed:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # else: the previous layer's fused MoE tail already produced the
+        # normed input (and the updated residual stream).
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -524,7 +575,14 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        mlp_out = self.mlp(
+            hidden_states, residual=residual, norm_weight=next_norm_weight
+        )
+        if isinstance(mlp_out, tuple):
+            # Fused MoE tail already did finalize + all-reduce + residual add
+            # + next-layer RMSNorm: (norm_out, residual_out).
+            return mlp_out
+        hidden_states = mlp_out
         return hidden_states, residual
 
     def is_moe_layer(self, layer_idx: int) -> bool:
@@ -744,6 +802,38 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
         else:
             self.norm = PPMissingLayer()
 
+        # Wire the fused MoE tail: each MoE layer's tail applies the *next*
+        # layer's input norm (or the final norm for the last layer), so the
+        # next layer's input arrives already normed.  The contract is static
+        # (independent of batch size): the runner produces (normed, residual)
+        # at every M.
+        self._tail_fusion = envs.VLLM_MIMO_V2_FUSED_MOE_TAIL
+        layer_list = list(self.layers)
+        self._moe_tail_ok = [
+            bool(getattr(getattr(l, "mlp", None), "_tail_fused", False))
+            for l in layer_list
+        ]
+        # The fusion needs every MoE layer on board (they share the
+        # prenormed-input contract); last layer's tail uses the final norm.
+        last_moe_idx = max((i for i, ok in enumerate(self._moe_tail_ok) if ok),
+                           default=-1)
+        self._last_layer_tail_fused = (
+            last_moe_idx == len(layer_list) - 1
+        )
+        if not (self._tail_fusion and all(
+                ok for i, ok in enumerate(self._moe_tail_ok) if i >= 1)):
+            self._tail_fusion = False
+        logger.info(
+            "MiMoV2 MoE tail fusion: _tail_fusion=%s, tail-ok layers=%d/%d",
+            self._tail_fusion,
+            sum(self._moe_tail_ok),
+            len(self._moe_tail_ok),
+        )
+        for i, layer in enumerate(layer_list):
+            layer._input_prenormed = bool(
+                self._tail_fusion and i > 0 and self._moe_tail_ok[i - 1]
+            )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -768,20 +858,48 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
         aux_hidden_states = self._maybe_add_hidden_state(
             [], self.start_layer, hidden_states, residual
         )
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
-        ):
-            hidden_states, residual = layer(positions, hidden_states, residual)
-            self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
+
+        # Tail fusion is a *static* structural property of the model (the
+        # runner picks the fused FI kernel vs plain torch per batch size).
+        layer_list = list(islice(self.layers, self.start_layer, self.end_layer))
+        for idx, layer in enumerate(layer_list):
+            tail_ok_this = (
+                self._tail_fusion
+                and idx < len(self._moe_tail_ok)
+                and self._moe_tail_ok[idx]
             )
+            if tail_ok_this:
+                abs_idx = self.start_layer + idx
+                if abs_idx + 1 < self.end_layer:
+                    next_norm_w = layer_list[idx + 1].input_layernorm.weight
+                else:
+                    next_norm_w = self.norm.weight
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual,
+                    next_norm_weight=next_norm_w,
+                    input_prenormed=idx > 0 and self._moe_tail_ok[idx - 1],
+                )
+            else:
+                hidden_states, residual = layer(positions, hidden_states,
+                                                residual)
+            # After a fused MoE tail, `residual` alone is the post-layer
+            # residual stream (hidden_states is the *normed* next input).
+            if (idx + 1) in self.aux_hidden_state_layers:
+                tap = (
+                    residual
+                    if tail_ok_this
+                    else (hidden_states + residual if residual is not None
+                          else hidden_states)
+                )
+                aux_hidden_states.append(tap)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not (self._tail_fusion and self._last_layer_tail_fused):
+            hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states

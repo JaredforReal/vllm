@@ -234,9 +234,9 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
                     value_cache,
                     output[:num_actual_tokens],
                     attn_metadata,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
+                    q_descale=self._descale_for(layer._q_scale, descale_shape),
+                    k_descale=self._descale_for(layer._k_scale, descale_shape),
+                    v_descale=self._descale_for(layer._v_scale, descale_shape),
                 )
                 return output
             else:
@@ -262,9 +262,9 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
                     softcap=self.logits_soft_cap,
                     scheduler_metadata=scheduler_metadata,
                     fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
+                    q_descale=self._descale_for(layer._q_scale, descale_shape),
+                    k_descale=self._descale_for(layer._k_scale, descale_shape),
+                    v_descale=self._descale_for(layer._v_scale, descale_shape),
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
                 )
