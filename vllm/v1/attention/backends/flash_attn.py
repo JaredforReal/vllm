@@ -1051,6 +1051,27 @@ class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
 
+    def _descale_for(
+        self, scale: torch.Tensor, shape: tuple[int, ...]
+    ) -> torch.Tensor:
+        """Materialize expanded descale tensors with stride-1 last dim.
+
+        The cute-DSL FA interface requires strides[leading_dim] == 1, but
+        ``scale.expand(shape)`` yields stride-0 and ``.contiguous()`` still
+        normalizes size-1 dims to stride 0 (e.g. (1,1) -> (0,0)). A fresh
+        ``torch.empty`` always has dense strides, so fill it once per
+        (scale, shape) and cache — the layer scales are constant.
+        """
+        if not hasattr(self, "_descale_cache"):
+            self._descale_cache = {}
+        key = (scale.data_ptr(), tuple(shape))
+        t = self._descale_cache.get(key)
+        if t is None:
+            t = torch.empty(shape, dtype=scale.dtype, device=scale.device)
+            t.copy_(scale)
+            self._descale_cache[key] = t
+        return t
+
     def __init__(
         self,
         num_heads: int,
@@ -1272,12 +1293,12 @@ class FlashAttentionImpl(AttentionImpl):
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
             q_descale = (
-                layer._q_scale.expand(descale_shape)
+                self._descale_for(layer._q_scale, descale_shape)
                 if self.supports_quant_query_input
                 else None
             )
-            k_descale = layer._k_scale.expand(descale_shape)
-            v_descale = layer._v_scale.expand(descale_shape)
+            k_descale = self._descale_for(layer._k_scale, descale_shape)
+            v_descale = self._descale_for(layer._v_scale, descale_shape)
 
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
