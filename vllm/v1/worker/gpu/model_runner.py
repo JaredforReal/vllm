@@ -1355,9 +1355,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
         if num_draft_tokens_per_req is not None:
-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
-                idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
-            )
+            if envs.VLLM_MIMO_V2_FUSED_SPEC_PREP:
+                # Defer: fused with combine_sampled_and_draft_tokens below.
+                expanded_idx_mapping = None
+                expanded_local_pos = None
+            else:
+                expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+                    idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
+                )
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = query_start_loc[: num_reqs_padded + 1]
 
@@ -1385,18 +1390,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-        )
+        # Mirror the deferral condition above exactly: expanded_idx_mapping is
+        # None iff we skipped expand_idx_mapping there, and anything else would
+        # leak that None downstream (draft_tokens can be empty while
+        # num_draft_tokens_per_req is set, when more than one token is sampled
+        # per step).
+        if num_draft_tokens_per_req is not None and envs.VLLM_MIMO_V2_FUSED_SPEC_PREP:
+            # Fused expand_idx_mapping + combine_sampled_and_draft_tokens.
+            from vllm.model_executor.models.mimo_v2_fused.spec_prep import (
+                expand_idx_mapping_and_combine_tokens,
+            )
+
+            expanded_idx_mapping, expanded_local_pos, logits_indices = (
+                expand_idx_mapping_and_combine_tokens(
+                    idx_mapping,
+                    total_num_logits,
+                    cu_num_logits,
+                    self.decode_query_len,
+                    self.input_buffers.input_ids,
+                    self.req_states.last_sampled_tokens,
+                    query_start_loc,
+                    seq_lens,
+                    self.req_states.prefill_len.gpu,
+                    self.req_states.draft_tokens,
+                    self.model_state.num_new_sampled_tokens_per_step,
+                )
+            )
+        else:
+            logits_indices = combine_sampled_and_draft_tokens(
+                self.input_buffers.input_ids,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
 
         fast_prefill = None
         if self.fast_prefill is not None:
