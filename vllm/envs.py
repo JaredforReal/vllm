@@ -209,6 +209,11 @@ if TYPE_CHECKING:
         "relax",
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
+    VLLM_MIMO_V2_FUSED_ROUTER: bool = False
+    VLLM_MIMO_V2_FUSED_ROPE: bool = False
+    VLLM_MIMO_V2_SKINNY_GEMM: bool = False
+    VLLM_MIMO_V2_FUSED_SPEC_PREP: bool = False
+    VLLM_MIMO_V2_FUSED_MOE_TAIL: bool = False
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
@@ -1594,6 +1599,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(
         int(os.getenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1"))
+    ),
+    # MiMo-V2 experimental fused decode kernels (see
+    # vllm/model_executor/models/mimo_v2_fused/).
+    "VLLM_MIMO_V2_FUSED_ROUTER": lambda: bool(
+        int(os.getenv("VLLM_MIMO_V2_FUSED_ROUTER", "0"))
+    ),
+    "VLLM_MIMO_V2_FUSED_ROPE": lambda: bool(
+        int(os.getenv("VLLM_MIMO_V2_FUSED_ROPE", "0"))
+    ),
+    "VLLM_MIMO_V2_SKINNY_GEMM": lambda: bool(
+        int(os.getenv("VLLM_MIMO_V2_SKINNY_GEMM", "0"))
+    ),
+    "VLLM_MIMO_V2_FUSED_SPEC_PREP": lambda: bool(
+        int(os.getenv("VLLM_MIMO_V2_FUSED_SPEC_PREP", "0"))
+    ),
+    "VLLM_MIMO_V2_FUSED_MOE_TAIL": lambda: bool(
+        int(os.getenv("VLLM_MIMO_V2_FUSED_MOE_TAIL", "0"))
     ),
     # Skip cudagraph/DP padding tokens in the MoE path by forcing their expert
     # ids to -1 so the dispatch and experts drop them. Requires a MoE kernel that
