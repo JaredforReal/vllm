@@ -678,7 +678,10 @@ def kda_recoverssm_verify(
         return out
 
     block_k = triton.next_power_of_2(key_dim)
-    block_v = min(triton.next_power_of_2(value_dim), 32)
+    # One warp per 16-wide value tile: the verify loop is latency bound on its
+    # per-token reductions, and more, smaller programs hide it better (B300,
+    # 32 heads x 64 requests: 4.33 -> 3.35 ms per 34-layer step).
+    block_v = min(triton.next_power_of_2(value_dim), 16)
     grid = (triton.cdiv(value_dim, block_v), batch, num_heads)
     _kda_recoverssm_verify_kernel[grid](
         q,
@@ -722,7 +725,7 @@ def kda_recoverssm_verify(
         BV=block_v,
         SPEC_QUERY_LEN=spec_query_len,
         USE_LOWER_BOUND=lower_bound is not None,
-        num_warps=4,
+        num_warps=1,
         num_stages=2,
     )
     return out
@@ -1060,7 +1063,8 @@ class KDARecoverSSMCommitContext:
             NUM_HEADS=num_heads,
             USE_LOWER_BOUND=self.lower_bound is not None,
             ALIGN_MODE=block_table is not None,
-            num_warps=4,
+            # 2.88 -> 2.11 ms per 34-layer commit on B300 at 64 requests.
+            num_warps=1,
             num_stages=2,
         )
 
