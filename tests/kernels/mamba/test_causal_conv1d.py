@@ -389,3 +389,39 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="needs CUDA/ROCm")
+@pytest.mark.parametrize("out_split", [256, 1024])
+@pytest.mark.parametrize("num_splits", [2, 3])
+def test_causal_conv1d_varlen_out_split(out_split, num_splits):
+    """``out_split`` writes channel block i to plane i; the values must be
+    bit-identical to the default token-major output, and the conv states must
+    be updated identically."""
+    set_random_seed(0)
+    dim, width = out_split * num_splits, 4
+    seqlens = [700, 1, 33, 1300]
+    cu = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32)
+    # Merged projections are token-major: pass the (dim, T) view.
+    x = torch.randn(sum(seqlens), dim, device=DEVICE, dtype=torch.bfloat16).t()
+    weight = torch.randn(dim, width, device=DEVICE, dtype=torch.bfloat16)
+    bias = torch.randn(dim, device=DEVICE, dtype=torch.bfloat16)
+    states = torch.randn(8, width - 1, dim, device=DEVICE, dtype=torch.bfloat16)
+    states = states.transpose(1, 2)
+    states_ref = states.clone()
+    kwargs = dict(
+        query_start_loc=cu.to(DEVICE),
+        cache_indices=torch.tensor([1, 3, 5, 6], dtype=torch.int32, device=DEVICE),
+        has_initial_state=torch.tensor([True, False, True, True], device=DEVICE),
+        activation="silu",
+    )
+    ref = causal_conv1d_fn(x, weight, bias, conv_states=states_ref, **kwargs)
+    out = causal_conv1d_fn(
+        x, weight, bias, conv_states=states, out_split=out_split, **kwargs
+    )
+
+    assert out.shape == (num_splits, sum(seqlens), out_split)
+    assert out.is_contiguous()
+    for i, plane in enumerate(ref.t().split(out_split, dim=-1)):
+        torch.testing.assert_close(out[i], plane, atol=0, rtol=0)
+    torch.testing.assert_close(states, states_ref, atol=0, rtol=0)

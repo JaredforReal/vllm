@@ -578,8 +578,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata_narrowed,
-            ).transpose(0, 1)
-            q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+                # Dense q/k/v planes: FlashKDA needs contiguous inputs, and a
+                # split of the merged token-major output would be strided.
+                out_split=self.local_projection_size,
+            )
+            q_ns, k_ns, v_ns = qkv_ns.unbind(0)
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_state_indices_tensor is not None
             decode_conv_indices = non_spec_state_indices_tensor[

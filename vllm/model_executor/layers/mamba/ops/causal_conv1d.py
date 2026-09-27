@@ -46,6 +46,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_cache_indices: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.int64,
+    stride_o_split: tl.int64,  # stride between output planes (OUT_SPLIT > 0)
     stride_block_m: tl.constexpr,  # Stride block to align divided by BLOCK_M
     # others
     pad_slot_id: tl.constexpr,
@@ -59,6 +60,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    OUT_SPLIT: tl.constexpr,  # > 0: channels [i*OUT_SPLIT, (i+1)*OUT_SPLIT) go to plane i
     launch_pdl: tl.constexpr,
 ):
     conv_states_ptr = initial_states_ptr
@@ -469,10 +471,16 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
+        if OUT_SPLIT > 0:
+            o_feat_off = (idx_feats // OUT_SPLIT) * stride_o_split + (
+                idx_feats % OUT_SPLIT
+            ) * stride_o_dim
+        else:
+            o_feat_off = idx_feats * stride_o_dim
         o_ptrs = (
             o_ptr
             + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
+            + o_feat_off
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
@@ -496,6 +504,7 @@ def causal_conv1d_fn(
     block_size_to_align=0,
     metadata=None,
     validate_data=False,
+    out_split: int = 0,
 ):
     """Support varlen + continuous batching when x is 2D tensor.
 
@@ -546,7 +555,13 @@ def causal_conv1d_fn(
         The number of tokens already completed for each sequence
     block_size_to_align: int
         The block size to align the cached states to
-    out: same shape as `x`
+    out_split: int
+        If > 0, the output is returned as contiguous planes of shape
+        (dim // out_split, cu_seq_len, out_split): channels
+        [i * out_split, (i + 1) * out_split) are written token-major to
+        plane i. Lets callers that split a merged conv (e.g. q|k|v) get
+        dense per-projection tensors without a strided copy.
+    out: same shape as `x`, or planes (see `out_split`)
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
@@ -555,7 +570,17 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    out = torch.empty_like(x)
+    if out_split > 0:
+        assert x.shape[0] % out_split == 0 and out_split % 256 == 0
+        out = torch.empty(
+            x.shape[0] // out_split,
+            x.shape[1],
+            out_split,
+            dtype=x.dtype,
+            device=x.device,
+        )
+    else:
+        out = torch.empty_like(x)
     if metadata is not None:
         nums_dict = metadata.nums_dict
         args = nums_dict
@@ -604,7 +629,10 @@ def causal_conv1d_fn(
         stride_istate_seq = conv_states.stride(0)
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
-    if out.dim() == 2:
+    stride_o_split = 0
+    if out_split > 0:
+        stride_o_split, stride_o_token, stride_o_dim = out.stride()
+    elif out.dim() == 2:
         stride_o_dim = out.stride(0)
         stride_o_token = out.stride(1)
     else:
@@ -739,6 +767,7 @@ def causal_conv1d_fn(
         stride_cache_indices,
         stride_o_dim,
         stride_o_token,
+        stride_o_split,
         block_size_to_align // BLOCK_M,
         # others
         pad_slot_id,
@@ -753,6 +782,7 @@ def causal_conv1d_fn(
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
         BLOCK_N=256,
+        OUT_SPLIT=out_split,
         num_stages=2,
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
