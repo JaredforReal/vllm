@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_SPARSE_MLA_FLASHMLA_PREFILL_MIN_TOKENS: int = 1024
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1087,6 +1088,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
+    # FLASHINFER_MLA_SPARSE with a bf16 NoPE-512 cache on SM10x: pure-prefill
+    # batches with at least this many query tokens run FlashMLA's sparse
+    # prefill kernel (query heads padded to 64). 0 disables.
+    "VLLM_SPARSE_MLA_FLASHMLA_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_SPARSE_MLA_FLASHMLA_PREFILL_MIN_TOKENS", "1024")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
