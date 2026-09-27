@@ -1094,7 +1094,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     # token-major (B, N, L) buffer so the MQA query is already
                     # contiguous; a NoPE model (qk_rope_head_dim == 0) then
                     # needs no concat at all.
-                    mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))
+                    # A backend with a head-padded sparse prefill kernel gets
+                    # the query in a (B, pad, L) buffer whose first N heads
+                    # the bmm fills; the padded heads are never written.
+                    pad = getattr(self.impl, "sparse_prefill_q_pad_heads", None)
+                    if (
+                        pad is not None
+                        and pad > N
+                        and attn_metadata.num_decode_tokens == 0
+                        and mqa_q_nope.shape[1] >= self.impl.sparse_prefill_min_tokens  # type: ignore[attr-defined]
+                    ):
+                        mqa_ql_nope = mqa_q_nope.new_empty((B, pad, L))[:, :N]
+                    else:
+                        mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))
                     torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))
 
             if fp8_attention and self.impl.supports_quant_query_input:

@@ -409,6 +409,10 @@ def _get_workspace_buffer(
     return _fi_sparse_workspace
 
 
+# FlashMLA's sparse prefill kernel runs 64 query heads per token.
+_FLASHMLA_PREFILL_HEADS = 64
+
+
 class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     """FlashInfer MLA Sparse implementation.
 
@@ -476,6 +480,28 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # top-k length tensor.
         self.is_nope_mla = self.qk_rope_head_dim == 0
 
+        # Pure-prefill batches of at least ``sparse_prefill_min_tokens`` query
+        # tokens run FlashMLA's sparse prefill kernel instead of the trtllm-gen
+        # decode kernel (which treats every prefill token as its own request).
+        # The sparse gather dominates both kernels, and FlashMLA's is faster
+        # even though it needs 64 query heads: the MLA layer writes the
+        # absorbed query into a 64-head buffer (``sparse_prefill_q_pad_heads``)
+        # and the padded heads' outputs are dropped. Applies to bf16 NoPE-512
+        # caches on SM10x.
+        self.sparse_prefill_q_pad_heads: int | None = None
+        self.sparse_prefill_min_tokens = (
+            envs.VLLM_SPARSE_MLA_FLASHMLA_PREFILL_MIN_TOKENS
+        )
+        if (
+            self.sparse_prefill_min_tokens > 0
+            and self.is_nope_mla
+            and self.kv_lora_rank == 512
+            and not is_quantized_kv_cache(kv_cache_dtype)
+            and num_heads <= _FLASHMLA_PREFILL_HEADS
+            and current_platform.is_device_capability_family(100)
+        ):
+            self.sparse_prefill_q_pad_heads = _FLASHMLA_PREFILL_HEADS
+
         # fp8 query quantization is required when using fp8 kv_cache,
         # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
         # for query and kv_cache (mixed bf16+fp8 is not supported).
@@ -490,12 +516,23 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if isinstance(q, tuple):
             ql_nope, q_pe = q
-            if q_pe.shape[-1] == 0 and ql_nope.is_contiguous():
+            if q_pe.shape[-1] == 0 and (
+                ql_nope.is_contiguous() or self._head_padded_query(ql_nope) is not None
+            ):
                 q = ql_nope
             else:
                 q = torch.cat(q, dim=-1)
 
         num_actual_toks = q.shape[0]
+        flashmla_q = (
+            self._head_padded_query(q)
+            if attn_metadata.num_decode_tokens == 0
+            and self.dcp_world_size == 1
+            and not isinstance(self.index_group, HiSparseMLAIndexGroup)
+            else None
+        )
+        if flashmla_q is None and not q.is_contiguous():
+            q = q.contiguous()
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
@@ -597,12 +634,70 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 return_valid_counts=True,
             )
 
+        if flashmla_q is not None:
+            return self._run_flashmla_prefill(
+                flashmla_q,
+                q.shape[1],
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                topk_indices_physical,
+                seq_lens,
+            )
+
         return self._run_mqa_kernel(
             q,
             kv_c_and_k_pe_cache,
             topk_indices_physical,
             seq_lens,
         )
+
+    def _head_padded_query(self, q: torch.Tensor) -> torch.Tensor | None:
+        """The 64-head view FlashMLA reads, if ``q`` is the real heads of a
+        head-padded query buffer (or already has all 64 heads)."""
+        pad = self.sparse_prefill_q_pad_heads
+        if (
+            pad is None
+            or q.dim() != 3
+            or q.shape[0] < self.sparse_prefill_min_tokens
+            or q.shape[1] > pad
+        ):
+            return None
+        num_tokens, _, head_dim = q.shape
+        if q.stride() != (pad * head_dim, head_dim, 1):
+            return None
+        return q.as_strided((num_tokens, pad, head_dim), (pad * head_dim, head_dim, 1))
+
+    def _run_flashmla_prefill(
+        self,
+        q_padded: torch.Tensor,
+        num_heads: int,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+        topk_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, None]:
+        """Sparse prefill with FlashMLA; ``q_padded`` is ``[T, 64, 512]`` whose
+        first ``num_heads`` heads are real. Returns the real heads' output as a
+        strided view."""
+        from vllm.third_party.flashmla.flash_mla_interface import (
+            flash_mla_sparse_fwd,
+        )
+
+        assert not self.need_to_return_lse_for_decode
+        head_dim = q_padded.shape[-1]
+        kv_rows, _ = flat_kv_row_view(
+            kv_cache.view(q_padded.dtype), attn_metadata.block_size
+        )
+        # Invalid (-1) slots past seq_lens are skipped via topk_length.
+        out = flash_mla_sparse_fwd(
+            q_padded,
+            kv_rows.unsqueeze(1),
+            topk_indices.unsqueeze(1),
+            self.scale,
+            d_v=head_dim,
+            topk_length=seq_lens,
+        )[0]
+        return out[:, :num_heads], None
 
     def _prepare_mqa_kernel(
         self,
