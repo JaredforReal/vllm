@@ -3419,8 +3419,12 @@ class VllmConfig:
             if self.model_config is not None and self.model_config.architecture not in (
                 "KimiLinearForCausalLM",
                 "KimiK3ForConditionalGeneration",
+                "Glm5NextForCausalLM",
+                "Glm5NextForConditionalGeneration",
             ):
-                raise ValueError("RecoverSSM is only supported for Kimi-K3 KDA")
+                raise ValueError(
+                    "RecoverSSM is only supported for Kimi-K3 and GLM-5.3-Flash KDA"
+                )
             if self.mamba_config.enable_stochastic_rounding:
                 raise ValueError(
                     "RecoverSSM supports bfloat16/float32 "
@@ -3468,9 +3472,23 @@ class VllmConfig:
             self.kv_transfer_config is not None
             and self.kv_transfer_config.is_kv_transfer_instance
         ):
-            raise ValueError(
-                "--use-replayssm is incompatible with KV connectors "
-                "(P/D disaggregation, KV cache offload)"
+            # KDA RecoverSSM appends its correction/key-gate records after the
+            # conv and recurrent state in each Mamba page. NIXL (pull) reads only
+            # those two leading regions, so homogeneous P/D (both instances with
+            # --use-replayssm, same page layout) transfers exactly the state the
+            # decoder needs; the records are verify scratch, rewritten locally.
+            if not (
+                self.cache_config.use_kda_recoverssm
+                and self.kv_transfer_config.kv_connector == "NixlConnector"
+            ):
+                raise ValueError(
+                    "--use-replayssm is incompatible with KV connectors "
+                    "(P/D disaggregation, KV cache offload), except NixlConnector "
+                    "with KDA RecoverSSM on both prefill and decode instances"
+                )
+            logger.warning_once(
+                "KDA RecoverSSM with NixlConnector requires --use-replayssm on "
+                "both the prefill and the decode instances."
             )
         return self
 
