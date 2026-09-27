@@ -172,8 +172,23 @@ def test_kda_recoverssm_derivation_is_revalidated():
     config.cache_config.mamba_cache_mode = "none"
 
     config.model_config.architecture = "NemotronHForCausalLM"
-    with pytest.raises(ValueError, match="only supported for Kimi-K3 KDA"):
+    with pytest.raises(ValueError, match="only supported for Kimi-K3 and GLM"):
         VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.model_config.architecture = "Glm5NextForCausalLM"
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert config.cache_config.use_kda_recoverssm
+
+    # KDA RecoverSSM keeps its records after the conv/recurrent state in each
+    # Mamba page, so NIXL P/D is allowed; other KV connectors are not.
+    config.kv_transfer_config = SimpleNamespace(
+        is_kv_transfer_instance=True, kv_connector="NixlConnector"
+    )
+    VllmConfig.validate_mamba_cached_kernel(config)
+    config.kv_transfer_config.kv_connector = "OffloadingConnector"
+    with pytest.raises(ValueError, match="incompatible with KV connectors"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+    config.kv_transfer_config = None
 
     config.model_config.architecture = "KimiLinearForCausalLM"
     config.parallel_config.pipeline_parallel_size = 2
