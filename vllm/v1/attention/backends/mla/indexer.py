@@ -240,7 +240,9 @@ def split_indexer_prefill_chunks(
 # rank owns a substantial prefill slice.  Keep the replicated path for
 # short/medium requests; on TP4 this makes the optimized path start at 64K
 # prefill rows while retaining the long-context benefit.
-MIN_TP_SHARD_ROWS_PER_RANK = 16_384
+MIN_TP_SHARD_ROWS_PER_RANK = int(
+    __import__("os").environ.get("VLLM_INDEXER_TP_SHARD_MIN_ROWS_PER_RANK", "16384")
+)
 
 
 def balanced_prefill_row_shard(
