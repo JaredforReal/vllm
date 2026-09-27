@@ -1036,9 +1036,9 @@ class Glm5NextForCausalLM(
             vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
         if vllm_config.cache_config.use_kda_recoverssm:
-            dtypes = MambaStateDtypeCalculator.append_kda_recoverssm_record(
-                dtypes, vllm_config.model_config.dtype
-            )
+            # fp32 correction and fp32 normalized-key/decay records; see
+            # vllm/models/glm5next/nvidia/ops/recoverssm.py.
+            dtypes = (*dtypes, torch.float32, torch.float32)
         return dtypes
 
     @classmethod

@@ -188,11 +188,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         if self.cache_config.use_kda_recoverssm:
             # RecoverSSM keeps one checkpoint plus per-draft-token records
-            # (fp32 correction, activation-dtype key/gate) instead of one full
+            # (fp32 correction, fp32 normalized key / decay) instead of one full
             # recurrent state per speculative position.
-            return MambaStateDtypeCalculator.append_kda_recoverssm_record(
-                dtypes, self.model_config.dtype
-            )
+            return (*dtypes, torch.float32, torch.float32)
         return dtypes
 
     def get_state_shape(
@@ -223,11 +221,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         if self.cache_config.use_kda_recoverssm:
             # Kimi-K3's KDA metadata builder carries the RecoverSSM commit plan
             # (a GDNAttentionMetadata subclass, so the fields read below match).
-            from vllm.models.kimi_k3.nvidia.kda_metadata import (
-                KimiK3KDAAttentionBackend,
+            from vllm.models.glm5next.nvidia.kda_recoverssm import (
+                Glm5NextKDARecoverSSMBackend,
             )
 
-            return KimiK3KDAAttentionBackend
+            return Glm5NextKDARecoverSSMBackend
         return super().get_attn_backend()
 
     def __init__(
@@ -710,8 +708,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             assert num_accepted_tokens is not None
             assert spec_query_start_loc is not None
             if use_recoverssm:
-                from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
-                    kda_recoverssm_verify,
+                from vllm.models.glm5next.nvidia.ops.recoverssm import (
+                    glm_kda_recoverssm_verify,
                 )
 
                 if len(recoverssm_records) != 2:
@@ -721,7 +719,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 # Reads the checkpoint without advancing it and records the
                 # per-token correction and key/gate; the accepted state is
                 # reconstructed after sampling (RecoverSSMState.commit_step).
-                core_attn_out_spec = kda_recoverssm_verify(
+                core_attn_out_spec = glm_kda_recoverssm_verify(
                     q=_rearr(q_spec),
                     k=_rearr(k_spec),
                     v=_rearr(v_spec),
@@ -732,7 +730,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     lower_bound=lower_bound,
                     checkpoint_state=recurrent_state,
                     correction_cache=recoverssm_records[0],
-                    kg_cache=recoverssm_records[1],
+                    kd_cache=recoverssm_records[1],
                     query_start_loc=spec_query_start_loc[: num_spec_decodes + 1],
                     state_indices=spec_state_indices_tensor[:num_spec_decodes, 0],
                     spec_query_len=self.spec_query_len,
