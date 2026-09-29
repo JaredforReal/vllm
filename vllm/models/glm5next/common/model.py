@@ -5,6 +5,8 @@ from collections.abc import Iterable
 from typing import ClassVar, Literal
 
 import torch
+
+import vllm.envs as envs
 from torch import nn
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -1086,6 +1088,11 @@ class Glm5NextForCausalLM(
         only ones that can join the MLA/indexer pages of each block. The draft
         attention still applies its window."""
         if type(spec) is not SlidingWindowSpec:
+            return spec
+        if envs.VLLM_GLM_DRAFT_SWA_PAGES:
+            # Keep the window: the GLM planner re-blocks the draft layers to the
+            # MLA page and aliases them onto MLA slots (see
+            # _get_kv_cache_groups_glm5_next).
             return spec
         return replace_as(
             spec,

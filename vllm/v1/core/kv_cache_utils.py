@@ -1214,10 +1214,17 @@ def _get_kv_cache_groups_glm5_next(
         for name, spec in kv_cache_spec.items()
         if isinstance(spec, KpoolTailSpec)
     }
+    # Windowed drafter layers (kept as SlidingWindowSpec) are re-blocked to the
+    # MLA page below and alias MLA slots like the Mamba groups do.
+    swa_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if type(spec) is SlidingWindowSpec and envs.VLLM_GLM_DRAFT_SWA_PAGES
+    }
     attn_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
-        if not isinstance(spec, (MambaSpec, KpoolTailSpec))
+        if not isinstance(spec, (MambaSpec, KpoolTailSpec)) and name not in swa_specs
     }
     if not mamba_specs or not all(
         type(spec) in (MLAAttentionSpec, FullAttentionSpec)
@@ -1278,9 +1285,33 @@ def _get_kv_cache_groups_glm5_next(
     for index, name in enumerate(mamba_specs):
         mamba_grouped_names[index % num_groups].append(name)
 
+    swa_group: KVCacheGroupSpec | None = None
+    if swa_specs:
+        any_swa = next(iter(swa_specs.values()))
+        if not all(spec == any_swa for spec in swa_specs.values()) or len(
+            swa_specs
+        ) > len(mla_names):
+            return None
+        # Largest block (a power-of-two fraction of the MLA block) whose
+        # windowed page fits the MLA page; pad it to the MLA page so the draft
+        # layers can alias MLA slots. The window then holds only a few blocks
+        # per request instead of a full-attention page in every block.
+        mla_block = mla_specs[mla_names[0]].block_size
+        bytes_per_token = any_swa.unpadded_page_size_bytes // any_swa.block_size
+        swa_block = mla_block
+        while swa_block * bytes_per_token > mla_page and swa_block % 32 == 0:
+            swa_block //= 2
+        if swa_block * bytes_per_token > mla_page or mla_block % swa_block:
+            return None
+        swa_group = KVCacheGroupSpec(
+            list(swa_specs),
+            replace(any_swa, block_size=swa_block, page_size_padded=mla_page),
+        )
+
     return (
         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])
+        + ([swa_group] if swa_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
     )
 
@@ -1309,6 +1340,12 @@ def _glm5_next_tensor_layout(
     mamba_groups = [
         group for group in kv_cache_groups if isinstance(group.kv_cache_spec, MambaSpec)
     ]
+    # Windowed drafter layers re-blocked onto MLA pages alias MLA slots too.
+    swa_groups = [
+        group
+        for group in kv_cache_groups
+        if type(group.kv_cache_spec) is SlidingWindowSpec
+    ]
     attn_group: KVCacheGroupSpec | None = None
     tail_group: KVCacheGroupSpec | None = None
     for group in uniform_groups:
@@ -1322,7 +1359,9 @@ def _glm5_next_tensor_layout(
             tail_group = group
     if attn_group is None or not mamba_groups:
         return None
-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
+    if len(uniform_groups) + len(mamba_groups) + len(swa_groups) != len(
+        kv_cache_groups
+    ):
         return None
 
     attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
@@ -1352,6 +1391,15 @@ def _glm5_next_tensor_layout(
     idx_page = idx_pages.pop()
     if any(group.kv_cache_spec.page_size_bytes != mla_page for group in mamba_groups):
         return None
+    if any(
+        group.kv_cache_spec.page_size_bytes != mla_page
+        or len(group.layer_names) > len(mla_names)
+        for group in swa_groups
+    ):
+        return None
+    # Callers treat these as slot-aliasing groups (tensor offsets and memory
+    # estimates); keep the Mamba groups first.
+    mamba_groups = mamba_groups + swa_groups
 
     tail_names: list[str] = []
     tail_page = 0

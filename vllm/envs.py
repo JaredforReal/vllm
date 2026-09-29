@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_MLA_FLASHMLA_PREFILL_MIN_TOKENS: int = 1024
+    VLLM_GLM_DRAFT_SWA_PAGES: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1098,6 +1099,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # FLASHINFER_MLA_SPARSE with a bf16 NoPE-512 cache on SM10x: pure-prefill
     # batches with at least this many query tokens run FlashMLA's sparse
     # prefill kernel (query heads padded to 64). 0 disables.
+    # GLM-5.3-Flash: keep sliding-window drafter layers (DFlash) as a windowed
+    # KV cache group aliased onto MLA slots instead of full-attention pages.
+    "VLLM_GLM_DRAFT_SWA_PAGES": lambda: bool(
+        int(os.getenv("VLLM_GLM_DRAFT_SWA_PAGES", "0"))
+    ),
     "VLLM_SPARSE_MLA_FLASHMLA_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_SPARSE_MLA_FLASHMLA_PREFILL_MIN_TOKENS", "1024")
     ),

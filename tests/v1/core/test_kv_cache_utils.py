@@ -4487,3 +4487,38 @@ def test_get_kv_cache_config_glm5_with_full_attention_layers():
         assert t.block_stride == draft_page
         assert t.offset == target_region + i * draft_page * 100
     assert {t.size for t in kv_cache_config.kv_cache_tensors} == {bytes_per_block * 100}
+
+
+def test_glm5_windowed_drafter_aliases_mla_slots(monkeypatch):
+    """With VLLM_GLM_DRAFT_SWA_PAGES, sliding-window drafter layers form their own
+    windowed group, re-blocked so their page fits (and is padded to) the MLA page,
+    and alias MLA slots: they add no bytes to each attention block."""
+    monkeypatch.setattr(kv_cache_utils.envs, "VLLM_GLM_DRAFT_SWA_PAGES", True)
+    specs, _ = _glm5_like_kv_cache_spec()
+    config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    base_groups = kv_cache_utils._get_kv_cache_groups_glm5_next(config, dict(specs))
+    assert base_groups is not None
+    mla = next(spec for name, spec in specs.items() if name.endswith(".attn"))
+    for i in range(5):
+        specs[f"draft.layers.{i}.attn"] = SlidingWindowSpec(
+            block_size=mla.block_size,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=2048,
+        )
+
+    groups = kv_cache_utils._get_kv_cache_groups_glm5_next(config, specs)
+    assert groups is not None
+    swa_groups = [g for g in groups if type(g.kv_cache_spec) is SlidingWindowSpec]
+    assert len(swa_groups) == 1
+    swa = swa_groups[0].kv_cache_spec
+    assert sorted(swa_groups[0].layer_names) == [f"draft.layers.{i}.attn" for i in range(5)]
+    assert mla.block_size % swa.block_size == 0
+    assert swa.unpadded_page_size_bytes <= mla.page_size_bytes
+    assert swa.page_size_bytes == mla.page_size_bytes
+    assert kv_cache_utils._glm5_next_tensor_layout(groups) is not None
+    # The drafter no longer widens every attention block.
+    assert kv_cache_utils._get_kv_cache_bytes_per_block(
+        groups
+    ) == kv_cache_utils._get_kv_cache_bytes_per_block(base_groups)
