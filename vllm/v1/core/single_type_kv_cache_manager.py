@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from vllm.v1.hisparse.coordinator import HiSparseCoordinator
 
 logger = init_logger(__name__)
+_DEBUG_MAMBA_CKPT = __import__('os').environ.get('VLLM_DEBUG_MAMBA_CKPT') == '1'
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -1561,6 +1562,9 @@ class MambaManager(SingleTypeKVCacheManager):
                 hit_length = (i + 1) * block_size
                 break  # we just need the last match - early stopping
 
+        if _DEBUG_MAMBA_CKPT:
+            logger.info("MAMBA_CKPT lookup max_length=%d bs=%d align=%d hit=%d",
+                        max_length, block_size, alignment_tokens, hit_length)
         return computed_blocks, hit_length
 
     @classmethod
@@ -2001,11 +2005,27 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
+            ckpt = self._checkpoints.get(request.request_id)
             partial_hash = self._cache_partial_tail_block(
                 request, num_tokens, retention_interval=retention_interval
             )
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
+            if _DEBUG_MAMBA_CKPT:
+                blocks = self.req_to_blocks[request.request_id]
+                cb = blocks[ckpt[1]] if ckpt is not None and ckpt[1] < len(blocks) else None
+                logger.info(
+                    "MAMBA_CKPT cache g=%d req=%s num_tokens=%d prompt=%d ret=%s "
+                    "cached_blocks %d->%d ckpt=%s partial=%s ckpt_block(id=%s,null=%s,"
+                    "hash_tokens=%s) nblocks=%d",
+                    self.kv_cache_group_id, request.request_id[-12:], num_tokens,
+                    request.num_prompt_tokens, retention_interval,
+                    num_cached_blocks_before, num_cached_blocks_after, ckpt,
+                    partial_hash is not None,
+                    None if cb is None else cb.block_id,
+                    None if cb is None else cb.is_null,
+                    None if cb is None else cb.block_hash_num_tokens, len(blocks),
+                )
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for idx in range(num_cached_blocks_before, num_cached_blocks_after):
@@ -2069,6 +2089,9 @@ class MambaManager(SingleTypeKVCacheManager):
                 # request-local. The slot may carry a hash from this step's
                 # full-block pass; that must go too, since the checkpoint
                 # state is about to overwrite the block.
+                if _DEBUG_MAMBA_CKPT:
+                    logger.info("MAMBA_CKPT evict transient ckpt req=%s pos=%d",
+                                request.request_id[-12:], checkpoint_position)
                 self.block_pool._maybe_evict_cached_block(checkpoint_block)
                 return None
             if checkpoint_block.block_hash_num_tokens == checkpoint_position:

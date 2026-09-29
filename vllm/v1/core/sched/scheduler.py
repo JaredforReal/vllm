@@ -74,6 +74,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+_DEBUG_MAMBA_CKPT = __import__('os').environ.get('VLLM_DEBUG_MAMBA_CKPT') == '1'
 
 
 class Scheduler(SchedulerInterface):
@@ -524,6 +525,17 @@ class Scheduler(SchedulerInterface):
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
+        if _DEBUG_MAMBA_CKPT:
+            logger.info(
+                "MAMBA_CKPT split req=%s start=%d end=%d prefill_end=%d "
+                "hash_bs=%d bs=%d ckpt_pos=%d internal=%s last_cache=%d "
+                "tail=%d junction=%s stops=%s align=%s partial_hit=%s",
+                request.request_id[-12:], start, end, prefill_end,
+                self.hash_block_size, block_size, checkpoint_position,
+                use_internal_checkpoint, last_cache_position, tail_boundary,
+                junction, stops, self.mamba_prefill_checkpoint_alignment,
+                self.mamba_partial_cache_hit,
+            )
         return max(end - start, 0)
 
     def _get_local_prefix_cache_hit(
@@ -531,11 +543,23 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[KVCacheBlocks, int, int, bool]:
         connector = self.connector
         if connector is not None and connector.supports_divergent_local_hybrid_hits:
-            return self.kv_cache_manager.get_computed_blocks_for_connector(request)
+            res = self.kv_cache_manager.get_computed_blocks_for_connector(request)
+            if _DEBUG_MAMBA_CKPT:
+                logger.info(
+                    "MAMBA_CKPT hit(conn) req=%s prompt=%d local_hit=%d junction=%s",
+                    request.request_id[-12:], request.num_prompt_tokens, res[1], res[2],
+                )
+            return res
 
         blocks, num_local, shared_prefix_boundary = (
             self.kv_cache_manager.get_computed_blocks(request)
         )
+        if _DEBUG_MAMBA_CKPT:
+            logger.info(
+                "MAMBA_CKPT hit req=%s prompt=%d local_hit=%d junction=%s",
+                request.request_id[-12:], request.num_prompt_tokens, num_local,
+                shared_prefix_boundary,
+            )
         return blocks, num_local, shared_prefix_boundary, False
 
     def _reserve_prefill_lookahead(
