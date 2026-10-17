@@ -4,7 +4,7 @@
 
 Stages that still call stock modules (the DSA attention) reach their BF16
 projections through ``quant_method.apply``; ``route`` wraps that call so a planned
-step's B1/B2 token counts take the skinny projection, and every other
+step's 1, 2 or 4 token counts take the skinny projection, and every other
 call (prefills, stock steps, unprepared counts) the stock GEMM.
 """
 
@@ -56,7 +56,9 @@ def route(module) -> bool:
         return True
     try:
         projection = Projection(weight)
-    except ValueError:  # K the skinny GEMM tactics cannot split (e.g. 1536)
+    except ValueError:
+        return False
+    if not projection.configs:  # no tactic splits this K
         return False
     module.quant_method = _RoutedApply(module.quant_method, projection)
     return True
