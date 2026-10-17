@@ -11,6 +11,7 @@ from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mhc import hc_contract, hc_expand
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 from ..linear import planned_step
 
@@ -31,7 +32,16 @@ class Step(NamedTuple):
 
 def is_decode(md, q: int, b: int) -> bool:
     """Whether one layer's metadata is a pure decode (q = 1) or a uniform verify of
-    b tokens. FULL graphs pad whole requests, so every row verifies q tokens."""
+    b tokens. FULL graphs pad whole requests, so every row verifies q tokens.
+
+    The DSA indexer metadata files q-token verify rows either as decodes or as
+    short prefills (the stock indexer runs them that way inside FULL verify
+    graphs too); both are uniform verify steps."""
+    if q > 1 and isinstance(md, DeepseekV32IndexerMetadata):
+        if md.num_prefills:
+            rows = md.num_prefills * q
+            return not md.num_decodes and rows == md.num_prefill_tokens == b
+        return md.num_decode_tokens == md.num_decodes * q == b
     if md.num_prefills:
         return False
     if q == 1:
@@ -181,9 +191,13 @@ class SpecializedDecode:
                     b,
                     q,
                     type(bad).__name__,
-                    {f: getattr(bad, f, None) for f in fields},
-                    getattr(
-                        getattr(bad, "spec_state_indices_tensor", None), "shape", None
+                    str({f: getattr(bad, f, None) for f in fields}),
+                    str(
+                        getattr(
+                            getattr(bad, "spec_state_indices_tensor", None),
+                            "shape",
+                            None,
+                        )
                     ),
                 )
             return None
