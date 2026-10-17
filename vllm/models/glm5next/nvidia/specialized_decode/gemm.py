@@ -1,31 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Skinny BF16 projections for decode batches: the CuTe skinny GEMM at B1/B2 and
-the split-K GEMM above, both from the Kimi K3 specialized decode."""
+"""Skinny BF16 projections for B1/B2 decode steps: the CuTe skinny GEMM that
+issues its static weight loads before the PDL wait.
+
+Above B2 cuBLAS stays: the Kimi K3 split-K tactics measured slower than cuBLAS
+on the GLM-5.3-Flash KDA in_proj at B4/B8 (14.4 vs 10.7 us).
+"""
 
 import torch
 
-from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.projection import (
-    PreparedProjection,
-)
-from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (
-    SkinnyProjection,
-    projection_policies,
+from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+    SkinnyGemmConfig,
+    shape_dynamic_skinny_gemm,
 )
 
-TP = 4
+# (BLOCK_N, warps, split K) per token count, from Kimi K3's SkinnyProjection.
+TACTICS = {1: (128, 4, 1), 2: (64, 4, 2)}
 
 
 class Projection:
-    """``x @ weight.T`` for the prepared token counts, into a fresh output."""
+    """``x @ weight.T`` for 1 or 2 tokens."""
 
-    def __init__(self, weight, batches):
-        self.weight = weight
-        split_k = PreparedProjection(
-            weight, projection_policies(TP, weight.shape[0], batches)
-        ).prepare()
-        self.skinny = SkinnyProjection(weight, split_k)
+    def __init__(self, weight):
+        self.weight, k = weight, weight.shape[1]
+        self.configs = {m: SkinnyGemmConfig(m, *t, 8, k) for m, t in TACTICS.items()}
+        for m, cfg in self.configs.items():  # compile before capture
+            shape_dynamic_skinny_gemm(weight.new_zeros(m, k), weight, cfg, None)
+
+    def supports(self, tokens: int) -> bool:
+        return tokens in self.configs
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        out = x.new_empty((x.shape[0], self.weight.shape[0]))
-        return self.skinny.run(x, out)
+        return shape_dynamic_skinny_gemm(x, self.weight, self.configs[x.shape[0]], None)

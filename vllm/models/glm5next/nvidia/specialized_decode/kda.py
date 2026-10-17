@@ -35,8 +35,8 @@ class KdaStage:
         if gemm:
             from .gemm import Projection
 
-            self.in_proj = Projection(a.in_proj_qkvbfg_a.weight, batches)
-            self.o_proj = Projection(a.o_proj.weight, batches)
+            self.in_proj = Projection(a.in_proj_qkvbfg_a.weight)
+            self.o_proj = Projection(a.o_proj.weight)
         self.heads = a.local_num_heads
         self.dim = self.heads * HEAD_DIM
         conv = torch.cat(
@@ -97,10 +97,8 @@ class KdaStage:
 
     def run(self, x, metadata, q):
         a = self.attention
-        if self.in_proj is not None:
-            projected = self.in_proj(x)
-        else:
-            projected = a.in_proj_qkvbfg_a(x)[0]
+        skinny = self.in_proj is not None and self.in_proj.supports(x.shape[0])
+        projected = self.in_proj(x) if skinny else a.in_proj_qkvbfg_a(x)[0]
         d, h = self.dim, self.heads
         g_a = projected[:, 3 * d + h + HEAD_DIM : 3 * d + h + 2 * HEAD_DIM]
         gate = a.g_b_proj(g_a)[0]
@@ -118,6 +116,6 @@ class KdaStage:
         tensors = self._operands(a.kv_cache, projected, gate, slots, out, accepted)
         views = tuple(to_cute(t, 16) for t in tensors)
         self.kernels[key](*views[:13], *self.scalars, *views[13:], stream(self.device))
-        if self.o_proj is not None:
+        if skinny:
             return tensor_model_parallel_all_reduce(self.o_proj(out))
         return a.o_proj(out)[0]

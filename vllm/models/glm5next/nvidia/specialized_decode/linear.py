@@ -4,7 +4,7 @@
 
 Stages that still call stock modules (the DSA attention) reach their BF16
 projections through ``quant_method.apply``; ``route`` wraps that call so a planned
-step's prepared token counts take the skinny / split-K projection, and every other
+step's B1/B2 token counts take the skinny projection, and every other
 call (prefills, stock steps, unprepared counts) the stock GEMM.
 """
 
@@ -27,15 +27,15 @@ def planned_step():
 
 
 class _RoutedApply:
-    def __init__(self, inner, projection, batches):
-        self.inner, self.projection, self.batches = inner, projection, batches
+    def __init__(self, inner, projection):
+        self.inner, self.projection = inner, projection
 
     def apply(self, layer, x, bias=None):
         if (
             _active[0]
             and bias is None
             and x.dim() == 2
-            and x.shape[0] in self.batches
+            and self.projection.supports(x.shape[0])
             and x.stride(-1) == 1
         ):
             return self.projection(x)
@@ -45,7 +45,7 @@ class _RoutedApply:
         return getattr(self.inner, name)
 
 
-def route(module, batches) -> bool:
+def route(module) -> bool:
     """Routes a BF16 linear module's decode GEMMs; False if it cannot."""
     weight = getattr(module, "weight", None)
     if weight is None or weight.dtype != torch.bfloat16 or weight.dim() != 2:
@@ -54,7 +54,9 @@ def route(module, batches) -> bool:
         return False
     if isinstance(module.quant_method, _RoutedApply):
         return True
-    module.quant_method = _RoutedApply(
-        module.quant_method, Projection(weight, batches), frozenset(batches)
-    )
+    try:
+        projection = Projection(weight)
+    except ValueError:  # K the skinny GEMM tactics cannot split (e.g. 1536)
+        return False
+    module.quant_method = _RoutedApply(module.quant_method, projection)
     return True

@@ -79,9 +79,49 @@ class SpecializedDecode:
                 indexer = getattr(attn, "indexer", None)
                 modules += [getattr(indexer, n, None) for n in INDEXER_PROJECTIONS]
                 for m in modules:
-                    if m is not None and route(m, self.batches):
+                    if m is not None and route(m):
                         self.routed.append(m.prefix)
             logger.info("Specialized decode routes %d DSA GEMMs", len(self.routed))
+        self.mhc = None
+        if "mhc" in config.stages:
+            from ..mhc import MAX_TOKENS as MHC_MAX_TOKENS
+            from ..mhc import MhcBoundary
+
+            first = self.layers[0]
+            self.mhc = MhcBoundary(first, first.hidden_size, first.hc_attn_fn.device)
+            self.mhc_max_tokens = MHC_MAX_TOKENS
+            # hc_fn is BF16 in the checkpoint, so the BF16 copy is exact.
+            self.hc_fn = {
+                id(fn): fn.detach().bfloat16()
+                for layer in self.layers
+                for fn in (layer.hc_attn_fn, layer.hc_ffn_fn)
+            }
+
+    def boundary(self, layer, x, residual, post, comb, fn, scale, base, norm):
+        """The previous sublayer's mHC post, then the next one's pre and norm."""
+        if self.mhc is not None and x.shape[0] <= self.mhc_max_tokens:
+            return self.mhc(
+                x,
+                residual.contiguous(),
+                post.contiguous(),
+                comb.contiguous(),
+                self.hc_fn[id(fn)],
+                scale,
+                base,
+                norm.weight.data,
+                norm.variance_epsilon,
+            )
+        return layer.hc_fused_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            fn,
+            scale,
+            base,
+            norm_weight=norm.weight.data,
+            norm_eps=norm.variance_epsilon,
+        )
 
     def prepare_kv(self) -> None:
         """Compiles the layer stages for the KV cache tensors the runner bound."""
@@ -104,23 +144,48 @@ class SpecializedDecode:
         Every predicate is the same on all TP ranks, so all ranks take one path.
         """
         b = positions.shape[-1]  # M-RoPE positions are [3, tokens]
+        if not torch.cuda.is_current_stream_capturing():
+            return None
         if intermediate_tensors is not None or b not in self.batches:
+            logger.info_once("Specialized decode skips a %d-token capture", b)
             return None
         if self.backbone.aux_hidden_state_layers:
-            return None
-        if not torch.cuda.is_current_stream_capturing():
+            logger.info_once(
+                "Specialized decode skips captures: aux layers %s",
+                self.backbone.aux_hidden_state_layers,
+            )
             return None
         if not is_forward_context_available():
             return None
         context = get_forward_context()
         if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            logger.info_once("Specialized decode skips a PIECEWISE %d-token capture", b)
             return None
         by_layer = context.attn_metadata
         if not isinstance(by_layer, dict) or not by_layer:
             return None
         rows: list[Any] = list(by_layer.values())
         q = self.q if any(getattr(md, "num_spec_decodes", 0) for md in rows) else 1
-        if b % q or not all(is_decode(md, q, b) for md in rows):
+        bad = next((md for md in rows if not is_decode(md, q, b)), None)
+        if b % q or bad is not None:
+            if bad is not None:
+                fields = (
+                    "num_prefills",
+                    "num_decodes",
+                    "num_decode_tokens",
+                    "num_spec_decodes",
+                    "num_spec_decode_tokens",
+                )
+                logger.info_once(
+                    "Specialized decode skips a %d-token capture (q=%d): %s %s %s",
+                    b,
+                    q,
+                    type(bad).__name__,
+                    {f: getattr(bad, f, None) for f in fields},
+                    getattr(
+                        getattr(bad, "spec_state_indices_tensor", None), "shape", None
+                    ),
+                )
             return None
         logger.info_once("GLM-5.3-Flash specialized decode captures %d-token steps", b)
         return Step(q, positions, by_layer)
@@ -147,7 +212,8 @@ class SpecializedDecode:
                 norm_eps=layer.input_layernorm.variance_epsilon,
             )
         else:
-            residual, post, comb, x = layer.hc_fused_post_pre(
+            residual, post, comb, x = self.boundary(
+                layer,
                 x,
                 residual,
                 post,
@@ -155,11 +221,11 @@ class SpecializedDecode:
                 layer.hc_attn_fn,
                 layer.hc_attn_scale,
                 layer.hc_attn_base,
-                norm_weight=layer.input_layernorm.weight.data,
-                norm_eps=layer.input_layernorm.variance_epsilon,
+                layer.input_layernorm,
             )
         x = self.attention(layer, x, step)
-        residual, post, comb, x = layer.hc_fused_post_pre(
+        residual, post, comb, x = self.boundary(
+            layer,
             x,
             residual,
             post,
@@ -167,8 +233,7 @@ class SpecializedDecode:
             layer.hc_ffn_fn,
             layer.hc_ffn_scale,
             layer.hc_ffn_base,
-            norm_weight=layer.post_attention_layernorm.weight.data,
-            norm_eps=layer.post_attention_layernorm.variance_epsilon,
+            layer.post_attention_layernorm,
         )
         x = layer.mlp(x)
         if layer.layer_idx == layer.num_hidden_layers - 1:
