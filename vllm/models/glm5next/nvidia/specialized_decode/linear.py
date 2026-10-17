@@ -4,8 +4,10 @@
 
 Stages that still call stock modules (the DSA attention) reach their BF16
 projections through ``quant_method.apply``; ``route`` wraps that call so a planned
-step's 1, 2 or 4 token counts take the skinny projection, and every other
-call (prefills, stock steps, unprepared counts) the stock GEMM.
+step's 1 or 2 token counts take the skinny projection, and every other call
+(prefills, stock steps, larger counts) the stock GEMM. At 4 tokens the DSA layer
+measured slower with it in place (124.6 -> 128.8 us per layer at B4), although
+the projections alone are faster.
 """
 
 from contextlib import contextmanager
@@ -14,6 +16,7 @@ import torch
 
 from .gemm import Projection
 
+MAX_TOKENS = 2
 _active = [False]
 
 
@@ -35,6 +38,7 @@ class _RoutedApply:
             _active[0]
             and bias is None
             and x.dim() == 2
+            and x.shape[0] <= MAX_TOKENS
             and self.projection.supports(x.shape[0])
             and x.stride(-1) == 1
         ):
