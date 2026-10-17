@@ -13,6 +13,8 @@ class DecodeConfig:
     # Tokens per request in a verify step (1 + draft tokens; 1 without speculation).
     q: int
     capture_sizes: tuple[int, ...]
+    # Layer stages that replace stock kernels ("kda"); the rest run stock modules.
+    stages: frozenset[str]
 
 
 def specialized_decode_config(vllm_config) -> DecodeConfig | None:
@@ -36,6 +38,7 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         capture_sizes=tuple(
             vllm_config.compilation_config.cudagraph_capture_sizes or ()
         ),
+        stages=frozenset(s for s in extra.get("stages", "kda").split(",") if s),
     )
 
 

@@ -1266,6 +1266,23 @@ class Glm5NextForConditionalGeneration(
     def get_model_state_cls(self) -> "type[ModelState]":
         return self.language_model.get_model_state_cls()
 
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | IntermediateTensors:
+        decode = self.language_model.specialized_decode
+        if decode is not None and intermediate_tensors is None:
+            step = decode.plan(positions, intermediate_tensors)
+            if step is not None:
+                return decode.run(step, input_ids, inputs_embeds)
+        return super().forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+        )
+
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
             layer.mlp
