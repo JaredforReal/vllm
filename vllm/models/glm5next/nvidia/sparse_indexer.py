@@ -512,7 +512,7 @@ def sparse_attn_indexer_kpool(
                 dec_k = k[:num_decode_tokens].view(*shape2, head_dim)
                 dec_gate = gate_score[:num_decode_tokens].view(*shape2, head_dim)
                 dec_slot = slot_mapping[:num_decode_tokens].view(shape2)
-                dec_pos = positions[:num_decode_tokens].to(torch.int32).view(shape2)
+                dec_pos = positions[:num_decode_tokens].view(shape2)
             tail_meta = (
                 attn_metadata.get(_resolve_layer_name(tail_prefix))
                 if tail_prefix is not None
@@ -662,8 +662,19 @@ def sparse_attn_indexer_kpool(
 
         # Resolve to token-level indices in the output buffer.
         if index_kpool > 1:
-            pool_ids = pool_topk.to(torch.int64)
             n = pool_topk.shape[0]
+            if positions is not None and not decode_metadata.requires_padding:
+                # Uniform rows: the kernel takes seq_len = position + 1 and
+                # writes the expansion straight into the output buffer.
+                kpool_ops.expand_pools_and_append_tail(
+                    pool_topk,
+                    positions[:n],
+                    index_kpool,
+                    seq_offset=1,
+                    out=topk_indices_buffer[:n],
+                )
+                return topk_indices_buffer
+            pool_ids = pool_topk
             # Decode seq_lens are pool-granular; recover token lengths from
             # positions using the padded [B, next_n] row layout when needed.
             if positions is not None:
