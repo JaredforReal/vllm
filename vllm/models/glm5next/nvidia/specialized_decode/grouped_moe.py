@@ -297,8 +297,9 @@ class _GroupedKernel:
         fence_tmem()
         tmem = tmem_base[0]
 
+        # No early launch_dependents: the finalize publish reads the routing
+        # weights this kernel writes before its own PDL wait.
         cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
         self.route(logits, offsets, ids, weights, mask, picks, warp, lane, cta)
         cute.arch.sync_threads()
         self.number_slots(mask, slot_of, slot_expert, slot_count, flags, warp, lane)

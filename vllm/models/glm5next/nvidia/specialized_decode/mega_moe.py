@@ -246,8 +246,10 @@ class _MegaKernel:
         fence_tmem()
         tmem = tmem_base[0]
 
+        # No early launch_dependents: the finalize publish reads the routing
+        # weights this kernel writes before its own PDL wait, so it may only
+        # launch once this grid has exited.
         cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
         pick, weight = self.top_k_pick(logits, offsets, route, lane)
         expert = Int64(pick)
         if rank == 0 and tid == 0:
