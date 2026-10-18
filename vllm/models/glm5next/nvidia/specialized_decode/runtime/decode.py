@@ -31,8 +31,14 @@ AR_MHC_MAX_TOKENS = 32
 # Token counts the MoE kernels serve: one 16-CTA cluster per route up to
 # PER_ROUTE_MAX_TOKENS (7 such clusters fit on GB300), the persistent
 # expert-grouped kernel above.
-PER_ROUTE_MAX_TOKENS = 1
-MEGA_MAX_TOKENS = 16
+PER_ROUTE_MAX_TOKENS = 2
+# Off until it beats TRTLLM-Gen: its per-task handoffs cost more than the
+# second cluster wave saves (29 vs 18 us at one token, 50 vs 28 at two).
+GROUPED_MAX_TOKENS = 0
+MEGA_MAX_TOKENS = max(PER_ROUTE_MAX_TOKENS, GROUPED_MAX_TOKENS)
+# Two tokens take two waves of the per-route clusters, which the shared expert
+# GEMVs then slow down: DeepGEMM's shared expert stays there.
+SHARED_MAX_TOKENS = 1
 # BF16 projections of the DSA layer and its indexer that dsa_gemm routes.
 DSA_PROJECTIONS = ("fused_qkv_a_proj", "q_b_proj", "o_proj")
 INDEXER_PROJECTIONS = ("wq_b", "wk_weights_proj")
@@ -84,6 +90,14 @@ def is_decode(md, q: int, b: int) -> bool:
     return full and not md.num_decodes and tokens == md.num_spec_decodes * q
 
 
+def _fp32_scales(scale: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    from ..shared_expert import block_scales
+
+    if scale.dtype == torch.float32:
+        return scale
+    return block_scales(scale, *weight.shape)
+
+
 class LayerStages:
     """The stages of one decoder layer's decode, shared by the backbone and
     the MTP draft layer."""
@@ -102,7 +116,7 @@ class LayerStages:
 
         from ..grouped_moe import GroupedExperts, shared_weights
         from ..mega_moe import MegaExperts
-        from ..shared_expert import SharedExpert, block_scales
+        from ..shared_expert import SharedExpert
 
         tokens = [b for b in self.batches if b <= MEGA_MAX_TOKENS]
         mega: dict[int, Any] = {}
@@ -137,21 +151,19 @@ class LayerStages:
                 [m for m in tokens if m <= PER_ROUTE_MAX_TOKENS], logits_dtype
             )
             se = layer.mlp.shared_experts
-
-            def fp32(scale, weight):
-                if scale.dtype == torch.float32:
-                    return scale
-                return block_scales(scale, *weight.shape)
-
-            gate_up, down = se.gate_up_proj, se.down_proj
-            shared = shared_weights(
-                gate_up.weight,
-                fp32(gate_up.weight_scale_inv, gate_up.weight),
-                down.weight,
-                fp32(down.weight_scale_inv, down.weight),
-            )
-            grouped = GroupedExperts(*args, shared=shared)
-            grouped.prepare([m for m in tokens if m > PER_ROUTE_MAX_TOKENS], logits_dtype)
+            grouped = None
+            if any(m > PER_ROUTE_MAX_TOKENS for m in tokens):
+                gate_up, down = se.gate_up_proj, se.down_proj
+                shared = shared_weights(
+                    gate_up.weight,
+                    _fp32_scales(gate_up.weight_scale_inv, gate_up.weight),
+                    down.weight,
+                    _fp32_scales(down.weight_scale_inv, down.weight),
+                )
+                grouped = GroupedExperts(*args, shared=shared)
+                grouped.prepare(
+                    [m for m in tokens if m > PER_ROUTE_MAX_TOKENS], logits_dtype
+                )
             mega[layer.layer_idx] = (per_route, grouped)
             self.shared[layer.layer_idx] = SharedExpert(
                 se.gate_up_proj.weight,
@@ -162,7 +174,7 @@ class LayerStages:
                 is_deep_gemm_e8m0_used(),
             )
             self.shared[layer.layer_idx].prepare(
-                [m for m in tokens if m <= PER_ROUTE_MAX_TOKENS]
+                [m for m in tokens if m <= SHARED_MAX_TOKENS]
             )
             device = routed.w13_weight.device
         if mega:
@@ -189,7 +201,10 @@ class LayerStages:
             main = torch.cuda.current_stream()
             self.shared_stream.wait_stream(main)
             with torch.cuda.stream(self.shared_stream):
-                shared = self.shared[layer.layer_idx](x)
+                if x.shape[0] <= SHARED_MAX_TOKENS:
+                    shared = self.shared[layer.layer_idx](x)
+                else:
+                    shared = moe.shared_experts(x)
             logits, _ = moe.experts.gate(x)
             rows, ids, weights = per_route(x, logits, bias)
             main.wait_stream(self.shared_stream)

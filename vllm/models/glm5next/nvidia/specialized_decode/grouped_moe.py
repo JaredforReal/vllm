@@ -212,8 +212,23 @@ class _GroupedKernel:
         shared_out: cute.Tensor, st: cuda.CUstream,
     ):  # fmt: skip
         self.kernel(
-            maps, w13_scale, w2_scale, x, logits, bias, rows1, rows2, out, ids,
-            weights, partial, hidden, hscale, counters, shared_scale1, shared_scale2,
+            maps,
+            w13_scale,
+            w2_scale,
+            x,
+            logits,
+            bias,
+            rows1,
+            rows2,
+            out,
+            ids,
+            weights,
+            partial,
+            hidden,
+            hscale,
+            counters,
+            shared_scale1,
+            shared_scale2,
             shared_out,
         ).launch(  # fmt: skip
             grid=(self.grid, 1, 1),
@@ -576,7 +591,9 @@ class _GroupedKernel:
                 inverse = div_rn(Float32(1.0), x_scale)
                 target = base + (kb * B_BYTES + row * TILE + (c ^ (row % 8)) * 16) // 4
                 for v in cutlass.range_constexpr(4):
-                    word = pack_fp8(tuple(values[4 * v + u] * inverse for u in range(4)))
+                    word = pack_fp8(
+                        tuple(values[4 * v + u] * inverse for u in range(4))
+                    )
                     cute.arch.store((target + v).llvm_ptr, word)
                 if live and c == 0:
                     xscale[token * self.nk1 + chunk * self.blocks1 + kb] = x_scale
@@ -599,7 +616,10 @@ class _GroupedKernel:
                 words = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
                 if j >= 0 and j < w and j < count:
                     words = _load_l2_words(
-                        hidden.iterator + (slot * w + j) * self.inter + kb * TILE + c * 16
+                        hidden.iterator
+                        + (slot * w + j) * self.inter
+                        + kb * TILE
+                        + c * 16
                     )
                 target = base + (kb * B_BYTES + row * TILE + (c ^ (row % 8)) * 16) // 4
                 for v in cutlass.range_constexpr(4):
@@ -609,7 +629,8 @@ class _GroupedKernel:
         if lane == 0:
             cute.arch.mbarrier_arrive(
                 cute.recast_ptr(sm.iterator + self.off_bar, dtype=Uint64)
-                + 2 * self.stages + buffer
+                + 2 * self.stages
+                + buffer
             )
 
     @cute.jit
@@ -643,14 +664,16 @@ class _GroupedKernel:
         for kb in cutlass.range_constexpr(self.blocks1):
             ws = Float32(0.0)
             if is_shared:
-                ws = cute.arch.load((shared_scale1.iterator + first + kb).llvm_ptr, Float32)
+                ws = cute.arch.load(
+                    (shared_scale1.iterator + first + kb).llvm_ptr, Float32
+                )
             else:
                 ws = cute.arch.load((w13_scale.iterator + first + kb).llvm_ptr, Float32)
             for j in cutlass.range_constexpr(w):
                 token = route_of[slot * w + cutlass.min(j, count - 1)] // self.top_k
-                scales[kb * w + j] = ws * xscale[
-                    token * self.nk1 + chunk * self.blocks1 + kb
-                ]
+                scales[kb * w + j] = (
+                    ws * xscale[token * self.nk1 + chunk * self.blocks1 + kb]
+                )
         total = self.sums(d, self.blocks1, self.accs1, scales)
         fence_tmem(before=True)
         cute.arch.sync_warp()
@@ -717,9 +740,14 @@ class _GroupedKernel:
                     cute.arch.fmax(amax_buf[2 * w + j], amax_buf[3 * w + j]),
                 )
                 scale = cute.arch.fmax(amax, Float32(1e-10)) / Float32(FP8_MAX)
-                byte = pack_fp8((act[j] / scale, Float32(0.0), Float32(0.0), Float32(0.0)))
+                byte = pack_fp8(
+                    (act[j] / scale, Float32(0.0), Float32(0.0), Float32(0.0))
+                )
                 _store_u8(
-                    hidden.iterator + (slot * w + j) * self.inter + pair * TILE + logical,
+                    hidden.iterator
+                    + (slot * w + j) * self.inter
+                    + pair * TILE
+                    + logical,
                     byte & Uint32(0xFF),
                 )
                 if e == 0:
@@ -744,7 +772,9 @@ class _GroupedKernel:
         for kb in cutlass.range_constexpr(self.nk2):
             ws = Float32(0.0)
             if is_shared:
-                ws = cute.arch.load((shared_scale2.iterator + first + kb).llvm_ptr, Float32)
+                ws = cute.arch.load(
+                    (shared_scale2.iterator + first + kb).llvm_ptr, Float32
+                )
             else:
                 ws = cute.arch.load((w2_scale.iterator + first + kb).llvm_ptr, Float32)
             for j in cutlass.range_constexpr(w):
@@ -816,12 +846,14 @@ class GroupedExperts:
             _workspaces[key] = (
                 torch.empty(
                     slots * kernel.tiles1 * kernel.chunks * w * TILE,
-                    dtype=torch.float32, device=device,
+                    dtype=torch.float32,
+                    device=device,
                 ),  # fmt: skip
                 torch.empty(slots * w * self.inter, dtype=torch.uint8, device=device),
                 torch.empty(slots * w * kernel.nk2, dtype=torch.float32, device=device),
-                torch.zeros(slots * (kernel.pairs + 1) + 1, dtype=torch.int32,
-                            device=device),  # fmt: skip
+                torch.zeros(
+                    slots * (kernel.pairs + 1) + 1, dtype=torch.int32, device=device
+                ),  # fmt: skip
             )
         return _workspaces[key]
 

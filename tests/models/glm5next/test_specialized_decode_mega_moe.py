@@ -130,9 +130,7 @@ def test_mega_moe_matches_reference(grouped, tokens, ue8m0):
     torch.testing.assert_close(out.float(), ref, atol=5e-3 * ref.abs().max(), rtol=0)
     if grouped:
         se31, se31_s = swap_w13_to_w31(se13), swap_w13_to_w31(se13_s)
-        ref = torch.stack(
-            [expert(se31, se31_s, se2, se2_s, t) for t in range(tokens)]
-        )
+        ref = torch.stack([expert(se31, se31_s, se2, se2_s, t) for t in range(tokens)])
         torch.testing.assert_close(
             shared_out.float(), ref, atol=5e-3 * ref.abs().max(), rtol=0
         )
