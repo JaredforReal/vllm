@@ -178,6 +178,8 @@ class SpecializedDecode:
         )
 
     def _build_mega(self) -> dict[int, Any]:
+        from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
         from ..mega_moe import MegaExperts
 
         tokens = [b for b in self.batches if b <= MEGA_MAX_TOKENS]
@@ -201,8 +203,10 @@ class SpecializedDecode:
                 routed.w2_weight_scale_inv,
                 self.backbone.config.num_experts_per_tok,
                 self.backbone.config.swiglu_limit,
+                layer.mlp.routed_scaling_factor,
+                is_deep_gemm_e8m0_used(),
             )
-            experts.prepare(tokens)
+            experts.prepare(tokens, layer.mlp.gate.out_dtype or torch.bfloat16)
             mega[layer.layer_idx] = experts
             device = routed.w13_weight.device
         if mega:
@@ -217,11 +221,6 @@ class SpecializedDecode:
     def _mega_moe(self, layer, x):
         """Routed experts as one kernel, left unfinalized for the boundary."""
         from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
-        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-            per_token_group_quant_fp8,
-        )
-
-        from ..routing import route
 
         moe = layer.mlp
         main = torch.cuda.current_stream()
@@ -229,14 +228,9 @@ class SpecializedDecode:
         with torch.cuda.stream(self.shared_stream):
             shared = moe.shared_experts(x)
         logits, _ = moe.experts.gate(x)
-        ids, weights = route(
-            logits,
-            moe.gate.e_score_correction_bias,
-            self.backbone.config.num_experts_per_tok,
-            moe.routed_scaling_factor,
+        rows, ids, weights = self.mega[layer.layer_idx](
+            x, logits, moe.gate.e_score_correction_bias
         )
-        x_q, x_scale = per_token_group_quant_fp8(x, 128)
-        rows = self.mega[layer.layer_idx](x_q, x_scale, ids)
         main.wait_stream(self.shared_stream)
         m, top_k = ids.shape
         routed = UnfinalizedMoEOutput(
