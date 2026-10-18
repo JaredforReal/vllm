@@ -63,6 +63,44 @@ def _exponent(x: Float32):
     return exponent
 
 
+@cute.jit
+def hadamard_quant(got, lane):
+    """One query head, a warp's four values per lane (two BF16x2 words), as
+    ``fwht128_quant_fp8``: (the lane's FP8x4 word, the head's power-of-two scale).
+    """
+    x = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
+    for i in cutlass.range_constexpr(2):
+        x[2 * i], x[2 * i + 1] = unpack_bf16(got[i])
+    # Strides 1 and 2 inside the lane: (a, b) -> (a + b, a - b).
+    for stride in (1, 2):
+        for i in cutlass.range_constexpr(4):
+            if cutlass.const_expr(i % (2 * stride) < stride):
+                a, b = x[i], x[i + stride]
+                x[i], x[i + stride] = a + b, a - b
+    # Strides 4..64 pair lanes l and l ^ (stride / 4); the lower lane holds a.
+    for shift in cutlass.range_constexpr(5):
+        upper = (lane >> shift) & 1
+        for i in cutlass.range_constexpr(4):
+            other = cute.arch.shuffle_sync_bfly(x[i], offset=1 << shift)
+            if upper == 1:
+                x[i] = other - x[i]
+            else:
+                x[i] = x[i] + other
+    amax = Float32(0.0)
+    for i in cutlass.range_constexpr(4):
+        x[i] = _round_bf16(x[i] * Float32(INV_SQRT_DIM))
+        amax = cute.arch.fmax(amax, cute.arch.fmax(x[i], -x[i]))
+    amax = cute.arch.fmax(warp_max_abs(amax), Float32(1e-4))
+    exponent = _exponent(amax * Float32(1.0 / 448.0))
+    q_scale = bits_float(Uint32(exponent + 127) << 23)
+    inverse = bits_float(Uint32(127 - exponent) << 23)
+    y = [
+        cute.arch.fmax(cute.arch.fmin(x[i] * inverse, Float32(448.0)), Float32(-448.0))
+        for i in range(4)
+    ]
+    return Int32(pack_fp8(tuple(y))), q_scale
+
+
 class _QueryKernel:
     def __init__(self, heads: int, padded: int):
         assert heads % WARPS == 0 and padded >= heads
@@ -113,44 +151,13 @@ class _QueryKernel:
 
     @cute.jit
     def head(self, q, weights, q_out, w_out, scale, t, head, lane):
-        x = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
         got = load_words(
             q.iterator + (t * self.heads + head) * DIM + lane * 4,
             count=2, word_type="u32", mutable=True,
         )  # fmt: skip
         weight = weights[t, head]  # issued beside the query load
-        for i in cutlass.range_constexpr(2):
-            x[2 * i], x[2 * i + 1] = unpack_bf16(got[i])
-        # Strides 1 and 2 inside the lane: (a, b) -> (a + b, a - b).
-        for stride in (1, 2):
-            for i in cutlass.range_constexpr(4):
-                if cutlass.const_expr(i % (2 * stride) < stride):
-                    a, b = x[i], x[i + stride]
-                    x[i], x[i + stride] = a + b, a - b
-        # Strides 4..64 pair lanes l and l ^ (stride / 4); the lower lane holds a.
-        for shift in cutlass.range_constexpr(5):
-            upper = (lane >> shift) & 1
-            for i in cutlass.range_constexpr(4):
-                other = cute.arch.shuffle_sync_bfly(x[i], offset=1 << shift)
-                if upper == 1:
-                    x[i] = other - x[i]
-                else:
-                    x[i] = x[i] + other
-        amax = Float32(0.0)
-        for i in cutlass.range_constexpr(4):
-            x[i] = _round_bf16(x[i] * Float32(INV_SQRT_DIM))
-            amax = cute.arch.fmax(amax, cute.arch.fmax(x[i], -x[i]))
-        amax = cute.arch.fmax(warp_max_abs(amax), Float32(1e-4))
-        exponent = _exponent(amax * Float32(1.0 / 448.0))
-        q_scale = bits_float(Uint32(exponent + 127) << 23)
-        inverse = bits_float(Uint32(127 - exponent) << 23)
-        y = [
-            cute.arch.fmax(
-                cute.arch.fmin(x[i] * inverse, Float32(448.0)), Float32(-448.0)
-            )
-            for i in range(4)
-        ]
-        q_out[t, head, lane] = Int32(pack_fp8(tuple(y)))
+        word, q_scale = hadamard_quant(got, lane)
+        q_out[t, head, lane] = word
         if lane == 0:
             w_out[t, head] = weight * q_scale * scale
 

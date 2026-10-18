@@ -82,3 +82,47 @@ def test_query_epilogue_matches_unfused(tokens, heads):
     assert not weights[:, heads:].any()
     ref_key = F.layer_norm(k.float(), (DIM,), norm.weight, norm.bias, norm.eps)
     torch.testing.assert_close(key, ref_key.bfloat16(), atol=2**-7, rtol=2**-7)
+
+
+@pytest.mark.parametrize("tokens", [1, 5, 16])
+@pytest.mark.parametrize("heads", [16, 32])
+def test_fused_query_matches_pair(tokens, heads):
+    """The projection kernel with the query epilogue inside writes what the
+    projection and ``indexer_query`` write; repeated calls advance its grid
+    barrier."""
+    from vllm.models.glm5next.nvidia.specialized_decode.indexer import (
+        IndexerProjection,
+    )
+    from vllm.models.glm5next.nvidia.specialized_decode.indexer_query import (
+        indexer_query,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(tokens)
+    wk = (
+        torch.randn(KEY + heads, HIDDEN, generator=g, device="cuda") * 0.02
+    ).bfloat16()
+    gate = (torch.randn(GATE, HIDDEN, generator=g, device="cuda") * 0.02).bfloat16()
+    projection = IndexerProjection(
+        SimpleNamespace(
+            head_dim=KEY,
+            n_head=heads,
+            index_kpool_compress_gate=SimpleNamespace(data=gate),
+            wk_weights_proj=SimpleNamespace(weight=SimpleNamespace(data=wk)),
+        )
+    )
+    norm = SimpleNamespace(
+        weight=1 + 0.1 * torch.randn(DIM, generator=g, device="cuda"),
+        bias=0.1 * torch.randn(DIM, generator=g, device="cuda"),
+        eps=1e-6,
+    )
+    scale = DIM**-0.5 * heads**-0.5
+    for _ in range(3):
+        x = torch.randn(tokens, HIDDEN, generator=g, device="cuda").bfloat16()
+        q = torch.randn(tokens, heads * DIM, generator=g, device="cuda").bfloat16()
+        k, w, gate_score = projection(x)
+        ref_q, ref_w, ref_key = indexer_query(q, k, w, norm, scale, 32)
+        q_fp8, weights, key, fused_gate = projection.fused(x, q, norm, scale, 32)
+        assert torch.equal(q_fp8.view(torch.uint8), ref_q.view(torch.uint8))
+        assert torch.equal(weights, ref_w)
+        assert torch.equal(fused_gate, gate_score)
+        torch.testing.assert_close(key, ref_key, atol=2**-7, rtol=2**-7)
