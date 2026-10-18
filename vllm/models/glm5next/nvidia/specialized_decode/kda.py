@@ -25,18 +25,21 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda.prepared import (
     executable,
 )
 
+from .gemm import Projection
+
 HEAD_DIM = 128
 
 
 class KdaStage:
     def __init__(self, attention, batches, q, gemm=False):
         self.attention = a = attention
-        self.in_proj = self.o_proj = None
+        # Skinny (in_proj, o_proj) GEMMs.
+        self.projections: tuple[Projection, Projection] | None = None
         if gemm:
-            from .gemm import Projection
-
-            self.in_proj = Projection(a.in_proj_qkvbfg_a.weight)
-            self.o_proj = Projection(a.o_proj.weight)
+            self.projections = (
+                Projection(a.in_proj_qkvbfg_a.weight),
+                Projection(a.o_proj.weight),
+            )
         self.heads = a.local_num_heads
         self.dim = self.heads * HEAD_DIM
         conv = torch.cat(
@@ -95,10 +98,13 @@ class KdaStage:
                 tokens,
             )
 
-    def run(self, x, metadata, q):
+    def run(self, x, metadata, q, reduce=True):
+        """The attention output, TP-reduced unless ``reduce`` is False."""
         a = self.attention
-        skinny = self.in_proj is not None and self.in_proj.supports(x.shape[0])
-        projected = self.in_proj(x) if skinny else a.in_proj_qkvbfg_a(x)[0]
+        skinny = self.projections
+        if skinny is not None and not skinny[0].supports(x.shape[0]):
+            skinny = None
+        projected = skinny[0](x) if skinny is not None else a.in_proj_qkvbfg_a(x)[0]
         d, h = self.dim, self.heads
         g_a = projected[:, 3 * d + h + HEAD_DIM : 3 * d + h + 2 * HEAD_DIM]
         gate = a.g_b_proj(g_a)[0]
@@ -116,6 +122,10 @@ class KdaStage:
         tensors = self._operands(a.kv_cache, projected, gate, slots, out, accepted)
         views = tuple(to_cute(t, 16) for t in tensors)
         self.kernels[key](*views[:13], *self.scalars, *views[13:], stream(self.device))
-        if skinny:
-            return tensor_model_parallel_all_reduce(self.o_proj(out))
-        return a.o_proj(out)[0]
+        if skinny is not None:
+            partial = skinny[1](out)
+        elif reduce:
+            return a.o_proj(out)[0]
+        else:
+            partial = a.o_proj.quant_method.apply(a.o_proj, out)
+        return tensor_model_parallel_all_reduce(partial) if reduce else partial

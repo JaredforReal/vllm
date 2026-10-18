@@ -3,11 +3,13 @@
 """The specialized decode executor over the stock GLM-5.3-Flash backbone: one
 routing decision per step, then every layer's stages in one loop."""
 
-from typing import Any, NamedTuple
+from contextlib import contextmanager, nullcontext
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
 from vllm.config import CUDAGraphMode
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mhc import hc_contract, hc_expand
@@ -15,13 +17,35 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 from ..linear import planned_step
 
+if TYPE_CHECKING:
+    from ..all_reduce_mhc import AllReduceMhcBoundary
+
 logger = init_logger(__name__)
 
 # Token counts (requests x tokens per request) with a planned decode path.
 MAX_TOKENS = 64
+# Token counts the fused all-reduce + mHC boundary serves.
+AR_MHC_MAX_TOKENS = 16
 # BF16 projections of the DSA layer and its indexer that dsa_gemm routes.
 DSA_PROJECTIONS = ("fused_qkv_a_proj", "q_b_proj", "o_proj")
 INDEXER_PROJECTIONS = ("wq_b", "wk_weights_proj")
+
+
+def _override(obj, name: str, value, enabled: bool):
+    """Sets ``obj.name`` to ``value`` for one call if ``enabled``."""
+    if not enabled:
+        return nullcontext()
+    return _swap(obj, name, value)
+
+
+@contextmanager
+def _swap(obj, name: str, value):
+    old = getattr(obj, name)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        setattr(obj, name, old)
 
 
 class Step(NamedTuple):
@@ -93,6 +117,9 @@ class SpecializedDecode:
                         self.routed.append(m.prefix)
             logger.info("Specialized decode routes %d DSA GEMMs", len(self.routed))
         self.mhc = None
+        self.ar_mhc: AllReduceMhcBoundary | None = None
+        if "ar_mhc" in config.stages:
+            self.ar_mhc = self._build_ar_mhc()
         if "mhc" in config.stages:
             from ..mhc import MAX_TOKENS as MHC_MAX_TOKENS
             from ..mhc import MhcBoundary
@@ -100,12 +127,41 @@ class SpecializedDecode:
             first = self.layers[0]
             self.mhc = MhcBoundary(first, first.hidden_size, first.hc_attn_fn.device)
             self.mhc_max_tokens = MHC_MAX_TOKENS
+        if self.mhc is not None or self.ar_mhc is not None:
             # hc_fn is BF16 in the checkpoint, so the BF16 copy is exact.
             self.hc_fn = {
                 id(fn): fn.detach().bfloat16()
                 for layer in self.layers
                 for fn in (layer.hc_attn_fn, layer.hc_ffn_fn)
             }
+
+    def _build_ar_mhc(self):
+        from ..all_reduce_mhc import AllReduceMhcBoundary
+
+        first = self.layers[0]
+        norms = {
+            n.variance_epsilon
+            for layer in self.layers
+            for n in (layer.input_layernorm, layer.post_attention_layernorm)
+        }
+        if len(norms) != 1:
+            logger.warning("Specialized decode: mixed norm eps, no fused boundary")
+            return None
+        return AllReduceMhcBoundary(
+            hidden_size=first.hidden_size,
+            max_num_tokens=AR_MHC_MAX_TOKENS,
+            rms_eps=first.rms_norm_eps,
+            hc_eps=first.hc_eps,
+            post_mult=first.mhc_post_mult_value,
+            sinkhorn_repeat=first.mhc_sinkhorn_iterations,
+            norm_eps=norms.pop(),
+            device=first.hc_attn_fn.device,
+        )
+
+    def partial(self, tokens: int) -> bool:
+        """Whether sublayers leave their output TP-partial for the fused
+        all-reduce + mHC boundary."""
+        return self.ar_mhc is not None and self.ar_mhc.supports(tokens)
 
     def boundary(self, layer, x, residual, post, comb, fn, scale, base, norm):
         """The previous sublayer's mHC post, then the next one's pre and norm."""
@@ -131,6 +187,20 @@ class SpecializedDecode:
             base,
             norm_weight=norm.weight.data,
             norm_eps=norm.variance_epsilon,
+        )
+
+    def reduced_boundary(self, layer, x, residual, post, comb, fn, scale, base, norm):
+        """``boundary`` of a TP-partial sublayer output."""
+        assert self.ar_mhc is not None
+        return self.ar_mhc(
+            x,
+            residual.contiguous(),
+            post.contiguous(),
+            comb.contiguous(),
+            self.hc_fn[id(fn)],
+            scale,
+            base,
+            norm.weight.data,
         )
 
     def prepare_kv(self) -> None:
@@ -205,14 +275,30 @@ class SpecializedDecode:
         return Step(q, positions, by_layer)
 
     def attention(self, layer, x, step: Step):
+        """The attention output and whether it is still TP-partial."""
+        partial = self.partial(x.shape[0])
         stage = self.kda.get(layer.layer_idx)
         if stage is not None:
             md = step.metadata[layer.self_attn.prefix]
-            return stage.run(x, md, step.q)
-        return layer.self_attn(hidden_states=x, positions=step.positions)
+            return stage.run(x, md, step.q, reduce=not partial), partial
+        o_proj = layer.self_attn.o_proj
+        with _override(o_proj, "reduce_results", False, partial):
+            return layer.self_attn(hidden_states=x, positions=step.positions), partial
 
-    def layer(self, layer, x, residual, post, comb, step: Step):
-        """``Glm5NextDecoderLayer.forward`` for a decode step (mHC, no SP)."""
+    def mlp(self, layer, x):
+        """The FFN output and whether it is still TP-partial."""
+        partial = self.partial(x.shape[0])
+        if layer._mlp_is_moe:
+            config = layer.mlp.experts.moe_config
+            unreduced = _override(config, "skip_final_all_reduce", True, partial)
+        else:
+            unreduced = _override(layer.mlp.down_proj, "reduce_results", False, partial)
+        with unreduced:
+            return layer.mlp(x), partial
+
+    def layer(self, layer, x, partial, residual, post, comb, step: Step):
+        """``Glm5NextDecoderLayer.forward`` for a decode step (mHC, no SP).
+        ``partial``: whether ``x`` still needs its TP all-reduce."""
         if post is None:
             if layer.layer_idx == 0:
                 x = hc_expand(x, layer.n)
@@ -226,7 +312,8 @@ class SpecializedDecode:
                 norm_eps=layer.input_layernorm.variance_epsilon,
             )
         else:
-            residual, post, comb, x = self.boundary(
+            boundary = self.reduced_boundary if partial else self.boundary
+            residual, post, comb, x = boundary(
                 layer,
                 x,
                 residual,
@@ -237,8 +324,9 @@ class SpecializedDecode:
                 layer.hc_attn_base,
                 layer.input_layernorm,
             )
-        x = self.attention(layer, x, step)
-        residual, post, comb, x = self.boundary(
+        x, partial = self.attention(layer, x, step)
+        boundary = self.reduced_boundary if partial else self.boundary
+        residual, post, comb, x = boundary(
             layer,
             x,
             residual,
@@ -249,11 +337,15 @@ class SpecializedDecode:
             layer.hc_ffn_base,
             layer.post_attention_layernorm,
         )
-        x = layer.mlp(x)
+        x, partial = self.mlp(layer, x)
         if layer.layer_idx == layer.num_hidden_layers - 1:
+            if partial:
+                x = tensor_model_parallel_all_reduce(x)
+            if self.ar_mhc is not None:
+                self.ar_mhc.join()
             x = layer.hc_post(x, residual, post, comb)
-            return hc_contract(x, layer.n), None, None, None
-        return x, residual, post, comb
+            return hc_contract(x, layer.n), False, None, None, None
+        return x, partial, residual, post, comb
 
     def run(self, step: Step, input_ids, inputs_embeds) -> torch.Tensor:
         """Normalized hidden states of a planned step."""
@@ -261,10 +353,8 @@ class SpecializedDecode:
         x = inputs_embeds
         if x is None:
             x = backbone.embed_input_ids(input_ids)
-        residual = post = comb = None
+        state = (False, None, None, None)
         with planned_step():
             for layer in self.layers:
-                x, residual, post, comb = self.layer(
-                    layer, x, residual, post, comb, step
-                )
+                x, *state = self.layer(layer, x, *state, step)
         return backbone.norm(x)
