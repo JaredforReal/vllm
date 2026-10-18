@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("tokens", [1, 3, 16])
+@pytest.mark.parametrize("tokens", [1, 3, 16, 40])
 @pytest.mark.parametrize("heads", [16, 32])
 def test_projection_matches_linear(tokens, heads):
     from vllm.models.glm5next.nvidia.specialized_decode.indexer import (
