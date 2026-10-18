@@ -60,6 +60,7 @@ def test_shared_expert_matches_reference(tokens, ue8m0):
         w13, _packed(e13, 2 * INTER), w2, _packed(e2, HIDDEN), LIMIT, ue8m0
     )
     x = torch.randn(tokens, HIDDEN, generator=g, device="cuda").bfloat16()
+    x[:, :128] = 0  # an all-zero group takes the 1e-10 amax floor
     out = shared(x)
 
     def dequant(w, e):
