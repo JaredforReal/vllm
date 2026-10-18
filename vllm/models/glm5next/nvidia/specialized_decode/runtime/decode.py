@@ -30,6 +30,9 @@ MAX_TOKENS = 64
 AR_MHC_MAX_TOKENS = 32
 # Token counts the mega MoE kernel serves (it streams each route's experts).
 MEGA_MAX_TOKENS = 2
+# Two tokens take two waves of the mega kernel's clusters, which the shared
+# expert GEMVs then slow down: DeepGEMM's shared expert stays there.
+SHARED_MAX_TOKENS = 1
 # BF16 projections of the DSA layer and its indexer that dsa_gemm routes.
 DSA_PROJECTIONS = ("fused_qkv_a_proj", "q_b_proj", "o_proj")
 INDEXER_PROJECTIONS = ("wq_b", "wk_weights_proj")
@@ -181,9 +184,11 @@ class SpecializedDecode:
         from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 
         from ..mega_moe import MegaExperts
+        from ..shared_expert import SharedExpert
 
         tokens = [b for b in self.batches if b <= MEGA_MAX_TOKENS]
         mega: dict[int, Any] = {}
+        self.shared: dict[int, Any] = {}
         config = self.backbone.config
         if (
             config.scoring_func != "sigmoid"
@@ -208,6 +213,18 @@ class SpecializedDecode:
             )
             experts.prepare(tokens, layer.mlp.gate.out_dtype or torch.bfloat16)
             mega[layer.layer_idx] = experts
+            se = layer.mlp.shared_experts
+            self.shared[layer.layer_idx] = SharedExpert(
+                se.gate_up_proj.weight,
+                se.gate_up_proj.weight_scale_inv,
+                se.down_proj.weight,
+                se.down_proj.weight_scale_inv,
+                self.backbone.config.swiglu_limit,
+                is_deep_gemm_e8m0_used(),
+            )
+            self.shared[layer.layer_idx].prepare(
+                [m for m in tokens if m <= SHARED_MAX_TOKENS]
+            )
             device = routed.w13_weight.device
         if mega:
             top_k = self.backbone.config.num_experts_per_tok
@@ -226,7 +243,10 @@ class SpecializedDecode:
         main = torch.cuda.current_stream()
         self.shared_stream.wait_stream(main)
         with torch.cuda.stream(self.shared_stream):
-            shared = moe.shared_experts(x)
+            if x.shape[0] <= SHARED_MAX_TOKENS:
+                shared = self.shared[layer.layer_idx](x)
+            else:
+                shared = moe.shared_experts(x)
         logits, _ = moe.experts.gate(x)
         rows, ids, weights = self.mega[layer.layer_idx](
             x, logits, moe.gate.e_score_correction_bias
