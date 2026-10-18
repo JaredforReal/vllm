@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+from typing import Any
+
 import torch
 
 import vllm.envs as envs
@@ -52,6 +54,10 @@ if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops
 
 logger = init_logger(__name__)
+
+# The specialized decode's kpool stage (specialized_decode/kpool.py), when
+# installed: CuTe kernels for the decode kernels below inside planned steps.
+SPECIALIZED_KPOOL: Any = None
 
 
 # kpool write helper: form pools from the current token batch and compress them
@@ -263,7 +269,27 @@ def sparse_attn_indexer_kpool(
                 "mxfp8" if mqa_logits_use_mx_scales() else scale_fmt,
             )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    kpool_stage = SPECIALIZED_KPOOL
+    if kpool_stage is not None and not kpool_stage.active():
+        kpool_stage = None
+    # Uniform kpool decode rows can leave their expansion to the layer's index
+    # remap (the stage's fused kernel), which needs no -1 filled logical rows.
+    defer_topk = (
+        kpool_stage is not None
+        and has_decode
+        and not has_prefill
+        and index_kpool > 1
+        and positions is not None
+        and dcp_world_size == 1
+        and attn_metadata_narrowed.decode is not None
+        and not attn_metadata_narrowed.decode.requires_padding
+        and attn_metadata_narrowed.max_seq_len > topk_tokens
+        and kpool_stage.defers(
+            num_decode_tokens, topk_tokens, index_kpool, topk_indices_buffer.shape[1]
+        )
+    )
+    if not defer_topk:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -546,7 +572,11 @@ def sparse_attn_indexer_kpool(
                 # provided. Inputs are already grouped per request (uniform:
                 # view; non-uniform: _scatter_decode_tokens_by_request padded to
                 # [B, lmax]) — no per-token .contiguous() copies needed.
-                kpool_ops.kpool_decode_update_and_maybe_write_cache_batched(
+                (
+                    kpool_ops.kpool_decode_update_and_maybe_write_cache_batched
+                    if kpool_stage is None
+                    else kpool_stage.update
+                )(
                     kv_cache_raw,
                     tail_kv_cache,
                     dec_tail_slot,
@@ -614,7 +644,7 @@ def sparse_attn_indexer_kpool(
             padded_q_quant_cast, padded_q_scale, padded_weights[:num_padded_tokens]
         )
         # SM100 decode is varlen: one row and context length per token.
-        logits = as_fp32_logits(
+        logits = (as_fp32_logits if kpool_stage is None else kpool_stage.upcast)(
             fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
@@ -631,7 +661,11 @@ def sparse_attn_indexer_kpool(
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
         select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
-        if index_kpool > 1:
+        if defer_topk:
+            assert num_rows == num_decode_tokens
+            pool_topk = kpool_stage.pool_ids(num_rows, select_k)
+            topk_dst = pool_topk
+        elif index_kpool > 1:
             pool_topk = torch.empty(
                 (num_rows, select_k), dtype=torch.int32, device=logits.device
             )
@@ -666,7 +700,14 @@ def sparse_attn_indexer_kpool(
             if positions is not None and not decode_metadata.requires_padding:
                 # Uniform rows: the kernel takes seq_len = position + 1 and
                 # writes the expansion straight into the output buffer.
-                kpool_ops.expand_pools_and_append_tail(
+                if defer_topk:
+                    kpool_stage.defer(pool_topk, positions[:n], index_kpool)
+                    return topk_indices_buffer
+                (
+                    kpool_ops.expand_pools_and_append_tail
+                    if kpool_stage is None
+                    else kpool_stage.expand
+                )(
                     pool_topk,
                     positions[:n],
                     index_kpool,

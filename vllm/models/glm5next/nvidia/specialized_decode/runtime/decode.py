@@ -129,6 +129,19 @@ class SpecializedDecode:
             for layer in self.layers:
                 if layer.layer_kind == "mla":
                     IndexerStage(layer.self_attn.indexer)
+        if "dsa_kpool" in config.stages:
+            from vllm.models.glm5next.nvidia import sparse_indexer
+
+            from ..kpool import KpoolStage
+
+            attentions = [
+                layer.self_attn for layer in self.layers if layer.layer_kind == "mla"
+            ]
+            kpool = KpoolStage(attentions, MAX_TOKENS, self.layers[0].hc_attn_fn.device)
+            sparse_indexer.SPECIALIZED_KPOOL = kpool
+            logger.info(
+                "Specialized decode kpool kernels (fused index remap: %s)", kpool.fuse
+            )
         # MoE layers whose routed experts run as one mega kernel.
         self.mega: dict[int, Any] = {}
         if "mega_moe" in config.stages:
