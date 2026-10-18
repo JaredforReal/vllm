@@ -203,6 +203,8 @@ class SpecializedDecode:
         tokens = [b for b in self.batches if b <= MEGA_MAX_TOKENS]
         mega: dict[int, Any] = {}
         self.shared: dict[int, Any] = {}
+        if not tokens:  # MTP verify steps hold q >= 2 tokens per request
+            return mega
         config = self.backbone.config
         if (
             config.scoring_func != "sigmoid"
