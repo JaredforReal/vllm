@@ -51,7 +51,16 @@ def _route(logits, bias):
 
 @pytest.mark.parametrize(
     ("grouped", "tokens"),
-    [(False, 1), (False, 2), (True, 1), (True, 2), (True, 4), (True, 8), (True, 16)],
+    [
+        (False, 1),
+        (False, 2),
+        (False, 4),
+        (True, 1),
+        (True, 2),
+        (True, 4),
+        (True, 8),
+        (True, 16),
+    ],
 )
 @pytest.mark.parametrize("ue8m0", [False, True])
 def test_mega_moe_matches_reference(grouped, tokens, ue8m0):

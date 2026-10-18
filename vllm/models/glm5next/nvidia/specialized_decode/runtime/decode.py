@@ -28,16 +28,17 @@ logger = init_logger(__name__)
 MAX_TOKENS = 64
 # Token counts the fused all-reduce + mHC boundary serves.
 AR_MHC_MAX_TOKENS = 32
-# Token counts the MoE kernels serve: one 16-CTA cluster per route up to
-# PER_ROUTE_MAX_TOKENS (7 such clusters fit on GB300), the persistent
-# expert-grouped kernel above.
-PER_ROUTE_MAX_TOKENS = 2
-# Off until it beats TRTLLM-Gen: its per-task handoffs cost more than the
-# second cluster wave saves (29 vs 18 us at one token, 50 vs 28 at two).
+# Token counts the MoE kernels serve: one 16-CTA cluster per route (two CTAs
+# per SM) up to PER_ROUTE_MAX_TOKENS, where TRTLLM-Gen overtakes it (42 vs
+# 49 us at 4 tokens, 73 vs 66 at 8), and the persistent expert-grouped
+# kernel up to GROUPED_MAX_TOKENS.
+PER_ROUTE_MAX_TOKENS = 4
+# Off until it beats the per-route kernel: its per-task handoffs cost more
+# than the cluster waves they avoid (25 vs 13 us at one token).
 GROUPED_MAX_TOKENS = 0
 MEGA_MAX_TOKENS = max(PER_ROUTE_MAX_TOKENS, GROUPED_MAX_TOKENS)
-# Two tokens take two waves of the per-route clusters, which the shared expert
-# GEMVs then slow down: DeepGEMM's shared expert stays there.
+# Above one token the per-route clusters take more than one wave, which the
+# shared expert GEMVs then slow down: DeepGEMM's shared expert stays there.
 SHARED_MAX_TOKENS = 1
 # BF16 projections of the DSA layer and its indexer that dsa_gemm routes.
 DSA_PROJECTIONS = ("fused_qkv_a_proj", "q_b_proj", "o_proj")

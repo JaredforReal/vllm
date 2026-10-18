@@ -54,7 +54,9 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives imp
 CLUSTER = 16
 TILE = 128  # weight rows per MMA (UMMA M) and per K block
 COLUMNS = 16  # UMMA N: the route's token in column 0, the rest zero
-STAGES = 10
+# Few enough stages (~106 KB of shared memory) that two CTAs share an SM:
+# 16-CTA clusters are GPC-bound, and packing two per SM fits more at once.
+STAGES = 4
 FP8_MAX = 448.0
 STAGE_BYTES = TILE * TILE  # one K block of one row tile, FP8
 B_BYTES = COLUMNS * TILE  # one K block of the activation operand
@@ -159,6 +161,7 @@ class _MegaKernel:
             smem=self.smem + 1024,
             stream=stream,
             use_pdl=True,
+            min_blocks_per_mp=2,
         )
 
     @cute.kernel
