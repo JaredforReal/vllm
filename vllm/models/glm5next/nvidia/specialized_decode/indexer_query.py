@@ -7,8 +7,9 @@ kernels).
 
 One warp per query head, four values per lane: the Hadamard stages of strides 1
 and 2 stay in a lane, the others pair lanes ``l`` and ``l ^ (stride / 4)``. The
-butterflies, the rounding and the power-of-two scale (an accurate log2, as the
-stock kernel's) follow ``fwht128_quant_fp8`` bit for bit.
+butterflies, the rounding and the power-of-two scale (the stock kernel's
+accurate log2, read off the exponent bits where that is exact) follow
+``fwht128_quant_fp8`` bit for bit.
 """
 
 import cuda.bindings.driver as cuda
@@ -23,13 +24,17 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
 )
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import (
     asm,
+    bf16x2,
     bits_float,
+    float_bits,
     load_words,
     pack_fp8,
+    store_words,
     unpack_bf16,
+    warp_max_abs,
+    warp_sum,
 )
 
-from .mega_moe import _store_bf16
 from .shared_expert import _round_bf16
 
 DIM = 128
@@ -40,6 +45,22 @@ INV_SQRT_DIM = 0.08838834764831845  # 1 / sqrt(128), exact in FP32
 @asm(Float32, pure=True)
 def _ceil(value):
     return "cvt.rpi.ftz.f32.f32 $0, $1;", "=f,f", (value,)
+
+
+@cute.jit
+def _exponent(x: Float32):
+    """``ceil(log2(x))`` with the stock kernel's accurate log2, for positive x.
+
+    From the bits unless the mantissa is barely above a power of two (where the
+    rounded log2 can land on the exponent itself) or x is not normal.
+    """
+    bits = Int32(float_bits(x))
+    biased = (bits >> 23) & 255
+    mantissa = bits & 0x7FFFFF
+    exponent = biased - 127 + Int32(mantissa != 0)
+    if (mantissa != 0 and mantissa < 4096) or biased == 0 or biased == 255:
+        exponent = Int32(_ceil(cute.math.log2(x, fastmath=False)))
+    return exponent
 
 
 class _QueryKernel:
@@ -97,6 +118,7 @@ class _QueryKernel:
             q.iterator + (t * self.heads + head) * DIM + lane * 4,
             count=2, word_type="u32", mutable=True,
         )  # fmt: skip
+        weight = weights[t, head]  # issued beside the query load
         for i in cutlass.range_constexpr(2):
             x[2 * i], x[2 * i + 1] = unpack_bf16(got[i])
         # Strides 1 and 2 inside the lane: (a, b) -> (a + b, a - b).
@@ -118,14 +140,10 @@ class _QueryKernel:
         for i in cutlass.range_constexpr(4):
             x[i] = _round_bf16(x[i] * Float32(INV_SQRT_DIM))
             amax = cute.arch.fmax(amax, cute.arch.fmax(x[i], -x[i]))
-        for shift in cutlass.range_constexpr(5):
-            amax = cute.arch.fmax(
-                amax, cute.arch.shuffle_sync_bfly(amax, offset=1 << shift)
-            )
-        amax = cute.arch.fmax(amax, Float32(1e-4))
-        exponent = _ceil(cute.math.log2(amax * Float32(1.0 / 448.0), fastmath=False))
-        q_scale = bits_float(Uint32(Int32(exponent) + 127) << 23)
-        inverse = bits_float(Uint32(127 - Int32(exponent)) << 23)
+        amax = cute.arch.fmax(warp_max_abs(amax), Float32(1e-4))
+        exponent = _exponent(amax * Float32(1.0 / 448.0))
+        q_scale = bits_float(Uint32(exponent + 127) << 23)
+        inverse = bits_float(Uint32(127 - exponent) << 23)
         y = [
             cute.arch.fmax(
                 cute.arch.fmin(x[i] * inverse, Float32(448.0)), Float32(-448.0)
@@ -134,7 +152,7 @@ class _QueryKernel:
         ]
         q_out[t, head, lane] = Int32(pack_fp8(tuple(y)))
         if lane == 0:
-            w_out[t, head] = weights[t, head] * q_scale * scale
+            w_out[t, head] = weight * q_scale * scale
 
     @cute.jit
     def key(self, k, k_out, gamma, beta, eps, t, lane):
@@ -144,22 +162,18 @@ class _QueryKernel:
         )
         for i in cutlass.range_constexpr(2):
             values[2 * i], values[2 * i + 1] = unpack_bf16(got[i])
-        total = values[0] + values[1] + values[2] + values[3]
-        for shift in cutlass.range_constexpr(5):
-            total = total + cute.arch.shuffle_sync_bfly(total, offset=1 << shift)
-        mean = total / Float32(DIM)
+        mean = warp_sum(values[0] + values[1] + values[2] + values[3]) / Float32(DIM)
         squares = Float32(0.0)
         for i in cutlass.range_constexpr(4):
             values[i] = values[i] - mean
             squares = squares + values[i] * values[i]
-        for shift in cutlass.range_constexpr(5):
-            squares = squares + cute.arch.shuffle_sync_bfly(squares, offset=1 << shift)
-        inv = cute.math.rsqrt(squares / Float32(DIM) + eps)
+        inv = cute.math.rsqrt(warp_sum(squares) / Float32(DIM) + eps)
         for i in cutlass.range_constexpr(4):
-            _store_bf16(
-                k_out.iterator + t * DIM + lane * 4 + i,
-                values[i] * inv * gamma[i] + beta[i],
-            )
+            values[i] = values[i] * inv * gamma[i] + beta[i]
+        store_words(
+            k_out.iterator + t * DIM + lane * 4,
+            (bf16x2(values[0], values[1]), bf16x2(values[2], values[3])),
+        )
 
 
 _compiled: dict = {}
