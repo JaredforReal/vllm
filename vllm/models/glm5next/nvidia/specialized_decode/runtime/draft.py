@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The specialized decode of the MTP draft layer: the main model's stages on the
-draft's FULL-graph steps.
+draft's FULL-graph steps, and a vocab-parallel argmax for greedy drafts.
 
 The MTP layer has no mHC streams, so its boundaries are a fused all-reduce,
 residual add and RMSNorm (``AllReduceNorm``) where the main model fuses the
@@ -31,12 +31,15 @@ from .decode import (
 
 logger = init_logger(__name__)
 
+# Draft rows whose greedy token the vocab-parallel argmax serves.
+ARGMAX_MAX_TOKENS = 64
+
 
 class SpecializedDraft(LayerStages):
     """Built on the first eager draft forward (the weights are processed by
     then). Reads the MTP layers, never modifies them."""
 
-    def __init__(self, predictor, config):
+    def __init__(self, predictor, config, greedy: bool):
         self.config = config
         self.q = config.q
         self.mtp_layers = list(predictor._mtp_layers)
@@ -75,6 +78,7 @@ class SpecializedDraft(LayerStages):
             self.ar_norm = self._build_ar_norm()
             if self.ar_norm is not None:
                 self.deferred = self._defer_moe_finalize()
+        self.argmax = self._build_argmax() if greedy else None
 
     def _build_ar_norm(self):
         from ..all_reduce_norm import AllReduceNorm
@@ -93,6 +97,27 @@ class SpecializedDraft(LayerStages):
             top_k=self.text_config.num_experts_per_tok,
             eps=norms.pop(),
             device=self.mtp_layers[0].eh_proj.weight.device,
+        )
+
+    def _build_argmax(self):
+        from ..draft_argmax import DraftArgmax
+
+        heads = [mtp.shared_head.head for mtp in self.mtp_layers]
+        head = heads[0]
+        weight = head.weight
+        shard = head.shard_indices
+        if weight.dtype != torch.bfloat16 or any(
+            h.weight.shape != weight.shape for h in heads
+        ):
+            logger.warning("Specialized draft: unsupported LM head, stock argmax")
+            return None
+        columns = weight.shape[0]
+        return DraftArgmax(
+            columns=columns,
+            valid=columns - shard.num_org_vocab_padding,
+            offset=shard.org_vocab_start_index,
+            capacity=ARGMAX_MAX_TOKENS,
+            device=weight.device,
         )
 
     def partial(self, tokens: int) -> bool:
@@ -159,3 +184,14 @@ class SpecializedDraft(LayerStages):
             x, partial = self.mlp(layer, x)
             x, _ = self.reduced_norm(x, partial, residual, mtp.shared_head.norm)
         return x, x
+
+    def top_tokens(self, head, logits_processor, hidden_states):
+        """Greedy draft tokens, or None for the stock vocab-parallel argmax."""
+        if self.argmax is None or not self.argmax.supports(hidden_states.shape[0]):
+            return None
+        if logits_processor.soft_cap is not None or logits_processor.scale != 1.0:
+            return None
+        logits = logits_processor._apply_head(head, hidden_states, None)
+        if logits.dtype != torch.bfloat16:
+            return None
+        return self.argmax(logits.contiguous())
