@@ -49,14 +49,21 @@ def _route(logits, bias):
     return ids, weights / weights.sum(-1, keepdim=True) * SCALE
 
 
+@pytest.mark.parametrize(
+    ("grouped", "tokens"),
+    [(False, 1), (False, 2), (True, 1), (True, 2), (True, 4), (True, 8), (True, 16)],
+)
 @pytest.mark.parametrize("ue8m0", [False, True])
-@pytest.mark.parametrize("tokens", [1, 2])
-def test_mega_moe_matches_reference(tokens, ue8m0):
+def test_mega_moe_matches_reference(grouped, tokens, ue8m0):
     """Routing, activation quant and both expert GEMMs against PyTorch."""
     import vllm.model_executor.layers.fused_moe  # noqa: F401
     from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
         _shuffle_deepseek_fp8_moe_weights,
         swap_w13_to_w31,
+    )
+    from vllm.models.glm5next.nvidia.specialized_decode.grouped_moe import (
+        GroupedExperts,
+        shared_weights,
     )
     from vllm.models.glm5next.nvidia.specialized_decode.mega_moe import MegaExperts
 
@@ -73,12 +80,26 @@ def test_mega_moe_matches_reference(tokens, ue8m0):
                       device="cuda") * 0.02  # fmt: skip
     w31, w31_s = swap_w13_to_w31(w13), swap_w13_to_w31(w13_s)
     w31_trtllm, w2_trtllm = _shuffle_deepseek_fp8_moe_weights(w31, w2)
-    mega = MegaExperts(w31_trtllm, w31_s, w2_trtllm, w2_s, TOP_K, LIMIT, SCALE, ue8m0)
+    args = (w31_trtllm, w31_s, w2_trtllm, w2_s, TOP_K, LIMIT, SCALE, ue8m0)
+    if grouped:
+        # The shared expert folds in as one more expert of every token.
+        se13 = (randn(2 * INTER, HIDDEN) * 0.5).to(FP8)
+        se13_s = torch.rand(2 * INTER // 128, HIDDEN // 128, generator=g,
+                            device="cuda") * 0.02  # fmt: skip
+        se2 = (randn(HIDDEN, INTER) * 0.5).to(FP8)
+        se2_s = torch.rand(HIDDEN // 128, INTER // 128, generator=g,
+                           device="cuda") * 0.02  # fmt: skip
+        shared = shared_weights(se13, se13_s, se2, se2_s)
+        mega = GroupedExperts(*args, shared=shared)
+    else:
+        mega = MegaExperts(*args)
 
     x = randn(tokens, HIDDEN).bfloat16()
     logits = randn(tokens, EXPERTS)
     bias = randn(EXPERTS) * 0.1
-    out, ids, weights = mega(x, logits, bias)
+    out, ids, weights, *shared_out = mega(x, logits, bias)
+    if grouped:  # the workspace counters must be reset for the next call
+        out, ids, weights, shared_out = mega(x, logits, bias)
 
     ref_ids, ref_weights = _route(logits, bias)
     order, ref_order = ids.long().sort(-1), ref_ids.sort(-1)
@@ -92,13 +113,26 @@ def test_mega_moe_matches_reference(tokens, ue8m0):
     )
 
     x = _dequant(*_quant(x, reciprocal=True, ue8m0=ue8m0))
-    ref = []
-    for t in range(tokens):
-        for e in ids[t].tolist():
-            up, gate = (_weight(w31[e], w31_s[e]) @ x[t]).split(INTER)
-            act = F.silu(gate.clamp(max=LIMIT)) * up.clamp(-LIMIT, LIMIT)
-            hidden = _dequant(*_quant(act))
-            ref.append(_weight(w2[e], w2_s[e]) @ hidden)
-    ref = torch.stack(ref)
+
+    def expert(w31, w31_s, w2, w2_s, token):
+        up, gate = (_weight(w31, w31_s) @ x[token]).split(INTER)
+        act = F.silu(gate.clamp(max=LIMIT)) * up.clamp(-LIMIT, LIMIT)
+        return _weight(w2, w2_s) @ _dequant(*_quant(act))
+
+    ref = torch.stack(
+        [
+            expert(w31[e], w31_s[e], w2[e], w2_s[e], t)
+            for t in range(tokens)
+            for e in ids[t].tolist()
+        ]
+    )
     # BF16 outputs; rare FP8 rounding flips of the hidden move a few elements.
     torch.testing.assert_close(out.float(), ref, atol=5e-3 * ref.abs().max(), rtol=0)
+    if grouped:
+        se31, se31_s = swap_w13_to_w31(se13), swap_w13_to_w31(se13_s)
+        ref = torch.stack(
+            [expert(se31, se31_s, se2, se2_s, t) for t in range(tokens)]
+        )
+        torch.testing.assert_close(
+            shared_out.float(), ref, atol=5e-3 * ref.abs().max(), rtol=0
+        )

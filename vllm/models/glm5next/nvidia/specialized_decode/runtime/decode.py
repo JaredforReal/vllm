@@ -28,11 +28,11 @@ logger = init_logger(__name__)
 MAX_TOKENS = 64
 # Token counts the fused all-reduce + mHC boundary serves.
 AR_MHC_MAX_TOKENS = 32
-# Token counts the mega MoE kernel serves (it streams each route's experts).
-MEGA_MAX_TOKENS = 2
-# Two tokens take two waves of the mega kernel's clusters, which the shared
-# expert GEMVs then slow down: DeepGEMM's shared expert stays there.
-SHARED_MAX_TOKENS = 1
+# Token counts the MoE kernels serve: one 16-CTA cluster per route up to
+# PER_ROUTE_MAX_TOKENS (7 such clusters fit on GB300), the persistent
+# expert-grouped kernel above.
+PER_ROUTE_MAX_TOKENS = 1
+MEGA_MAX_TOKENS = 16
 # BF16 projections of the DSA layer and its indexer that dsa_gemm routes.
 DSA_PROJECTIONS = ("fused_qkv_a_proj", "q_b_proj", "o_proj")
 INDEXER_PROJECTIONS = ("wq_b", "wk_weights_proj")
@@ -183,8 +183,9 @@ class SpecializedDecode:
     def _build_mega(self) -> dict[int, Any]:
         from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 
+        from ..grouped_moe import GroupedExperts, shared_weights
         from ..mega_moe import MegaExperts
-        from ..shared_expert import SharedExpert
+        from ..shared_expert import SharedExpert, block_scales
 
         tokens = [b for b in self.batches if b <= MEGA_MAX_TOKENS]
         mega: dict[int, Any] = {}
@@ -201,7 +202,7 @@ class SpecializedDecode:
             if not layer._mlp_is_moe:
                 continue
             routed = layer.mlp.experts.routed_experts
-            experts = MegaExperts(
+            args = (
                 routed.w13_weight,
                 routed.w13_weight_scale_inv,
                 routed.w2_weight,
@@ -211,9 +212,28 @@ class SpecializedDecode:
                 layer.mlp.routed_scaling_factor,
                 is_deep_gemm_e8m0_used(),
             )
-            experts.prepare(tokens, layer.mlp.gate.out_dtype or torch.bfloat16)
-            mega[layer.layer_idx] = experts
+            logits_dtype = layer.mlp.gate.out_dtype or torch.bfloat16
+            per_route = MegaExperts(*args)
+            per_route.prepare(
+                [m for m in tokens if m <= PER_ROUTE_MAX_TOKENS], logits_dtype
+            )
             se = layer.mlp.shared_experts
+
+            def fp32(scale, weight):
+                if scale.dtype == torch.float32:
+                    return scale
+                return block_scales(scale, *weight.shape)
+
+            gate_up, down = se.gate_up_proj, se.down_proj
+            shared = shared_weights(
+                gate_up.weight,
+                fp32(gate_up.weight_scale_inv, gate_up.weight),
+                down.weight,
+                fp32(down.weight_scale_inv, down.weight),
+            )
+            grouped = GroupedExperts(*args, shared=shared)
+            grouped.prepare([m for m in tokens if m > PER_ROUTE_MAX_TOKENS], logits_dtype)
+            mega[layer.layer_idx] = (per_route, grouped)
             self.shared[layer.layer_idx] = SharedExpert(
                 se.gate_up_proj.weight,
                 se.gate_up_proj.weight_scale_inv,
@@ -223,7 +243,7 @@ class SpecializedDecode:
                 is_deep_gemm_e8m0_used(),
             )
             self.shared[layer.layer_idx].prepare(
-                [m for m in tokens if m <= SHARED_MAX_TOKENS]
+                [m for m in tokens if m <= PER_ROUTE_MAX_TOKENS]
             )
             device = routed.w13_weight.device
         if mega:
@@ -240,18 +260,20 @@ class SpecializedDecode:
         from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 
         moe = layer.mlp
-        main = torch.cuda.current_stream()
-        self.shared_stream.wait_stream(main)
-        with torch.cuda.stream(self.shared_stream):
-            if x.shape[0] <= SHARED_MAX_TOKENS:
+        per_route, grouped = self.mega[layer.layer_idx]
+        bias = moe.gate.e_score_correction_bias
+        if x.shape[0] > PER_ROUTE_MAX_TOKENS:
+            # The grouped kernel runs the shared expert as one more expert.
+            logits, _ = moe.experts.gate(x)
+            rows, ids, weights, shared = grouped(x, logits, bias)
+        else:
+            main = torch.cuda.current_stream()
+            self.shared_stream.wait_stream(main)
+            with torch.cuda.stream(self.shared_stream):
                 shared = self.shared[layer.layer_idx](x)
-            else:
-                shared = moe.shared_experts(x)
-        logits, _ = moe.experts.gate(x)
-        rows, ids, weights = self.mega[layer.layer_idx](
-            x, logits, moe.gate.e_score_correction_bias
-        )
-        main.wait_stream(self.shared_stream)
+            logits, _ = moe.experts.gate(x)
+            rows, ids, weights = per_route(x, logits, bias)
+            main.wait_stream(self.shared_stream)
         m, top_k = ids.shape
         routed = UnfinalizedMoEOutput(
             gemm2_permuted=rows,
