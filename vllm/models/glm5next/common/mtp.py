@@ -159,6 +159,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         spec = vllm_config.speculative_config
         self.greedy_draft = spec is not None and spec.use_local_argmax_reduction
         self.specialized_decode: SpecializedDraft | None = None
+        self.prefill_rows: torch.Tensor | None = None
 
     def _specialized_draft(self) -> "SpecializedDraft | None":
         if self.specialized_decode_config is None:
@@ -173,6 +174,10 @@ class Glm5NextMultiTokenPredictor(nn.Module):
                 self, self.specialized_decode_config, self.greedy_draft
             )
         return self.specialized_decode
+
+    def set_prefill_rows(self, rows: torch.Tensor) -> None:
+        """The speculator's [max_num_reqs] last-token rows of a draft prefill."""
+        self.prefill_rows = rows
 
     def set_skip_topk(self, skip: bool):
         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
@@ -210,6 +215,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
                     step,
                     inputs_embeds,
                     previous_hidden_states,
+                    self.prefill_rows,
                 )
         return self._mtp_layers[current_step_idx](
             input_ids,

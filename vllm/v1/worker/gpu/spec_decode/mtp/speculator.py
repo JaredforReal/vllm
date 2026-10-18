@@ -33,6 +33,10 @@ class MTPSpeculator(TargetDependentARSpeculator):
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")
         )
+        # Draft prefill outputs are sampled only at each request's last token.
+        set_prefill_rows = getattr(draft_model.model, "set_prefill_rows", None)
+        if set_prefill_rows is not None:
+            set_prefill_rows(self.last_token_indices)
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:

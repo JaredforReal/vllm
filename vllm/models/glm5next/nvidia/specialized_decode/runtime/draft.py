@@ -153,8 +153,13 @@ class SpecializedDraft(LayerStages):
             return self.ar_norm(x, residual, norm.weight.data)
         return norm(x, residual)
 
-    def run(self, mtp, step: Step, inputs_embeds, previous_hidden_states):
-        """``Glm5NextMultiTokenPredictorLayer.forward`` of a planned step."""
+    def run(self, mtp, step: Step, inputs_embeds, previous_hidden_states, rows):
+        """``Glm5NextMultiTokenPredictorLayer.forward`` of a planned step.
+
+        ``rows``: the speculator's per-request last-token rows. A draft prefill
+        (q tokens per request) samples only those rows, so after the attention
+        (which writes every token's KV) only they run on; the other output rows
+        are left unset."""
         layer = mtp.mtp_block
         x = fused_eh_norm(
             step.positions,
@@ -178,11 +183,20 @@ class SpecializedDraft(LayerStages):
             residual = x
             x = layer.input_layernorm(x)
             x, partial = self.attention(layer, x, step)
+            if step.q > 1 and rows is not None:
+                rows = rows[: tokens // step.q]
+                x, residual = x[rows], residual[rows]
+            else:
+                rows = None
             x, residual = self.reduced_norm(
                 x, partial, residual, layer.post_attention_layernorm
             )
             x, partial = self.mlp(layer, x)
             x, _ = self.reduced_norm(x, partial, residual, mtp.shared_head.norm)
+        if rows is not None:
+            out = x.new_empty((tokens, x.shape[1]))
+            out[rows] = x
+            x = out
         return x, x
 
     def top_tokens(self, head, logits_processor, hidden_states):
