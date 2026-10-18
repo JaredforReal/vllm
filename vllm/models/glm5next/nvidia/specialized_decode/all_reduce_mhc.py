@@ -33,10 +33,12 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from vllm.distributed import get_tp_group
+from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.models.deepseek_v41.nvidia.ops.cute_dsl.all_reduce_mhc import (
     ACTIVE_STAGE,
     LAMPORT_GENERATIONS,
     NEXT_STAGE,
+    _QuadFinalizePublishDeviceKernel,
 )
 from vllm.models.deepseek_v41.nvidia.ops.cute_dsl.primitives import (
     VEC_BF16,
@@ -429,10 +431,13 @@ class _MixesDeviceKernel:
     """One thread per token: the post-mix and the Sinkhorn residual mix from a
     boundary's raw mixes."""
 
-    def __init__(self, *, sinkhorn_eps: float, post_mult: float, repeat: int):
+    def __init__(
+        self, *, sinkhorn_eps: float, post_mult: float, repeat: int, capacity_m: int
+    ):
         self.sinkhorn_eps = sinkhorn_eps
         self.post_mult = post_mult
         self.repeat = repeat
+        self.threads = -(-capacity_m // WARP_SIZE) * WARP_SIZE
 
     @cute.jit
     def __call__(
@@ -446,7 +451,7 @@ class _MixesDeviceKernel:
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(mixes, scale, base, post, comb, m).launch(
-            grid=(1, 1, 1), block=(WARP_SIZE, 1, 1), stream=stream
+            grid=(1, 1, 1), block=(self.threads, 1, 1), stream=stream
         )
 
     @cute.kernel
@@ -531,9 +536,11 @@ class AllReduceMhcBoundary:
         sinkhorn_repeat: int,
         norm_eps: float,
         device: torch.device,
+        top_k: int,
         cluster_size: int = 8,
     ) -> None:
         group = get_tp_group().device_group
+        self.top_k = top_k
         self.hidden_size = hidden = hidden_size
         self.capacity = capacity = max_num_tokens
         tp = dist.get_world_size(group)
@@ -556,6 +563,38 @@ class AllReduceMhcBoundary:
                 Int32(capacity),
                 current_cu_stream(),
             )
+            # By routing-weight dtype; the routing folds in the routed scale.
+            self._finalize_publish = {
+                dtype: cute.compile(
+                    _QuadFinalizePublishDeviceKernel(
+                        hidden=hidden,
+                        top_k=top_k,
+                        tp=tp,
+                        rank=rank,
+                        capacity_m=capacity,
+                        threads=128,
+                        routed_scaling_factor=1.0,
+                        include_shared_expert=True,
+                        load_shared_expert_before_pdl=False,
+                        enable_pdl=True,
+                        prefetch_group=top_k,
+                        fp32_weights=dtype == torch.float32,
+                    ),
+                    dynamic(BFloat16, 16, hidden),
+                    dynamic(
+                        Float32 if dtype == torch.float32 else BFloat16,
+                        4 if dtype == torch.float32 else 2,
+                        top_k,
+                    ),
+                    dynamic(Int32, 4, top_k),
+                    dynamic(BFloat16, 16, hidden),
+                    make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+                    Int64(0),
+                    Int32(capacity),
+                    current_cu_stream(),
+                )
+                for dtype in (torch.float32, torch.bfloat16)
+            }
             self._boundary = cute.compile(
                 _BoundaryDeviceKernel(
                     hidden=hidden,
@@ -589,7 +628,10 @@ class AllReduceMhcBoundary:
             )
             self._mixes = cute.compile(
                 _MixesDeviceKernel(
-                    sinkhorn_eps=hc_eps, post_mult=post_mult, repeat=sinkhorn_repeat
+                    sinkhorn_eps=hc_eps,
+                    post_mult=post_mult,
+                    repeat=sinkhorn_repeat,
+                    capacity_m=capacity,
                 ),
                 dynamic(Float32, 4, MIX),
                 make_fake_compact_tensor(Float32, (3,), assumed_align=4),
@@ -632,7 +674,7 @@ class AllReduceMhcBoundary:
 
     def __call__(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | MoEOutput,
         residual: torch.Tensor,
         post: torch.Tensor,
         comb: torch.Tensor,
@@ -645,7 +687,9 @@ class AllReduceMhcBoundary:
         of ``hc_fused_post_pre`` applied to the TP sum of ``x``.
 
         Args:
-            x: [M, hidden] BF16 TP-partial sublayer output.
+            x: [M, hidden] BF16 TP-partial sublayer output, or a MoE output
+                whose routed top-k reduction is still open (its shared and
+                routed parts are TP-partial).
             residual: [M, hc, hidden] BF16 residual streams.
             post: [M, hc, 1] FP32 post-mix.
             comb: [M, hc, hc] FP32 residual mix, indexed [source, target].
@@ -655,21 +699,48 @@ class AllReduceMhcBoundary:
             norm_weight: [hidden] BF16 RMSNorm weight.
 
         """
-        m, hidden = x.shape[0], self.hidden_size
-        device = x.device
+        hidden = self.hidden_size
+        self.join()
+        if isinstance(x, MoEOutput):
+            routed, shared = x.routed, x.shared_output
+            assert shared is not None and not isinstance(routed, torch.Tensor)
+            m = shared.shape[0]
+            top_k = self.top_k
+            weights = routed.expert_weights
+            self._finalize_publish[weights.dtype](
+                to_cute_dynamic(
+                    routed.gemm2_permuted.flatten(), 16, divisibility=hidden
+                ),
+                to_cute_dynamic(
+                    weights.flatten(), weights.element_size(), divisibility=top_k
+                ),
+                to_cute_dynamic(
+                    routed.expanded_idx_to_permuted_idx.flatten(),
+                    4,
+                    divisibility=top_k,
+                ),
+                to_cute_dynamic(shared.flatten(), 16, divisibility=hidden),
+                to_cute(self._stage_state, 4),
+                Int64(self._multicast),
+                Int32(m),
+                current_cu_stream(),
+            )
+            layer_input = torch.empty_like(shared)
+        else:
+            m = x.shape[0]
+            self._publish(
+                to_cute_dynamic(x.flatten(), 16, divisibility=hidden),
+                to_cute(self._stage_state, 4),
+                Int64(self._multicast),
+                Int32(m),
+                current_cu_stream(),
+            )
+            layer_input = torch.empty_like(x)
+        device = residual.device
         residual_output = torch.empty_like(residual)
         mixes = torch.empty((m, MIX), dtype=torch.float32, device=device)
         post_output = torch.empty((m, HC, 1), dtype=torch.float32, device=device)
         comb_output = torch.empty((m, HC, HC), dtype=torch.float32, device=device)
-        layer_input = torch.empty_like(x)
-        self.join()
-        self._publish(
-            to_cute_dynamic(x.flatten(), 16, divisibility=hidden),
-            to_cute(self._stage_state, 4),
-            Int64(self._multicast),
-            Int32(m),
-            current_cu_stream(),
-        )
         self._boundary(
             to_cute(self._mailbox.flatten(), 16),
             to_cute_dynamic(residual.flatten(), 16, divisibility=HC * hidden),

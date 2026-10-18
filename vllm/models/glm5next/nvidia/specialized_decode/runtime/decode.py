@@ -12,6 +12,8 @@ from vllm.config import CUDAGraphMode
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import _unpack
 from vllm.model_executor.layers.mhc import hc_contract, hc_expand
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
@@ -25,7 +27,7 @@ logger = init_logger(__name__)
 # Token counts (requests x tokens per request) with a planned decode path.
 MAX_TOKENS = 64
 # Token counts the fused all-reduce + mHC boundary serves.
-AR_MHC_MAX_TOKENS = 16
+AR_MHC_MAX_TOKENS = 32
 # BF16 projections of the DSA layer and its indexer that dsa_gemm routes.
 DSA_PROJECTIONS = ("fused_qkv_a_proj", "q_b_proj", "o_proj")
 INDEXER_PROJECTIONS = ("wq_b", "wk_weights_proj")
@@ -118,8 +120,12 @@ class SpecializedDecode:
             logger.info("Specialized decode routes %d DSA GEMMs", len(self.routed))
         self.mhc = None
         self.ar_mhc: AllReduceMhcBoundary | None = None
+        # MoE layers whose routed top-k reduction the fused boundary takes.
+        self.deferred: set[int] = set()
         if "ar_mhc" in config.stages:
             self.ar_mhc = self._build_ar_mhc()
+            if self.ar_mhc is not None:
+                self.deferred = self._defer_moe_finalize()
         if "mhc" in config.stages:
             from ..mhc import MAX_TOKENS as MHC_MAX_TOKENS
             from ..mhc import MhcBoundary
@@ -150,6 +156,7 @@ class SpecializedDecode:
         return AllReduceMhcBoundary(
             hidden_size=first.hidden_size,
             max_num_tokens=AR_MHC_MAX_TOKENS,
+            top_k=self.backbone.config.num_experts_per_tok,
             rms_eps=first.rms_norm_eps,
             hc_eps=first.hc_eps,
             post_mult=first.mhc_post_mult_value,
@@ -157,6 +164,42 @@ class SpecializedDecode:
             norm_eps=norms.pop(),
             device=first.hc_attn_fn.device,
         )
+
+    def _defer_moe_finalize(self) -> set[int]:
+        """MoE layers (but the last) whose TRTLLM-Gen FP8 experts can stop
+        after GEMM2 for the fused boundary's finalize publish."""
+        from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (
+            TrtLlmFp8ExpertsModular,
+            TrtLlmFp8ExpertsMonolithic,
+        )
+
+        deferred = set()
+        for layer in self.layers[:-1]:
+            if not layer._mlp_is_moe:
+                continue
+            experts = layer.mlp.experts
+            method = experts.routed_experts.quant_method
+            if (
+                getattr(method, "experts_cls", None)
+                not in (TrtLlmFp8ExpertsModular, TrtLlmFp8ExpertsMonolithic)
+                or experts.routed_scaling_factor != 1.0
+            ):
+                logger.info_once(
+                    "Specialized decode keeps the MoE finalize: %s, scale %s",
+                    str(getattr(method, "experts_cls", None)),
+                    str(experts.routed_scaling_factor),
+                )
+                continue
+            config = experts.moe_config
+            config.limit_deferred_moe_finalize(AR_MHC_MAX_TOKENS)
+            # Planned steps turn the deferral on per call; others finalize.
+            config._defer_moe_finalize = True
+            usable = config.use_deferred_moe_finalize
+            config._defer_moe_finalize = False
+            if usable:
+                deferred.add(layer.layer_idx)
+        logger.info("Specialized decode defers %d MoE finalizes", len(deferred))
+        return deferred
 
     def partial(self, tokens: int) -> bool:
         """Whether sublayers leave their output TP-partial for the fused
@@ -288,6 +331,12 @@ class SpecializedDecode:
     def mlp(self, layer, x):
         """The FFN output and whether it is still TP-partial."""
         partial = self.partial(x.shape[0])
+        if partial and layer.layer_idx in self.deferred:
+            experts = layer.mlp.experts
+            with _swap(experts.moe_config, "_defer_moe_finalize", True):
+                # The runner's custom op returns tensors only; run its body.
+                shared, routed = _unpack(experts._forward_impl(x, x, x, None))
+            return MoEOutput(routed=routed, shared_output=shared), True
         if layer._mlp_is_moe:
             config = layer.mlp.experts.moe_config
             unreduced = _override(config, "skip_final_all_reduce", True, partial)

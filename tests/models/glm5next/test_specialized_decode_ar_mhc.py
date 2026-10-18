@@ -9,6 +9,10 @@ import torch
 
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.kernels.mhc.torch import mhc_post_torch, mhc_pre_torch
+from vllm.model_executor.layers.fused_moe.moe_output import (
+    MoEOutput,
+    UnfinalizedMoEOutput,
+)
 from vllm.platforms import current_platform
 
 from ...utils import (
@@ -17,7 +21,7 @@ from ...utils import (
     multi_process_parallel,
 )
 
-HIDDEN, HC, SINKHORN, EPS = 4096, 4, 20, 1e-6
+HIDDEN, HC, SINKHORN, EPS, TOP_K = 4096, 4, 20, 1e-6, 8
 
 
 def _reference(peers, i):
@@ -71,8 +75,9 @@ def _boundary(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
         init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
         ensure_model_parallel_initialized(tp_size, pp_size)
         op = AllReduceMhcBoundary(
-            hidden_size=HIDDEN, max_num_tokens=16, rms_eps=EPS, hc_eps=EPS,
-            post_mult=2.0, sinkhorn_repeat=SINKHORN, norm_eps=EPS, device=device,
+            hidden_size=HIDDEN, max_num_tokens=16, top_k=TOP_K, rms_eps=EPS,
+            hc_eps=EPS, post_mult=2.0, sinkhorn_repeat=SINKHORN, norm_eps=EPS,
+            device=device,
         )  # fmt: skip
 
         def check(outputs, i):
@@ -107,6 +112,34 @@ def _boundary(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
             i["residual"].mul_(2)
             graph.replay()
             check(captured, i)
+
+            # A MoE output with its top-k reduction open: the fused finalize
+            # must match finalizing first (one FP32 FMA per route in route
+            # order, the shared add, one BF16 rounding).
+            rows = tokens * TOP_K + 5
+            gemm2 = torch.randn(rows, HIDDEN, device=device).bfloat16()
+            permuted = torch.randperm(rows, device=device)[: tokens * TOP_K]
+            permuted = permuted.view(tokens, TOP_K).int()
+            permuted[0, -1] = -1  # an expert this rank does not hold
+            weights = torch.rand(tokens, TOP_K, device=device)
+            routed = UnfinalizedMoEOutput(gemm2, weights, permuted)
+            shared = i["x"]
+            moe = MoEOutput(routed=routed, shared_output=shared)
+            fused = op(moe, *args[1:])
+            acc = torch.zeros(tokens, HIDDEN, device=device)
+            for k in range(TOP_K):
+                valid = (permuted[:, k] >= 0).unsqueeze(-1)
+                rows_k = gemm2[permuted[:, k].clamp_min(0).long()].float()
+                torch.addcmul(
+                    acc,
+                    torch.where(valid, rows_k, 0.0),
+                    torch.where(valid, weights[:, k : k + 1], 0.0),
+                    out=acc,
+                )
+            plain = op((acc + shared.float()).bfloat16(), *args[1:])
+            op.join()
+            for a, b in zip(fused, plain):
+                assert torch.equal(a, b)
 
 
 @pytest.mark.skipif(
