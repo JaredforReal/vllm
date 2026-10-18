@@ -118,6 +118,12 @@ class SpecializedDecode:
                     if m is not None and route(m):
                         self.routed.append(m.prefix)
             logger.info("Specialized decode routes %d DSA GEMMs", len(self.routed))
+        if "dsa_indexer" in config.stages:
+            from ..indexer import IndexerStage
+
+            for layer in self.layers:
+                if layer.layer_kind == "mla":
+                    IndexerStage(layer.self_attn.indexer)
         self.mhc = None
         self.ar_mhc: AllReduceMhcBoundary | None = None
         # MoE layers whose routed top-k reduction the fused boundary takes.

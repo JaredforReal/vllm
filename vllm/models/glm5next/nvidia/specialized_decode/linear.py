@@ -20,6 +20,11 @@ MAX_TOKENS = 2
 _active = [False]
 
 
+def planned() -> bool:
+    """Whether a planned decode step is being captured."""
+    return _active[0]
+
+
 @contextmanager
 def planned_step():
     _active[0] = True
