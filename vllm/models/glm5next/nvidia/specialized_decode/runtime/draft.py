@@ -78,6 +78,7 @@ class SpecializedDraft(LayerStages):
             self.ar_norm = self._build_ar_norm()
             if self.ar_norm is not None:
                 self.deferred = self._defer_moe_finalize()
+        self.head: Any = None
         self.argmax = self._build_argmax() if greedy else None
 
     def _build_ar_norm(self):
@@ -112,6 +113,10 @@ class SpecializedDraft(LayerStages):
             logger.warning("Specialized draft: unsupported LM head, stock argmax")
             return None
         columns = weight.shape[0]
+        if "dsa_gemm" in self.config.stages:
+            from ..gemm import Projection
+
+            self.head = Projection(weight)
         return DraftArgmax(
             columns=columns,
             valid=columns - shard.num_org_vocab_padding,
@@ -205,7 +210,18 @@ class SpecializedDraft(LayerStages):
             return None
         if logits_processor.soft_cap is not None or logits_processor.scale != 1.0:
             return None
-        logits = logits_processor._apply_head(head, hidden_states, None)
+        tokens = hidden_states.shape[0]
+        if (
+            self.head is not None
+            and torch.cuda.is_current_stream_capturing()
+            and tokens <= PROJECTION_MAX_TOKENS
+            and self.head.supports(tokens)
+            and head.weight is self.head.weight
+            and hidden_states.is_contiguous()
+        ):
+            logits = self.head(hidden_states)
+        else:
+            logits = logits_processor._apply_head(head, hidden_states, None)
         if logits.dtype != torch.bfloat16:
             return None
         return self.argmax(logits.contiguous())
