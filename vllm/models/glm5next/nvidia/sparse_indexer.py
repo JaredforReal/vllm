@@ -285,7 +285,11 @@ def sparse_attn_indexer_kpool(
         and not attn_metadata_narrowed.decode.requires_padding
         and attn_metadata_narrowed.max_seq_len > topk_tokens
         and kpool_stage.defers(
-            num_decode_tokens, topk_tokens, index_kpool, topk_indices_buffer.shape[1]
+            k_cache_prefix,
+            num_decode_tokens,
+            topk_tokens,
+            index_kpool,
+            topk_indices_buffer.shape[1],
         )
     )
     if not defer_topk:

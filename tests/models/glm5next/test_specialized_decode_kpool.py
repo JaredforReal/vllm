@@ -187,10 +187,15 @@ def test_fused_remap_hook_matches_stock_conversion():
         index_group=fused, group_conversion_decode_only=False, dcp_world_size=1
     )
     attention = SimpleNamespace(
-        mla_attn=SimpleNamespace(mla_attn=SimpleNamespace(impl=impl))
+        mla_attn=SimpleNamespace(mla_attn=SimpleNamespace(impl=impl)),
+        indexer=SimpleNamespace(k_cache=SimpleNamespace(prefix="layers.0.k_cache")),
     )
     stage = kpool.KpoolStage([attention], 64, "cuda")
-    assert stage.fuse and stage.defers(rows, GROUPS * POOL, POOL, WIDTH)
+    assert stage.fuse and stage.defers(
+        "layers.0.k_cache", rows, GROUPS * POOL, POOL, WIDTH
+    )
+    # Layers without a fused conversion (the MTP draft's) never defer.
+    assert not stage.defers("mtp.k_cache", rows, GROUPS * POOL, POOL, WIDTH)
     pool_ids = stage.pool_ids(rows, GROUPS)
     pool_ids.copy_(ids)
     stage.defer(pool_ids, positions, POOL)

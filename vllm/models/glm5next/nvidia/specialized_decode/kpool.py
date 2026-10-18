@@ -677,6 +677,9 @@ class KpoolStage:
     def __init__(self, attentions, max_rows: int, device):
         self.pending: tuple[torch.Tensor, torch.Tensor, int] | None = None
         self.fuse = False
+        # Indexer caches of the fused layers: others (the MTP draft's) never
+        # reach a FusedRemap, so they must not defer.
+        self.layers: set[str] = set()
         self.max_rows = max_rows
         self.pool_buffer = torch.empty(
             (max_rows, 2048), dtype=torch.int32, device=device
@@ -692,6 +695,7 @@ class KpoolStage:
             for impl, group in zip(impls, groups)
         ):
             self.fuse = True
+            self.layers = {str(attn.indexer.k_cache.prefix) for attn in attentions}
             for group in groups:
                 FusedRemap(group, self)
 
@@ -699,9 +703,9 @@ class KpoolStage:
     def active() -> bool:
         return planned()
 
-    def defers(self, rows: int, topk: int, pool_size: int, width: int) -> bool:
+    def defers(self, layer, rows: int, topk: int, pool_size: int, width: int) -> bool:
         return (
-            self.fuse
+            str(layer) in self.layers
             and pool_size == 4
             and rows <= self.max_rows
             and topk // pool_size <= self.pool_buffer.shape[1]
