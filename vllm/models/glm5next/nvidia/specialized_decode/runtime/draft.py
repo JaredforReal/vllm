@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""The specialized decode of the MTP draft layer: the main model's stages on the
+draft's FULL-graph steps.
+
+The MTP layer has no mHC streams, so its boundaries are a fused all-reduce,
+residual add and RMSNorm (``AllReduceNorm``) where the main model fuses the
+all-reduce with mHC.
+"""
+
+from typing import Any
+
+import torch
+
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
+from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
+
+from ..linear import MAX_TOKENS as PROJECTION_MAX_TOKENS
+from ..linear import planned_step
+from .decode import (
+    AR_MHC_MAX_TOKENS,
+    DSA_PROJECTIONS,
+    INDEXER_PROJECTIONS,
+    MAX_TOKENS,
+    LayerStages,
+    Step,
+    is_decode,
+)
+
+logger = init_logger(__name__)
+
+
+class SpecializedDraft(LayerStages):
+    """Built on the first eager draft forward (the weights are processed by
+    then). Reads the MTP layers, never modifies them."""
+
+    def __init__(self, predictor, config):
+        self.config = config
+        self.q = config.q
+        self.mtp_layers = list(predictor._mtp_layers)
+        self.layers = [layer.mtp_block for layer in self.mtp_layers]
+        self.text_config = self.mtp_layers[0].config
+        # Every MTP MoE output feeds a fused boundary.
+        self.moe_layers = self.layers
+        # Draft decode steps run one token per request; draft prefills run q.
+        self.batches = sorted(b for b in config.capture_sizes if b <= MAX_TOKENS)
+        self.kda: dict[int, Any] = {}
+        self.eh_proj: dict[int, Any] = {}
+        if "dsa_gemm" in config.stages:
+            from ..gemm import Projection
+            from ..linear import route
+
+            routed = 0
+            for mtp, layer in zip(self.mtp_layers, self.layers):
+                attn = layer.self_attn
+                modules = [getattr(attn, n, None) for n in DSA_PROJECTIONS]
+                indexer = getattr(attn, "indexer", None)
+                modules += [getattr(indexer, n, None) for n in INDEXER_PROJECTIONS]
+                routed += sum(m is not None and route(m) for m in modules)
+                self.eh_proj[layer.layer_idx] = Projection(mtp.eh_proj.weight)
+            logger.info("Specialized draft routes %d DSA GEMMs", routed)
+        if "dsa_indexer" in config.stages:
+            from ..indexer import IndexerStage
+
+            for layer in self.layers:
+                IndexerStage(layer.self_attn.indexer)
+        self.mega: dict[int, Any] = {}
+        if "mega_moe" in config.stages:
+            self.mega = self._build_mega()
+        self.ar_norm = None
+        self.deferred: set[int] = set()
+        if "ar_mhc" in config.stages:
+            self.ar_norm = self._build_ar_norm()
+            if self.ar_norm is not None:
+                self.deferred = self._defer_moe_finalize()
+
+    def _build_ar_norm(self):
+        from ..all_reduce_norm import AllReduceNorm
+
+        norms = {
+            n.variance_epsilon
+            for mtp, layer in zip(self.mtp_layers, self.layers)
+            for n in (layer.post_attention_layernorm, mtp.shared_head.norm)
+        }
+        if len(norms) != 1:
+            logger.warning("Specialized draft: mixed norm eps, no fused boundary")
+            return None
+        return AllReduceNorm(
+            hidden_size=self.layers[0].hidden_size,
+            max_num_tokens=AR_MHC_MAX_TOKENS,
+            top_k=self.text_config.num_experts_per_tok,
+            eps=norms.pop(),
+            device=self.mtp_layers[0].eh_proj.weight.device,
+        )
+
+    def partial(self, tokens: int) -> bool:
+        return self.ar_norm is not None and self.ar_norm.supports(tokens)
+
+    def plan(self, positions) -> Step | None:
+        """This draft step's plan, or None for the stock forward: planned only
+        inside FULL-graph captures of uniform draft prefills (q tokens per
+        request) and draft decodes (one token per request)."""
+        b = positions.shape[-1]
+        if not torch.cuda.is_current_stream_capturing() or b > MAX_TOKENS:
+            return None
+        if not is_forward_context_available():
+            return None
+        context = get_forward_context()
+        if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            return None
+        by_layer = context.attn_metadata
+        if not isinstance(by_layer, dict) or not by_layer:
+            return None
+        rows = list(by_layer.values())
+        for q in dict.fromkeys((self.q, 1)):
+            if b % q == 0 and all(is_decode(md, q, b) for md in rows):
+                logger.info_once("Specialized draft captures %d-token steps", b)
+                return Step(q, positions, by_layer)
+        logger.info_once("Specialized draft skips a %d-token capture", b)
+        return None
+
+    def reduced_norm(self, x, partial, residual, norm):
+        """``norm(x + residual)`` and the new residual of a sublayer output."""
+        if partial:
+            assert self.ar_norm is not None
+            return self.ar_norm(x, residual, norm.weight.data)
+        return norm(x, residual)
+
+    def run(self, mtp, step: Step, inputs_embeds, previous_hidden_states):
+        """``Glm5NextMultiTokenPredictorLayer.forward`` of a planned step."""
+        layer = mtp.mtp_block
+        x = fused_eh_norm(
+            step.positions,
+            inputs_embeds,
+            previous_hidden_states,
+            mtp.enorm.weight,
+            mtp.hnorm.weight,
+            mtp.enorm.variance_epsilon,
+        )
+        projection = self.eh_proj.get(layer.layer_idx)
+        tokens = x.shape[0]
+        with planned_step():
+            if (
+                projection is not None
+                and tokens <= PROJECTION_MAX_TOKENS
+                and projection.supports(tokens)
+            ):
+                x = projection(x)
+            else:
+                x = mtp.eh_proj(x)
+            residual = x
+            x = layer.input_layernorm(x)
+            x, partial = self.attention(layer, x, step)
+            x, residual = self.reduced_norm(
+                x, partial, residual, layer.post_attention_layernorm
+            )
+            x, partial = self.mlp(layer, x)
+            x, _ = self.reduced_norm(x, partial, residual, mtp.shared_head.norm)
+        return x, x

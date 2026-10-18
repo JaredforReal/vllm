@@ -26,6 +26,9 @@ from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
+from vllm.models.glm5next.nvidia.specialized_decode.runtime import (
+    specialized_decode_config,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -39,6 +42,9 @@ from .model import (
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
+
+if typing.TYPE_CHECKING:
+    from ..nvidia.specialized_decode.runtime.draft import SpecializedDraft
 
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
@@ -147,6 +153,24 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             assert isinstance(self_attn, Glm5NextMLAAttention)
             self._mtp_mla_attns.append(self_attn.mla_attn)
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        # decode_backend=latency_specialized: the draft layer's specialized decode,
+        # built on the first eager forward (after the weights are processed).
+        self.specialized_decode_config = specialized_decode_config(vllm_config)
+        self.specialized_decode: SpecializedDraft | None = None
+
+    def _specialized_draft(self) -> "SpecializedDraft | None":
+        if self.specialized_decode_config is None:
+            return None
+        if (
+            self.specialized_decode is None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            from ..nvidia.specialized_decode.runtime.draft import SpecializedDraft
+
+            self.specialized_decode = SpecializedDraft(
+                self, self.specialized_decode_config
+            )
+        return self.specialized_decode
 
     def set_skip_topk(self, skip: bool):
         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
@@ -175,6 +199,16 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
+        decode = self._specialized_draft()
+        if decode is not None:
+            step = decode.plan(positions)
+            if step is not None:
+                return decode.run(
+                    self._mtp_layers[current_step_idx],
+                    step,
+                    inputs_embeds,
+                    previous_hidden_states,
+                )
         return self._mtp_layers[current_step_idx](
             input_ids,
             positions,
