@@ -28,6 +28,8 @@ logger = init_logger(__name__)
 MAX_TOKENS = 64
 # Token counts the fused all-reduce + mHC boundary serves.
 AR_MHC_MAX_TOKENS = 32
+# Token counts the mega MoE kernel serves (it streams each route's experts).
+MEGA_MAX_TOKENS = 2
 # BF16 projections of the DSA layer and its indexer that dsa_gemm routes.
 DSA_PROJECTIONS = ("fused_qkv_a_proj", "q_b_proj", "o_proj")
 INDEXER_PROJECTIONS = ("wq_b", "wk_weights_proj")
@@ -124,6 +126,10 @@ class SpecializedDecode:
             for layer in self.layers:
                 if layer.layer_kind == "mla":
                     IndexerStage(layer.self_attn.indexer)
+        # MoE layers whose routed experts run as one mega kernel.
+        self.mega: dict[int, Any] = {}
+        if "mega_moe" in config.stages:
+            self.mega = self._build_mega()
         self.mhc = None
         self.ar_mhc: AllReduceMhcBoundary | None = None
         # MoE layers whose routed top-k reduction the fused boundary takes.
@@ -170,6 +176,75 @@ class SpecializedDecode:
             norm_eps=norms.pop(),
             device=first.hc_attn_fn.device,
         )
+
+    def _build_mega(self) -> dict[int, Any]:
+        from ..mega_moe import MegaExperts
+
+        tokens = [b for b in self.batches if b <= MEGA_MAX_TOKENS]
+        mega: dict[int, Any] = {}
+        config = self.backbone.config
+        if (
+            config.scoring_func != "sigmoid"
+            or config.n_group != 1
+            or not (config.norm_topk_prob)
+        ):
+            logger.warning("Specialized decode: unsupported routing, no mega MoE")
+            return {}
+        for layer in self.layers[:-1]:
+            if not layer._mlp_is_moe:
+                continue
+            routed = layer.mlp.experts.routed_experts
+            experts = MegaExperts(
+                routed.w13_weight,
+                routed.w13_weight_scale_inv,
+                routed.w2_weight,
+                routed.w2_weight_scale_inv,
+                self.backbone.config.num_experts_per_tok,
+                self.backbone.config.swiglu_limit,
+            )
+            experts.prepare(tokens)
+            mega[layer.layer_idx] = experts
+            device = routed.w13_weight.device
+        if mega:
+            top_k = self.backbone.config.num_experts_per_tok
+            self.route_order = torch.arange(
+                max(tokens) * top_k, dtype=torch.int32, device=device
+            )
+            self.shared_stream = torch.cuda.Stream(device)
+        logger.info("Specialized decode runs %d MoE layers as one kernel", len(mega))
+        return mega
+
+    def _mega_moe(self, layer, x):
+        """Routed experts as one kernel, left unfinalized for the boundary."""
+        from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            per_token_group_quant_fp8,
+        )
+
+        from ..routing import route
+
+        moe = layer.mlp
+        main = torch.cuda.current_stream()
+        self.shared_stream.wait_stream(main)
+        with torch.cuda.stream(self.shared_stream):
+            shared = moe.shared_experts(x)
+        logits, _ = moe.experts.gate(x)
+        ids, weights = route(
+            logits,
+            moe.gate.e_score_correction_bias,
+            self.backbone.config.num_experts_per_tok,
+            moe.routed_scaling_factor,
+        )
+        x_q, x_scale = per_token_group_quant_fp8(x, 128)
+        rows = self.mega[layer.layer_idx](x_q, x_scale, ids)
+        main.wait_stream(self.shared_stream)
+        m, top_k = ids.shape
+        routed = UnfinalizedMoEOutput(
+            gemm2_permuted=rows,
+            expert_weights=weights,
+            expanded_idx_to_permuted_idx=self.route_order[: m * top_k].view(m, top_k),
+        )
+        return MoEOutput(routed=routed, shared_output=shared)
 
     def _defer_moe_finalize(self) -> set[int]:
         """MoE layers (but the last) whose TRTLLM-Gen FP8 experts can stop
@@ -337,6 +412,8 @@ class SpecializedDecode:
     def mlp(self, layer, x):
         """The FFN output and whether it is still TP-partial."""
         partial = self.partial(x.shape[0])
+        if partial and layer.layer_idx in self.mega and x.shape[0] <= MEGA_MAX_TOKENS:
+            return self._mega_moe(layer, x), True
         if partial and layer.layer_idx in self.deferred:
             experts = layer.mlp.experts
             with _swap(experts.moe_config, "_defer_moe_finalize", True):
