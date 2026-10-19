@@ -354,7 +354,6 @@ class SpecializedDecode(LayerStages):
         self.mega: dict[int, Any] = {}
         if "mega_moe" in config.stages:
             self.mega = self._build_mega()
-        self.mhc = None
         self.ar_mhc: AllReduceMhcBoundary | None = None
         # MoE layers whose routed top-k reduction the fused boundary takes.
         self.deferred: set[int] = set()
@@ -362,14 +361,7 @@ class SpecializedDecode(LayerStages):
             self.ar_mhc = self._build_ar_mhc()
             if self.ar_mhc is not None:
                 self.deferred = self._defer_moe_finalize()
-        if "mhc" in config.stages:
-            from ..mhc import MAX_TOKENS as MHC_MAX_TOKENS
-            from ..mhc import MhcBoundary
-
-            first = self.layers[0]
-            self.mhc = MhcBoundary(first, first.hidden_size, first.hc_attn_fn.device)
-            self.mhc_max_tokens = MHC_MAX_TOKENS
-        if self.mhc is not None or self.ar_mhc is not None:
+        if self.ar_mhc is not None:
             # hc_fn is BF16 in the checkpoint, so the BF16 copy is exact.
             self.hc_fn = {
                 id(fn): fn.detach().bfloat16()
@@ -406,18 +398,6 @@ class SpecializedDecode(LayerStages):
 
     def boundary(self, layer, x, residual, post, comb, fn, scale, base, norm):
         """The previous sublayer's mHC post, then the next one's pre and norm."""
-        if self.mhc is not None and x.shape[0] <= self.mhc_max_tokens:
-            return self.mhc(
-                x,
-                residual.contiguous(),
-                post.contiguous(),
-                comb.contiguous(),
-                self.hc_fn[id(fn)],
-                scale,
-                base,
-                norm.weight.data,
-                norm.variance_epsilon,
-            )
         return layer.hc_fused_post_pre(
             x,
             residual,
