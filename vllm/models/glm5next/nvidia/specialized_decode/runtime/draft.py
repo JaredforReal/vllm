@@ -19,8 +19,8 @@ from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 
 from ..linear import MAX_TOKENS as PROJECTION_MAX_TOKENS
 from ..linear import planned_step
+from ..policy import Policy
 from .decode import (
-    AR_MHC_MAX_TOKENS,
     DSA_PROJECTIONS,
     INDEXER_PROJECTIONS,
     MAX_TOKENS,
@@ -41,6 +41,7 @@ class SpecializedDraft(LayerStages):
 
     def __init__(self, predictor, config, greedy: bool):
         self.config = config
+        self.policy = Policy(config.policy)
         self.q = config.q
         self.mtp_layers = list(predictor._mtp_layers)
         self.layers = [layer.mtp_block for layer in self.mtp_layers]
@@ -95,7 +96,7 @@ class SpecializedDraft(LayerStages):
             return None
         return AllReduceNorm(
             hidden_size=self.layers[0].hidden_size,
-            max_num_tokens=AR_MHC_MAX_TOKENS,
+            max_num_tokens=self.boundary_max_tokens,
             top_k=self.text_config.num_experts_per_tok,
             eps=norms.pop(),
             device=self.mtp_layers[0].eh_proj.weight.device,
@@ -127,7 +128,7 @@ class SpecializedDraft(LayerStages):
         )
 
     def partial(self, tokens: int) -> bool:
-        return self.ar_norm is not None and self.ar_norm.supports(tokens)
+        return self.ar_norm is not None and bool(self.policy("boundary", tokens))
 
     def plan(self, positions) -> Step | None:
         """This draft step's plan, or None for the stock forward: planned only

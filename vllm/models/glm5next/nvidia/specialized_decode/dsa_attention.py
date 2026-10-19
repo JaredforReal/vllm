@@ -346,8 +346,6 @@ TACTICS = {
     (512, 256): {1: (64, 16), 2: (32, 16), 4: (32, 16)},  # value up
     (128, 2048): {1: (64, 8), 2: (64, 8), 4: (64, 8), 8: (64, 8)},  # KDA g_b
 }
-# Token counts where cuBLAS's W_UV bmm is faster (3.0 vs 2.5 us at 8 tokens).
-VALUE_UP_MAX_TOKENS = 4
 
 
 def _flat(tensor):
@@ -438,7 +436,7 @@ class DsaAttentionStage:
     every other call runs the stock forward. ``max_tokens`` bounds the token
     counts whose attention gets the caller-owned counter buffer."""
 
-    def __init__(self, attention, max_tokens: int):
+    def __init__(self, attention, max_tokens: int, value_up_tokens: set[int]):
         from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
             FlashInferMLASparseImpl,
         )
@@ -466,6 +464,8 @@ class DsaAttentionStage:
         self.w_uk = mla.W_UK_T  # [N, P, L]
         self.w_uv = mla.W_UV.contiguous()  # [N, L, V]
         impl.kv_counter = _kv_counter(self.w_uk.device, max_tokens, self.heads)
+        # Token counts whose W_UV runs as the CuTe GEMV; cuBLAS's bmm otherwise.
+        self.value_up_tokens = value_up_tokens
         self.stock = w.forward
         w.forward = self.forward
 
@@ -516,7 +516,7 @@ class DsaAttentionStage:
             (m, self.heads, self.w_uv.shape[2]), dtype=q.dtype, device=q.device
         )
         latent = latent.view(m, self.heads, -1)
-        if m <= VALUE_UP_MAX_TOKENS:
+        if m in self.value_up_tokens:
             head_gemv(latent, self.w_uv, out)
         else:
             torch.bmm(latent.transpose(0, 1), mla.W_UV, out=out.transpose(0, 1))

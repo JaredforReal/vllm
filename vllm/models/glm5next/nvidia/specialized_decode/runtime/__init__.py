@@ -15,6 +15,8 @@ class DecodeConfig:
     capture_sizes: tuple[int, ...]
     # Layer stages that replace stock kernels ("kda"); the rest run stock modules.
     stages: frozenset[str]
+    # Overrides of the per-token-count dispatch (see ``policy.DEFAULT``).
+    policy: tuple[tuple[str, str], ...] = ()
 
 
 def specialized_decode_config(vllm_config) -> DecodeConfig | None:
@@ -39,6 +41,7 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
             vllm_config.compilation_config.cudagraph_capture_sizes or ()
         ),
         stages=frozenset(s for s in extra.get("stages", "kda").split(",") if s),
+        policy=tuple(extra.get("policy", {}).items()),
     )
 
 

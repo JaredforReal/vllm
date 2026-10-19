@@ -18,6 +18,7 @@ from vllm.model_executor.layers.mhc import hc_contract, hc_expand
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 from ..linear import planned_step
+from ..policy import Policy
 
 if TYPE_CHECKING:
     from ..all_reduce_mhc import AllReduceMhcBoundary
@@ -26,23 +27,6 @@ logger = init_logger(__name__)
 
 # Token counts (requests x tokens per request) with a planned decode path.
 MAX_TOKENS = 64
-# Token counts the fused all-reduce + mHC boundary serves.
-AR_MHC_MAX_TOKENS = 32
-# Token counts the MoE kernels serve: one 16-CTA cluster per route (two CTAs
-# per SM) up to PER_ROUTE_MAX_TOKENS, where TRTLLM-Gen overtakes it (42 vs
-# 49 us at 4 tokens, 73 vs 66 at 8), and the persistent expert-grouped
-# kernel up to GROUPED_MAX_TOKENS.
-PER_ROUTE_MAX_TOKENS = 4
-# Off until it beats the per-route kernel: its per-task handoffs cost more
-# than the cluster waves they avoid (25 vs 13 us at one token).
-GROUPED_MAX_TOKENS = 0
-MEGA_MAX_TOKENS = max(PER_ROUTE_MAX_TOKENS, GROUPED_MAX_TOKENS)
-# At four tokens the shared expert GEMVs slow the per-route clusters more than
-# DeepGEMM does (B4 step 4.56 vs 4.37 ms): it keeps the shared expert there.
-SHARED_MAX_TOKENS = 2
-# Token counts the dense layers' CuTe MLP serves (B1/B2/B4 steps 10-21 us
-# faster; at 8 tokens it only ties stock in isolation).
-DENSE_TOKENS = (1, 2, 4)
 # BF16 projections of the DSA layer and its indexer that dsa_gemm routes.
 DSA_PROJECTIONS = ("fused_qkv_a_proj", "q_b_proj", "o_proj")
 INDEXER_PROJECTIONS = ("wq_b", "wk_weights_proj")
@@ -114,6 +98,7 @@ class LayerStages:
     kda: dict[int, Any]
     mega: dict[int, Any]
     deferred: set[int]
+    policy: Policy
     # Dense layers whose MLP runs as the CuTe GEMVs.
     dense: dict[int, Any]
 
@@ -124,7 +109,9 @@ class LayerStages:
         from ..mega_moe import MegaExperts
         from ..shared_expert import SharedExpert
 
-        tokens = [b for b in self.batches if b <= MEGA_MAX_TOKENS]
+        tokens = [b for b in self.batches if self.policy("moe", b)]
+        per_route_tokens = [m for m in tokens if self.policy("moe", m) == "per_route"]
+        grouped_tokens = [m for m in tokens if self.policy("moe", m) == "grouped"]
         mega: dict[int, Any] = {}
         self.shared: dict[int, Any] = {}
         if not tokens:  # MTP verify steps hold q >= 2 tokens per request
@@ -153,12 +140,10 @@ class LayerStages:
             )
             logits_dtype = layer.mlp.gate.out_dtype or torch.bfloat16
             per_route = MegaExperts(*args)
-            per_route.prepare(
-                [m for m in tokens if m <= PER_ROUTE_MAX_TOKENS], logits_dtype
-            )
+            per_route.prepare(per_route_tokens, logits_dtype)
             se = layer.mlp.shared_experts
             grouped = None
-            if any(m > PER_ROUTE_MAX_TOKENS for m in tokens):
+            if grouped_tokens:
                 gate_up, down = se.gate_up_proj, se.down_proj
                 shared = shared_weights(
                     gate_up.weight,
@@ -167,9 +152,7 @@ class LayerStages:
                     _fp32_scales(down.weight_scale_inv, down.weight),
                 )
                 grouped = GroupedExperts(*args, shared=shared)
-                grouped.prepare(
-                    [m for m in tokens if m > PER_ROUTE_MAX_TOKENS], logits_dtype
-                )
+                grouped.prepare(grouped_tokens, logits_dtype)
             mega[layer.layer_idx] = (per_route, grouped)
             self.shared[layer.layer_idx] = SharedExpert(
                 se.gate_up_proj.weight,
@@ -180,7 +163,7 @@ class LayerStages:
                 is_deep_gemm_e8m0_used(),
             )
             self.shared[layer.layer_idx].prepare(
-                [m for m in tokens if m <= SHARED_MAX_TOKENS]
+                [m for m in per_route_tokens if self.policy("shared_expert", m)]
             )
             device = routed.w13_weight.device
         if mega:
@@ -197,7 +180,7 @@ class LayerStages:
 
         from ..dense_mlp import DenseMlp
 
-        tokens = [b for b in self.batches if b in DENSE_TOKENS]
+        tokens = [b for b in self.batches if self.policy("dense_mlp", b)]
         dense: dict[int, Any] = {}
         if not tokens:
             return dense
@@ -227,7 +210,7 @@ class LayerStages:
         moe = layer.mlp
         per_route, grouped = self.mega[layer.layer_idx]
         bias = moe.gate.e_score_correction_bias
-        if x.shape[0] > PER_ROUTE_MAX_TOKENS:
+        if self.policy("moe", x.shape[0]) == "grouped":
             # The grouped kernel runs the shared expert as one more expert.
             logits, _ = moe.experts.gate(x)
             rows, ids, weights, shared = grouped(x, logits, bias)
@@ -235,7 +218,7 @@ class LayerStages:
             main = torch.cuda.current_stream()
             self.shared_stream.wait_stream(main)
             with torch.cuda.stream(self.shared_stream):
-                if x.shape[0] <= SHARED_MAX_TOKENS:
+                if self.policy("shared_expert", x.shape[0]):
                     shared = self.shared[layer.layer_idx](x)
                 else:
                     shared = moe.shared_experts(x)
@@ -276,7 +259,7 @@ class LayerStages:
                 )
                 continue
             config = experts.moe_config
-            config.limit_deferred_moe_finalize(AR_MHC_MAX_TOKENS)
+            config.limit_deferred_moe_finalize(self.boundary_max_tokens)
             # Planned steps turn the deferral on per call; others finalize.
             config._defer_moe_finalize = True
             usable = config.use_deferred_moe_finalize
@@ -285,6 +268,10 @@ class LayerStages:
                 deferred.add(layer.layer_idx)
         logger.info("Specialized decode defers %d MoE finalizes", len(deferred))
         return deferred
+
+    @property
+    def boundary_max_tokens(self) -> int:
+        return max(self.policy.tokens("boundary", "fused"), default=0)
 
     def partial(self, tokens: int) -> bool:
         """Whether sublayers leave their output TP-partial for a fused
@@ -306,12 +293,12 @@ class LayerStages:
         """The FFN output and whether it is still TP-partial."""
         partial = self.partial(x.shape[0])
         dense = self.dense.get(layer.layer_idx)
-        if dense is not None and x.shape[0] in DENSE_TOKENS:
+        if dense is not None and self.policy("dense_mlp", x.shape[0]):
             out = dense(x)
             if not partial:
                 out = tensor_model_parallel_all_reduce(out)
             return out, partial
-        if partial and layer.layer_idx in self.mega and x.shape[0] <= MEGA_MAX_TOKENS:
+        if partial and layer.layer_idx in self.mega and self.policy("moe", x.shape[0]):
             return self._mega_moe(layer, x), True
         if partial and layer.layer_idx in self.deferred:
             experts = layer.mlp.experts
@@ -334,6 +321,7 @@ class SpecializedDecode(LayerStages):
     def __init__(self, backbone, config):
         self.backbone = backbone
         self.config = config
+        self.policy = Policy(config.policy)
         self.q = config.q
         self.layers = list(backbone.layers)
         self.text_config = backbone.config
@@ -353,7 +341,9 @@ class SpecializedDecode(LayerStages):
                         self.batches,
                         self.q,
                         gemm="gemm" in config.stages,
-                        gate="kda_gate" in config.stages,
+                        gate_tokens=self.policy.tokens("kda_gate", "cute")
+                        if "kda_gate" in config.stages
+                        else frozenset(),
                     )
                     self.kda[layer.layer_idx] = stage
         self.routed: list[str] = []
@@ -382,7 +372,11 @@ class SpecializedDecode(LayerStages):
 
             for layer in self.layers:
                 if layer.layer_kind == "mla":
-                    DsaAttentionStage(layer.self_attn, MAX_TOKENS)
+                    DsaAttentionStage(
+                        layer.self_attn,
+                        MAX_TOKENS,
+                        self.policy.tokens("dsa_value_up", "cute"),
+                    )
         if "dsa_kpool" in config.stages:
             from vllm.models.glm5next.nvidia import sparse_indexer
 
@@ -432,7 +426,7 @@ class SpecializedDecode(LayerStages):
             return None
         return AllReduceMhcBoundary(
             hidden_size=first.hidden_size,
-            max_num_tokens=AR_MHC_MAX_TOKENS,
+            max_num_tokens=self.boundary_max_tokens,
             top_k=self.text_config.num_experts_per_tok,
             rms_eps=first.rms_norm_eps,
             hc_eps=first.hc_eps,
@@ -443,7 +437,7 @@ class SpecializedDecode(LayerStages):
         )
 
     def partial(self, tokens: int) -> bool:
-        return self.ar_mhc is not None and self.ar_mhc.supports(tokens)
+        return self.ar_mhc is not None and bool(self.policy("boundary", tokens))
 
     def boundary(self, layer, x, residual, post, comb, fn, scale, base, norm):
         """The previous sublayer's mHC post, then the next one's pre and norm."""
