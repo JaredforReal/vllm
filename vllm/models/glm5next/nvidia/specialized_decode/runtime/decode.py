@@ -37,9 +37,9 @@ PER_ROUTE_MAX_TOKENS = 4
 # than the cluster waves they avoid (25 vs 13 us at one token).
 GROUPED_MAX_TOKENS = 0
 MEGA_MAX_TOKENS = max(PER_ROUTE_MAX_TOKENS, GROUPED_MAX_TOKENS)
-# Above one token the per-route clusters take more than one wave, which the
-# shared expert GEMVs then slow down: DeepGEMM's shared expert stays there.
-SHARED_MAX_TOKENS = 1
+# At four tokens the shared expert GEMVs slow the per-route clusters more than
+# DeepGEMM does (B4 step 4.56 vs 4.37 ms): it keeps the shared expert there.
+SHARED_MAX_TOKENS = 2
 # BF16 projections of the DSA layer and its indexer that dsa_gemm routes.
 DSA_PROJECTIONS = ("fused_qkv_a_proj", "q_b_proj", "o_proj")
 INDEXER_PROJECTIONS = ("wq_b", "wk_weights_proj")
