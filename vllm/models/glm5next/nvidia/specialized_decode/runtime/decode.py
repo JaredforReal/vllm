@@ -285,7 +285,7 @@ class LayerStages:
 
     @property
     def boundary_max_tokens(self) -> int:
-        return max(self.policy.tokens("boundary", "fused"), default=0)
+        return max(self.policy.tables["boundary"], default=0)
 
     def partial(self, tokens: int) -> bool:
         """Whether sublayers leave their output TP-partial for a fused
@@ -451,6 +451,7 @@ class SpecializedDecode(LayerStages):
             sinkhorn_repeat=first.mhc_sinkhorn_iterations,
             norm_eps=norms.pop(),
             device=first.hc_attn_fn.device,
+            cluster_tokens=self.policy.tables["boundary"],
         )
 
     def partial(self, tokens: int) -> bool:

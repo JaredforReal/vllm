@@ -74,10 +74,12 @@ def _boundary(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
         torch.accelerator.set_device_index(device)
         init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
         ensure_model_parallel_initialized(tp_size, pp_size)
+        # Larger batches share each cluster between tokens; 37 and 64 end on a
+        # short group.
         op = AllReduceMhcBoundary(
-            hidden_size=HIDDEN, max_num_tokens=16, top_k=TOP_K, rms_eps=EPS,
+            hidden_size=HIDDEN, max_num_tokens=64, top_k=TOP_K, rms_eps=EPS,
             hc_eps=EPS, post_mult=2.0, sinkhorn_repeat=SINKHORN, norm_eps=EPS,
-            device=device,
+            device=device, cluster_tokens={6: 2, 16: 2, 37: 3, 48: 4, 64: 5},
         )  # fmt: skip
 
         def check(outputs, i):
@@ -91,7 +93,7 @@ def _boundary(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
             torch.testing.assert_close(outputs[3], ref[3], atol=2**-5, rtol=2**-7)
 
         # Changing shapes cover shrinking and growing batches in one mailbox.
-        for tokens in (1, 6, 16, 3, 2):
+        for tokens in (1, 6, 16, 3, 2, 64, 37, 48, 8):
             i = _inputs(tokens, rank, device)
             args = [i[k] for k in ("x", "residual", "post", "comb", "fn")]
             args += [i[k] for k in ("scale", "base", "norm")]

@@ -12,9 +12,12 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.policy import 
 )
 
 DEFAULT = {
-    # Fused all-reduce + mHC boundary (all-reduce + norm in the draft); slower
-    # than stock at 64 tokens.
-    "boundary": "1-32:fused",
+    # Fused all-reduce + mHC boundary (all-reduce + norm in the draft), by
+    # tokens per 8-CTA cluster. GB300 holds 15 such clusters at once; each
+    # extra token per cluster costs ~1.2 us (standalone 7.6 / 8.9 / 10.0 / 11.1
+    # / 12.6 us at 8 / 16 / 32 / 48 / 64 tokens; stock all-reduce + mHC ~25 us
+    # at 64).
+    "boundary": "1-15:1,16-30:2,31-45:3,46-60:4,61-64:5",
     # Routed experts: one 16-CTA cluster per route (two CTAs per SM) up to 4
     # tokens, where TRTLLM-Gen overtakes it (42 vs 49 us at 4 tokens, 73 vs 66
     # at 8). From 8 tokens the persistent expert-grouped kernel ("grouped",
