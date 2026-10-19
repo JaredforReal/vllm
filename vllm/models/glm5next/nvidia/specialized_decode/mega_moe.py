@@ -546,6 +546,10 @@ def _logical_rows(n: int, device) -> torch.Tensor:
     return order.to(device=device, dtype=torch.int32)
 
 
+# Compiled kernels by shape, shared by every layer.
+_compiled: dict = {}
+
+
 class MegaExperts:
     """Routed experts of up to a few tokens: routing, GEMM1, clamped SwiGLU, FP8
     hidden and GEMM2 of every (token, expert) route in one kernel."""
@@ -574,7 +578,9 @@ class MegaExperts:
             hidden=hidden, inter=n1 // 2, experts=experts, top_k=top_k, limit=limit,
             scale=scale, ue8m0=ue8m0,
         )  # fmt: skip
-        self.compiled: dict = {}
+        self.compiled = _compiled.setdefault(
+            (hidden, n1 // 2, experts, top_k, limit, scale, ue8m0), {}
+        )
 
     def prepare(self, tokens: list[int], logits_dtype: torch.dtype) -> None:
         """Compiles the kernel for these token counts before graph capture."""

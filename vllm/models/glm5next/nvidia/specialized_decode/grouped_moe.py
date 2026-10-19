@@ -1093,6 +1093,8 @@ class _GroupedKernel:
 
 
 _workspaces: dict = {}
+# Compiled kernels by shape, shared by every layer.
+_compiled: dict = {}
 
 
 def _workspace(device, experts, top_k, hidden, inter, grid):
@@ -1153,7 +1155,10 @@ class GroupedExperts:
         )
         assert torch.equal(within[0], within[1]), "up and gate shuffles differ"
         self.grid = torch.cuda.get_device_properties(w13.device).multi_processor_count
-        self.compiled: dict = {}
+        self.compiled = _compiled.setdefault(
+            (self.hidden, self.inter, experts, top_k, limit, scale, ue8m0, self.grid),
+            {},
+        )
 
     def kernel(self, tokens, finalize):
         return _GroupedKernel(
