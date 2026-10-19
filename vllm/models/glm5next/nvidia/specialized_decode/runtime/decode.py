@@ -337,6 +337,12 @@ class SpecializedDecode(LayerStages):
             for layer in self.layers:
                 if layer.layer_kind == "mla":
                     IndexerStage(layer.self_attn.indexer)
+        if "dsa_attn" in config.stages:
+            from ..dsa_attention import DsaAttentionStage
+
+            for layer in self.layers:
+                if layer.layer_kind == "mla":
+                    DsaAttentionStage(layer.self_attn, MAX_TOKENS)
         if "dsa_kpool" in config.stages:
             from vllm.models.glm5next.nvidia import sparse_indexer
 
