@@ -99,6 +99,7 @@ class LayerStages:
     mega: dict[int, Any]
     deferred: set[int]
     policy: Policy
+    config: Any
     # Dense layers whose MLP runs as the CuTe GEMVs.
     dense: dict[int, Any]
 
@@ -152,7 +153,11 @@ class LayerStages:
                     _fp32_scales(down.weight_scale_inv, down.weight),
                 )
                 grouped = GroupedExperts(*args, shared=shared)
-                grouped.prepare(grouped_tokens, logits_dtype)
+                # Token counts without a fused boundary reduce in the kernel.
+                fused = "ar_mhc" in self.config.stages
+                finalized = [m for m in grouped_tokens
+                             if not (fused and self.policy("boundary", m))]  # fmt: skip
+                grouped.prepare(grouped_tokens, logits_dtype, finalized)
             mega[layer.layer_idx] = (per_route, grouped)
             self.shared[layer.layer_idx] = SharedExpert(
                 se.gate_up_proj.weight,
@@ -233,6 +238,15 @@ class LayerStages:
         )
         return MoEOutput(routed=routed, shared_output=shared)
 
+    def _grouped_moe(self, layer, x):
+        """Routed and shared experts as the grouped kernel, finalized and
+        all-reduced (token counts without a fused boundary)."""
+        moe = layer.mlp
+        _, grouped = self.mega[layer.layer_idx]
+        logits, _ = moe.experts.gate(x)
+        bias = moe.gate.e_score_correction_bias
+        return tensor_model_parallel_all_reduce(grouped(x, logits, bias, finalize=True))
+
     def _defer_moe_finalize(self) -> set[int]:
         """MoE layers (but the last) whose TRTLLM-Gen FP8 experts can stop
         after GEMM2 for the fused boundary's finalize publish."""
@@ -298,8 +312,11 @@ class LayerStages:
             if not partial:
                 out = tensor_model_parallel_all_reduce(out)
             return out, partial
-        if partial and layer.layer_idx in self.mega and self.policy("moe", x.shape[0]):
-            return self._mega_moe(layer, x), True
+        if layer.layer_idx in self.mega and self.policy("moe", x.shape[0]):
+            if partial:
+                return self._mega_moe(layer, x), True
+            if self.policy("moe", x.shape[0]) == "grouped":
+                return self._grouped_moe(layer, x), False
         if partial and layer.layer_idx in self.deferred:
             experts = layer.mlp.experts
             with _swap(experts.moe_config, "_defer_moe_finalize", True):
