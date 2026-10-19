@@ -4,8 +4,8 @@
 as two CuTe kernels, in place of input quant, DeepGEMM gate_up, SwiGLU, quant and
 DeepGEMM down.
 
-Each CTA owns 16 weight rows over the whole K and each of its warps 512 of K, one
-m16n8k32 FP8 mma.sync per 32 K with the tokens as the eight B columns. A lane
+A CTA owns a few 16-row tiles over the whole K, one warp per (tile, 512 of K):
+one m16n8k32 FP8 mma.sync per 32 K with the tokens as the eight B columns. A lane
 always reads the same 16 bytes of a row (and of a token), so its A and B
 fragments come from plain 16-byte loads: within each 64-K step lane (g, q) holds
 K 16q..16q+15 of rows g and g + 8, and the two mmas of the step take its first
@@ -13,8 +13,10 @@ and last eight bytes. Any K order is fine as long as A and B agree.
 
 The CTA's weights stream into shared memory (cp.async, L2 evict-first) and,
 for the first ``in_regs`` steps, into registers before the PDL wait, so a whole
-layer's weights are in flight at launch. After the wait every warp quantizes its
-own K slice of the tokens (FP8 per 128 with the stock scale rule), each 128-K
+layer's weights are in flight at launch. After the wait the tiles' warps of a K
+slice split its tokens and quantize them once for the CTA (FP8 per 128 with the
+stock scale rule): every CTA reads and quantizes the whole input, so fewer,
+larger CTAs (one per SM) keep that from growing with the tokens. Each 128-K
 group's four mmas sum in FP32 and take the weight and activation scales, and the
 warps' partial sums meet in shared memory.
 
@@ -68,18 +70,19 @@ class _MmaGemv:
     gate (first half) and up (second half) rows."""
 
     def __init__(
-        self, rows: int, k: int, tokens: int, in_regs: int, ctas_per_sm: int,
-        swiglu: bool, limit: float, ue8m0: bool,
+        self, rows: int, k: int, tokens: int, tiles: int, in_regs: int,
+        ctas_per_sm: int, swiglu: bool, limit: float, ue8m0: bool,
     ):  # fmt: skip
-        assert k % SLICE == 0 and rows % 16 == 0 and 0 <= in_regs <= STEPS
+        assert k % SLICE == 0 and rows % (16 * tiles) == 0 and 0 <= in_regs <= STEPS
         assert 1 <= tokens <= MAX_TOKENS
         self.rows, self.k, self.tokens, self.in_regs = rows, k, tokens, in_regs
         self.ctas_per_sm, self.swiglu, self.limit = ctas_per_sm, swiglu, limit
-        self.ue8m0 = ue8m0
-        self.warps = k // SLICE
+        self.ue8m0, self.tiles = ue8m0, tiles
+        self.slices = k // SLICE  # warps per tile
+        self.warps = self.slices * tiles
         self.threads = 32 * self.warps
-        assert self.threads >= 16 * tokens
-        self.ctas = rows // 16
+        assert 32 * self.slices >= 16 * tokens and self.threads <= 1024
+        self.ctas = rows // (16 * tiles)
         self.staged = STEPS - in_regs
         # Weights, then the quantized slices (reused for the partial sums).
         self.weight_words = self.warps * self.staged * 2 * 32 * 4
@@ -97,10 +100,10 @@ class _MmaGemv:
             min_blocks_per_mp=self.ctas_per_sm, stream=st, use_pdl=True,
         )  # fmt: skip
 
-    def _row(self, cta, half, g):
+    def _row(self, tile, half, g):
         if self.swiglu:
-            return cta * 8 + g + half * (self.rows // 2)
-        return cta * 16 + half * 8 + g
+            return tile * 8 + g + half * (self.rows // 2)
+        return tile * 16 + half * 8 + g
 
     def _slot(self, staged, warp, h, step):
         """Shared words of step ``step``, half ``h`` of the warp's weights."""
@@ -120,8 +123,10 @@ class _MmaGemv:
         lane = cute.arch.lane_idx()
         cta, _, _ = cute.arch.block_idx()
         g, q = lane // 4, lane % 4
-        k0 = warp * SLICE
-        rows = [Int64(self._row(cta, h, g)) for h in range(2)]
+        # Warp (tile i, slice j) of the CTA's tiles x K slices.
+        tile, piece = warp // self.slices, warp % self.slices
+        k0 = piece * SLICE
+        rows = [Int64(self._row(cta * self.tiles + tile, h, g)) for h in range(2)]
 
         regs = cute.make_rmem_tensor(
             cute.make_layout((2, max(self.in_regs, 1), 4)), Uint32
@@ -148,15 +153,25 @@ class _MmaGemv:
 
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
-        # Lane l quantizes K k0 + 16l .. + 15 of every token; 8 lanes per group.
+        # The tiles' warps of a K slice share its quantized tokens: tile i's
+        # warp takes tokens i, i + tiles, ... Lane l quantizes K k0 + 16l .. + 15;
+        # 8 lanes per group.
+        rounds = (tokens + self.tiles - 1) // self.tiles
+        mine = act + piece * tokens * SLICE // 4
+        owned = []
+        for j in cutlass.range_constexpr(rounds):
+            t = j * self.tiles + tile
+            if t >= tokens:
+                t = tokens - 1
+            owned.append(t)
         loaded = [
             load_words(x.iterator + t * k + k0 + lane * 16, count=4, mutable=True)
             + load_words(x.iterator + t * k + k0 + lane * 16 + 8, count=4, mutable=True)
-            for t in range(tokens)
+            for t in owned
         ]
-        mine = act + warp * tokens * SLICE // 4
-        for t in cutlass.range_constexpr(tokens):
-            values = [v for word in loaded[t] for v in unpack_bf16(word)]
+        for j in cutlass.range_constexpr(rounds):
+            t = owned[j]
+            values = [v for word in loaded[j] for v in unpack_bf16(word)]
             amax = Float32(0.0)
             for v in values:
                 amax = cute.arch.fmax(amax, cute.arch.fmax(v, -v))
@@ -169,11 +184,12 @@ class _MmaGemv:
                 pack_fp8(tuple(values[4 * j + v] * inverse for v in range(4)))
                 for j in range(4)
             )
-            store_words(mine + t * SLICE // 4 + lane * 4, packed, shared=True)
-            if lane % 8 == 0:
-                index = t * (k // GROUP) + k0 // GROUP + lane // 8
-                _store_scale(x_scales, index, scale)
-        cute.arch.sync_warp()
+            if j * self.tiles + tile < tokens:
+                store_words(mine + t * SLICE // 4 + lane * 4, packed, shared=True)
+                if lane % 8 == 0:
+                    index = t * (k // GROUP) + k0 // GROUP + lane // 8
+                    _store_scale(x_scales, index, scale)
+        cute.arch.barrier()
 
         # B fragments: token g's 16 bytes of each step; columns past the tokens
         # repeat the last one and are never read.
@@ -229,17 +245,21 @@ class _MmaGemv:
         partial = act
         store_words(partial + (warp * 32 + lane) * 4, tuple(total), shared=True)
         cute.arch.barrier()
-        self.epilogue(partial, out, cta, tid)
+        self.epilogue(
+            partial + tile * self.slices * 128, out, cta * self.tiles + tile,
+            tid % (32 * self.slices),
+        )  # fmt: skip
 
     def _summed(self, partial, src, i):
-        """Partial sum ``i`` of lane ``src``, over the warps."""
+        """Partial sum ``i`` of lane ``src``, over the tile's warps."""
         value = Float32(0.0)
-        for v in range(self.warps):
+        for v in range(self.slices):
             value = value + _load_scale(partial, (v * 32 + src) * 4 + i)
         return value
 
     @cute.jit
     def epilogue(self, partial, out, cta, tid):
+        """Tile ``cta``'s outputs from its warps' partial sums."""
         tokens = self.tokens
         if cutlass.const_expr(self.swiglu):
             # Element (token t, gate row g): C column t of lane 4g + t / 2.
@@ -266,11 +286,11 @@ class _MmaGemv:
                 _store_bf16_if(pointer, value, 1)
 
 
-# (weight steps held in registers, CTAs per SM) of the gate_up kernel by token
-# count (GB300 microbench: 5.3 / 5.6 / 6.9 / 10.9 us at 1 / 2 / 4 / 8
-# tokens), and of the down kernel.
-GATE_UP_SHAPES = {1: (4, 3), 2: (4, 3), 4: (6, 2), 8: (6, 2)}
-DOWN_SHAPE = (0, 4)
+# (16-row tiles per CTA, weight steps held in registers, CTAs per SM). More
+# tiles per CTA share one quantized input among more rows: 128 one-per-SM
+# CTAs for both kernels.
+GATE_UP_SHAPE = (3, 4, 1)
+DOWN_SHAPE = (2, 4, 1)
 
 
 class DenseMlp:
@@ -311,7 +331,7 @@ class DenseMlp:
                     self.n1,
                     self.k,
                     m,
-                    *GATE_UP_SHAPES.get(m, (6, 2)),
+                    *GATE_UP_SHAPE,
                     True,
                     self.limit,
                     self.ue8m0,

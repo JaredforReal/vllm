@@ -24,9 +24,9 @@ DEFAULT = {
     # Shared expert GEMVs beside the per-route clusters. At four tokens they slow
     # the clusters more than DeepGEMM does (B4 step 4.56 vs 4.37 ms).
     "shared_expert": "1-2:cute",
-    # Dense layers' MLP (B1/B2/B4 steps 10-21 us faster; at 8 tokens it only
-    # ties stock in isolation).
-    "dense_mlp": "1-2:cute,4:cute",
+    # Dense layers' MLP: 7.5 / 8.4 / 11.0 us per layer in situ at 1 / 4 / 8
+    # tokens, stock ~20.
+    "dense_mlp": "1-2:cute,4:cute,8:cute",
     # KDA output gate g_b_proj; cuBLAS wins at 8 (1.7 vs 2.0 us with the
     # weights out of L2).
     "kda_gate": "1-4:cute",
