@@ -15,7 +15,8 @@ top-k and the attention, then the cuBLAS W_UV bmm. Here:
   indexer, so only the index remap separates the top-k from the attention;
 - the attention kernel gets one caller-owned counter buffer (it resets the
   counters itself), so FlashInfer zero-fills none per call;
-- ``head_gemv`` is the W_UV bmm.
+- ``head_gemv`` is the W_UV bmm (and, for the KDA stage, the output gate's
+  g_b_proj).
 
 The bmms are per-head ``x @ W`` products with W row-major [I, J]: a thread
 holds RPT rows of eight consecutive columns, loaded before the PDL wait, and
@@ -343,6 +344,7 @@ class _HeadGemvKernel:
 TACTICS = {
     (256, 512): {1: (64, 8), 2: (64, 8), 4: (64, 16), 8: (64, 16)},  # absorb
     (512, 256): {1: (64, 16), 2: (32, 16), 4: (32, 16)},  # value up
+    (128, 2048): {1: (64, 8), 2: (64, 8), 4: (64, 8), 8: (64, 8)},  # KDA g_b
 }
 # Token counts where cuBLAS's W_UV bmm is faster (3.0 vs 2.5 us at 8 tokens).
 VALUE_UP_MAX_TOKENS = 4

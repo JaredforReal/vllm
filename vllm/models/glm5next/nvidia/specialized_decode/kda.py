@@ -25,13 +25,17 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda.prepared import (
     executable,
 )
 
+from .dsa_attention import head_gemv
 from .gemm import Projection
 
 HEAD_DIM = 128
+# Token counts whose output gate runs as a CuTe GEMV: cuBLAS wins at 8 (1.7 vs
+# 2.0 us with the weights out of L2).
+GATE_MAX_TOKENS = 4
 
 
 class KdaStage:
-    def __init__(self, attention, batches, q, gemm=False):
+    def __init__(self, attention, batches, q, gemm=False, gate=False):
         self.attention = a = attention
         # Skinny (in_proj, o_proj) GEMMs.
         self.projections: tuple[Projection, Projection] | None = None
@@ -41,6 +45,11 @@ class KdaStage:
                 Projection(a.o_proj.weight),
             )
         self.heads = a.local_num_heads
+        # The low-rank output gate's g_b_proj as a CuTe GEMV (stage kda_gate):
+        # its transposed weight, [1, rank, heads x 128].
+        self.g_b = None
+        if gate and a.g_b_proj.weight.dtype == torch.bfloat16:
+            self.g_b = a.g_b_proj.weight.detach().t().contiguous().unsqueeze(0)
         self.dim = self.heads * HEAD_DIM
         conv = torch.cat(
             [m.weight.detach() for m in (a.q_conv1d, a.k_conv1d, a.v_conv1d)]
@@ -107,7 +116,11 @@ class KdaStage:
         projected = skinny[0](x) if skinny is not None else a.in_proj_qkvbfg_a(x)[0]
         d, h = self.dim, self.heads
         g_a = projected[:, 3 * d + h + HEAD_DIM : 3 * d + h + 2 * HEAD_DIM]
-        gate = a.g_b_proj(g_a)[0]
+        if self.g_b is not None and x.shape[0] <= GATE_MAX_TOKENS:
+            gate = torch.empty((x.shape[0], d), dtype=x.dtype, device=x.device)
+            head_gemv(g_a.unsqueeze(1), self.g_b, gate.unsqueeze(1))
+        else:
+            gate = a.g_b_proj(g_a)[0]
         out = torch.empty((x.shape[0], d), dtype=x.dtype, device=x.device)
         batch = x.shape[0]
         if q > 1:

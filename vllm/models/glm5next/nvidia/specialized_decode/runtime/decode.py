@@ -314,6 +314,7 @@ class SpecializedDecode(LayerStages):
                         self.batches,
                         self.q,
                         gemm="gemm" in config.stages,
+                        gate="kda_gate" in config.stages,
                     )
                     self.kda[layer.layer_idx] = stage
         self.routed: list[str] = []

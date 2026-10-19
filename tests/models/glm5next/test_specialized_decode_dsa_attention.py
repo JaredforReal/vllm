@@ -148,3 +148,25 @@ def test_absorb_writes_kv_cache_as_stock(tokens, k_scale):
     untouched[slots[slots >= 0]] = False
     assert not cache.reshape(-1, LATENT)[untouched].any()
 
+
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8])
+def test_kda_gate_matches_linear(tokens):
+    """The KDA output gate's g_b_proj (rank 128 -> 16 heads x 128) on a strided
+    slice of the in_proj output, as ``head_gemv`` of one head."""
+    from vllm.models.glm5next.nvidia.specialized_decode.dsa_attention import (
+        head_gemv,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(tokens)
+    rank, width, pitch = 128, 2048, 6416
+    weight = torch.randn(width, rank, generator=g, device="cuda") * rank**-0.5
+    weight = weight.bfloat16()
+    projected = torch.randn(tokens, pitch, generator=g, device="cuda").bfloat16()
+    g_a = projected[:, 6288 : 6288 + rank]
+    gate = torch.empty(tokens, width, dtype=torch.bfloat16, device="cuda")
+    head_gemv(g_a.unsqueeze(1), weight.t().contiguous().unsqueeze(0), gate.unsqueeze(1))
+
+    reference = g_a.double() @ weight.double().t()
+    stock = torch.nn.functional.linear(g_a, weight)
+    ours, theirs = _errors(gate, reference), _errors(stock, reference)
+    assert ours[0] <= theirs[0] and ours[1] <= theirs[1] * 1.02, (ours, theirs)
