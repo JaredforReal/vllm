@@ -126,3 +126,48 @@ def test_fused_query_matches_pair(tokens, heads):
         assert torch.equal(weights, ref_w)
         assert torch.equal(fused_gate, gate_score)
         torch.testing.assert_close(key, ref_key, atol=2**-7, rtol=2**-7)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_bf16_head_weights_round_fp32(fused):
+    """BF16 head weights (for the SM100 MQA logits) are the FP32 ones rounded
+    as ``.to(torch.bfloat16)`` rounds them, padding included."""
+    from vllm.models.glm5next.nvidia.specialized_decode.indexer import (
+        IndexerProjection,
+    )
+    from vllm.models.glm5next.nvidia.specialized_decode.indexer_query import (
+        indexer_query,
+    )
+
+    tokens, heads = 2, 16
+    g = torch.Generator(device="cuda").manual_seed(7)
+    wk = (
+        torch.randn(KEY + heads, HIDDEN, generator=g, device="cuda") * 0.02
+    ).bfloat16()
+    gate = (torch.randn(GATE, HIDDEN, generator=g, device="cuda") * 0.02).bfloat16()
+    projection = IndexerProjection(
+        SimpleNamespace(
+            head_dim=KEY,
+            n_head=heads,
+            index_kpool_compress_gate=SimpleNamespace(data=gate),
+            wk_weights_proj=SimpleNamespace(weight=SimpleNamespace(data=wk)),
+        )
+    )
+    norm = SimpleNamespace(
+        weight=1 + 0.1 * torch.randn(DIM, generator=g, device="cuda"),
+        bias=0.1 * torch.randn(DIM, generator=g, device="cuda"),
+        eps=1e-6,
+    )
+    scale = DIM**-0.5 * heads**-0.5
+    x = torch.randn(tokens, HIDDEN, generator=g, device="cuda").bfloat16()
+    q = torch.randn(tokens, heads * DIM, generator=g, device="cuda").bfloat16()
+    outputs = []
+    for dtype in (torch.float32, torch.bfloat16):
+        if fused:
+            outputs.append(projection.fused(x, q, norm, scale, 32, dtype)[1])
+        else:
+            k, w, _ = projection(x)
+            outputs.append(indexer_query(q, k, w, norm, scale, 32, dtype)[1])
+    fp32, bf16 = outputs
+    assert bf16.dtype == torch.bfloat16
+    assert torch.equal(bf16.view(torch.int16), fp32.bfloat16().view(torch.int16))

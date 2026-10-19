@@ -34,8 +34,9 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives imp
     shared_address,
     wait,
 )
+from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 
-from .indexer_query import DIM, hadamard_quant, indexer_query
+from .indexer_query import DIM, hadamard_quant, indexer_query, store_weight
 from .linear import planned
 from .mega_moe import _store_bf16
 from .shared_expert import _round_bf16
@@ -91,8 +92,9 @@ class _ProjectionKernel:
         self.tiles = (tokens + TILE - 1) // TILE
         self.smem = (warps * self.tiles * 32 * 4 + tokens * ROWS) * 4
         if fused is not None:
-            # (padded heads, CTAs incl. the cluster padding, first head CTA)
-            self.padded, self.ctas, self.first_head = fused
+            # (padded heads, CTAs incl. the cluster padding, first head CTA,
+            # BF16 head weights)
+            self.padded, self.ctas, self.first_head, self.bf16 = fused
             self.cluster = key // ROWS  # the key rows' CTAs: one cluster
             assert split == 1 and self.ctas % self.cluster == 0
             self.fused_smem = (
@@ -288,7 +290,10 @@ class _ProjectionKernel:
             ):  # fmt: skip
                 q_out[i // spare, self.heads + i % spare, lane] = Int32(0)
                 if lane == 0:
-                    w_out[i // spare, self.heads + i % spare] = Float32(0.0)
+                    store_weight(
+                        w_out, i // spare, self.heads + i % spare, Float32(0.0),
+                        self.padded, self.bf16,
+                    )  # fmt: skip
         rounds = (self.tokens + self.warps - 1) // self.warps
         mine = [j * self.warps + warp for j in range(rounds)]
         head = min(max(cta - self.first_head, 0), self.heads - 1)
@@ -321,7 +326,8 @@ class _ProjectionKernel:
             kind = code >> 16
             total = self.warp_total(partial, e)
             if kind == _HEAD:
-                w_out[t, index] = total * scales[t] * scale
+                value = total * scales[t] * scale
+                store_weight(w_out, t, index, value, self.padded, self.bf16)
             elif kind == _GATE:
                 _store_bf16(gate.iterator + t * self.gate + index, total)
             elif kind == _KEY:
@@ -449,15 +455,15 @@ class IndexerProjection:
         _compiled[cache](*(to_cute(t, 16) for t in args), st)
         return key, weights, gate
 
-    def fused(self, x, q, norm, scale: float, padded: int):
-        """(q_fp8 [M, padded, 128], scaled head weights [M, padded] FP32, normed
-        key [M, 128] BF16, kpool gate [M, 128] BF16), as ``__call__`` followed by
+    def fused(self, x, q, norm, scale: float, padded: int, weights_dtype=torch.float32):
+        """(q_fp8 [M, padded, 128], scaled head weights [M, padded], normed key
+        [M, 128] BF16, kpool gate [M, 128] BF16), as ``__call__`` followed by
         ``indexer_query``."""
         m, k = x.shape
         assert x.is_contiguous() and q.is_contiguous()
         dev = x.device
         q_out = torch.empty((m, padded, DIM), dtype=torch.float8_e4m3fn, device=dev)
-        w_out = torch.empty((m, padded), dtype=torch.float32, device=dev)
+        w_out = torch.empty((m, padded), dtype=weights_dtype, device=dev)
         key = torch.empty((m, self.key), dtype=torch.bfloat16, device=dev)
         gate = torch.empty((m, self.gate), dtype=torch.bfloat16, device=dev)
         words = q_out.view(torch.int32).view(m, padded, DIM // 4)
@@ -465,11 +471,12 @@ class IndexerProjection:
                 norm.bias, self.slots)  # fmt: skip
         st = stream(dev)
         rows = self.weight.shape[0]
-        cache = ("fused", rows, k, self.heads, padded, m, dev.index)
+        bf16 = weights_dtype == torch.bfloat16
+        cache = ("fused", rows, k, self.heads, padded, bf16, m, dev.index)
         if cache not in _compiled:
             kernel = _ProjectionKernel(
                 rows, k, self.key, self.heads, m, FUSED_WARPS, 1,
-                fused=(padded, self.slots.numel() // ROWS, self.first_head),
+                fused=(padded, self.slots.numel() // ROWS, self.first_head, bf16),
             )  # fmt: skip
             _compiled[cache] = cute.compile(
                 kernel.fused_call, *(to_cute(t, 16) for t in args),
@@ -494,6 +501,11 @@ class IndexerStage:
         self.indexer = indexer
         self.stock = indexer.forward
         self.projection = IndexerProjection(indexer)
+        # The SM100 MQA logits take BF16 head weights: writing them in BF16
+        # saves the stock FP32 -> BF16 cast kernel, bit for bit.
+        self.weights_dtype = (
+            torch.bfloat16 if mqa_logits_use_mx_scales() else torch.float32
+        )
         indexer.forward = self.forward
 
     def forward(self, hidden_states, qr, positions, rotary_emb):
@@ -503,13 +515,16 @@ class IndexerStage:
         q, _ = ind.wq_b(qr)
         scale = ind.softmax_scale * ind.n_head**-0.5
         padded = max(ind.n_head, MQA_MIN_HEADS)
+        dtype = self.weights_dtype
         if _fuse(hidden_states.shape[0], ind.n_head):
             q_fp8, weights, k, gate_score = self.projection.fused(
-                hidden_states, q, ind.k_norm, scale, padded
+                hidden_states, q, ind.k_norm, scale, padded, dtype
             )
         else:
             k, weights, gate_score = self.projection(hidden_states)
-            q_fp8, weights, k = indexer_query(q, k, weights, ind.k_norm, scale, padded)
+            q_fp8, weights, k = indexer_query(
+                q, k, weights, ind.k_norm, scale, padded, dtype
+            )
         return ind.indexer_op(
             hidden_states,
             q_fp8,

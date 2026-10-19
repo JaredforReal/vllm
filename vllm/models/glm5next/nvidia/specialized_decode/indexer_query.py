@@ -35,6 +35,7 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives imp
     warp_sum,
 )
 
+from .mega_moe import _store_bf16
 from .shared_expert import _round_bf16
 
 DIM = 128
@@ -101,10 +102,20 @@ def hadamard_quant(got, lane):
     return Int32(pack_fp8(tuple(y))), q_scale
 
 
+@cute.jit
+def store_weight(w_out, t, head, value, padded: cutlass.Constexpr, bf16):
+    """``w_out[t, head] = value``, rounded to BF16 (as ``.to(torch.bfloat16)``)
+    when ``bf16``."""
+    if cutlass.const_expr(bf16):
+        _store_bf16(w_out.iterator + t * padded + head, value)
+    else:
+        w_out[t, head] = value
+
+
 class _QueryKernel:
-    def __init__(self, heads: int, padded: int):
+    def __init__(self, heads: int, padded: int, bf16: bool):
         assert heads % WARPS == 0 and padded >= heads
-        self.heads, self.padded = heads, padded
+        self.heads, self.padded, self.bf16 = heads, padded, bf16
         self.groups = heads // WARPS  # CTAs per token for the heads
 
     @cute.jit
@@ -147,7 +158,7 @@ class _QueryKernel:
             for head in cutlass.range(self.heads + warp, self.padded, WARPS, unroll=1):
                 q_out[t, head, lane] = Int32(0)
                 if lane == 0:
-                    w_out[t, head] = Float32(0.0)
+                    store_weight(w_out, t, head, Float32(0.0), self.padded, self.bf16)
 
     @cute.jit
     def head(self, q, weights, q_out, w_out, scale, t, head, lane):
@@ -159,7 +170,8 @@ class _QueryKernel:
         word, q_scale = hadamard_quant(got, lane)
         q_out[t, head, lane] = word
         if lane == 0:
-            w_out[t, head] = weight * q_scale * scale
+            value = weight * q_scale * scale
+            store_weight(w_out, t, head, value, self.padded, self.bf16)
 
     @cute.jit
     def key(self, k, k_out, gamma, beta, eps, t, lane):
@@ -186,8 +198,10 @@ class _QueryKernel:
 _compiled: dict = {}
 
 
-def indexer_query(q, k, weights, norm, scale: float, padded: int):
-    """Returns (q_fp8 [M, padded, 128], weights [M, padded] FP32, key [M, 128]).
+def indexer_query(
+    q, k, weights, norm, scale: float, padded: int, weights_dtype=torch.float32
+):
+    """Returns (q_fp8 [M, padded, 128], weights [M, padded], key [M, 128]).
 
     Args:
         q: [M, heads * 128] BF16 indexer query.
@@ -196,21 +210,23 @@ def indexer_query(q, k, weights, norm, scale: float, padded: int):
         norm: the key LayerNorm module (FP32 weight and bias).
         scale: the folded softmax and head-count scale.
         padded: heads after zero padding.
+        weights_dtype: FP32, or BF16 for consumers that round them to BF16.
 
     """
     m, dim = k.shape
     heads = weights.shape[1]
     assert dim == DIM and q.is_contiguous() and k.is_contiguous()
     q_out = torch.empty((m, padded, dim), dtype=torch.float8_e4m3fn, device=q.device)
-    w_out = torch.empty((m, padded), dtype=torch.float32, device=q.device)
+    w_out = torch.empty((m, padded), dtype=weights_dtype, device=q.device)
     k_out = torch.empty_like(k)
     words = q_out.view(torch.int32).view(m, padded, dim // 4)
     args = (q, k, weights, norm.weight, norm.bias, words, w_out, k_out)
     st = stream(q.device)
-    key = (heads, padded, q.device.index)
+    bf16 = weights_dtype == torch.bfloat16
+    key = (heads, padded, bf16, q.device.index)
     if key not in _compiled:
         _compiled[key] = cute.compile(
-            _QueryKernel(heads, padded), *(to_cute(t, 16) for t in args),
+            _QueryKernel(heads, padded, bf16), *(to_cute(t, 16) for t in args),
             Float32(scale), Float32(norm.eps), Int32(m), st,
         )  # fmt: skip
     _compiled[key](
