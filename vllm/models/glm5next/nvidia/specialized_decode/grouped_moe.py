@@ -14,8 +14,9 @@ weight stages (two 128 x 128 K blocks of one row tile) evenly over the CTAs:
   the end of its range: the others publish FP32 partials as they start theirs.
   The owner sums them in CTA order, applies the clamped SwiGLU, quantizes the
   hidden block to FP8 per 128 and publishes it.
-- FC2: (unit, output row tile) jobs, split the same way; a job waits for its
-  unit's four hidden blocks and writes each route's BF16 output row
+- FC2: (unit, output row tile) jobs, claimed in chunks from a counter as each
+  CTA's FC1 ends (so the CTAs that finish FC1 first take more); a job waits
+  for its unit's four hidden blocks and writes each route's BF16 output row
   (finalize-ready, like ``mega_moe``).
 
 Above 40 units both lists are cut in halves A and B and every CTA runs FC1(A),
@@ -24,8 +25,9 @@ FC1(B), FC2(A), FC2(B), so FC2(A)'s hidden blocks are ready by the time it runs.
 Block scales are not powers of two, so each K block lands in its own TMEM column
 group (the unit's tokens on the UMMA N side) and the epilogue scales (weight
 block scale times the token's activation scale, which the B gatherer warps
-compute beside the B tiles) and sums them in FP32. Every role walks a packed
-per-CTA stage table, so a stage costs each a few shared memory loads.
+compute beside the B tiles) and sums them in FP32. The weight producer posts a
+packed descriptor of every stage to the other roles through a shared memory
+ring, so a stage costs each a few shared memory loads.
 """
 
 import cuda.bindings.driver as cuda
@@ -75,6 +77,7 @@ from .mega_moe import (
 )
 
 GROUP = 16  # tokens per UMMA column group
+END = 0xFFFFFFFF  # stage descriptor past a CTA's last stage
 DEPTH = 2  # K blocks per pipeline stage, each its own TMEM column group
 MAX_TOKENS = 64
 SMEM_LIMIT = 227 * 1024
@@ -89,7 +92,7 @@ IDESC = (1 << 4) | ((GROUP >> 3) << 17) | ((TILE >> 4) << 24)
 # Shared CTA scalars (Int32 words).
 (
     S_PARITY, S_UNITS, S_SPLIT, S_N1A, S_N1B, S_N2A, S_N2B,
-    S_LO1A, S_LO1B, S_LO2A, S_LO2B, S_S1A, S_S1B, S_FLAG,
+    S_LO1A, S_LO1B, S_J2A, S_J2B, S_S1A, S_S1B, S_FLAG,
 ) = range(14)  # fmt: skip
 
 
@@ -193,8 +196,8 @@ def unit_capacity(experts: int, top_k: int, tokens: int = MAX_TOKENS) -> int:
 
 def counter_words(experts: int, top_k: int, pairs: int) -> int:
     """Counters of one call parity: ready tokens, pair arrivals, unit readiness,
-    finished CTAs."""
-    return 2 + unit_capacity(experts, top_k) * (pairs + 1)
+    the next FC2 job of halves A and B, finished CTAs."""
+    return 4 + unit_capacity(experts, top_k) * (pairs + 1)
 
 
 class _GroupedKernel:
@@ -212,6 +215,9 @@ class _GroupedKernel:
         self.span = 2 * self.nk1 // DEPTH  # FC1 stages of a pair (up, gate)
         self.unit1 = self.pairs * self.span  # FC1 stages of a unit
         self.job = self.nk2 // DEPTH  # FC2 stages of a (unit, row tile) job
+        # FC2 jobs per claim: fewer unit switches against a finer tail balance
+        # (8 tokens 59 vs 65 us at 2 vs 8; 64 tokens 174 vs 181 at 8 vs 2).
+        self.chunk = 2 if tokens <= 16 else 8
         # Units of up to GROUP tokens: one UMMA column group, accumulators in
         # registers. Experts with more tokens run as several units.
         self.groups = 1
@@ -223,11 +229,6 @@ class _GroupedKernel:
         self.slots = min(32, TMEM_COLUMNS // self.columns)
         self.b_bytes = DEPTH * w * TILE
         self.a_bytes = DEPTH * STAGE_BYTES
-        # Most stages one CTA runs: its FC1 and FC2 shares of both halves.
-        units = self.max_units
-        self.max_stages = (
-            units * self.unit1 // grid + units * self.tiles2 // grid * self.job + 16
-        )
         # As many weight stages as shared memory holds.
         for stages in range(12, 3, -1):
             self.layout(stages)
@@ -249,6 +250,9 @@ class _GroupedKernel:
         self.stages = stages
         # Column scales of the stages in flight (see ``gather``).
         self.ring = self.slots + stages + 1
+        # Stage descriptors: the producer posts one before waiting for its weight
+        # slot, and the epilogue reads it up to ``stages + slots`` stages later.
+        self.posts = self.slots + stages + 2
         self.off_w = take(stages * self.a_bytes, 1024)
         self.off_b = take(stages * self.b_bytes, 1024)
         self.off_ring = take(self.ring * self.columns * 4)
@@ -263,9 +267,8 @@ class _GroupedKernel:
         self.off_ucnt = take(self.max_units * 4)
         self.off_flat = take((self.routes + tokens) * 4)
         self.off_scal = take(64)
-        self.off_desc = take(self.max_stages * 4)
-        self.off_wsc = take(self.max_stages * DEPTH * 4)
-        self.bars = 2 * stages + 2 * self.slots
+        self.off_desc = take(self.posts * 4)
+        self.bars = 2 * stages + 2 * self.slots + self.posts
         self.off_bar = take(self.bars * 8, 8)
         self.off_tmem = take(16)
         self.smem = offset
@@ -336,6 +339,7 @@ class _GroupedKernel:
         empty = full + stages
         acc_full = empty + stages
         acc_empty = acc_full + slots
+        posted = acc_empty + slots
         tmem_base = view(sm.iterator, self.off_tmem, Uint32, 1)
         scal = view(sm.iterator, self.off_scal, Int32, 16)
 
@@ -347,6 +351,8 @@ class _GroupedKernel:
             for s in cutlass.range_constexpr(slots):
                 cute.arch.mbarrier_init(acc_full + s, 1)
                 cute.arch.mbarrier_init(acc_empty + s, 4)
+            for s in cutlass.range_constexpr(self.posts):
+                cute.arch.mbarrier_init(posted + s, 1)
             cute.arch.mbarrier_init_fence()
             for m in cutlass.range_constexpr(4):
                 acquire_tensormap_asm(maps.iterator + 128 * m)
@@ -401,30 +407,25 @@ class _GroupedKernel:
         _gather_l2(xall, plan_s.iterator, self.tokens * self.nk1, tid, THREADS)
         self.number_units(sm, ids, scal, tid, warp, lane, cta)
         cute.arch.sync_threads()
-        total = scal[S_N1A] + scal[S_N1B] + scal[S_N2A] + scal[S_N2B]
-        desc = view(sm.iterator, self.off_desc, Uint32, self.max_stages)
-        for n in cutlass.range(tid, total, THREADS, unroll=1):
-            desc[n] = self.describe(scal, n)
-        cute.arch.sync_threads()
         pair_count = mine + 1
         unit_ready = pair_count + unit_capacity(self.experts, self.top_k) * self.pairs
+        jobs = mine + words - 3  # next FC2 job of halves A and B
 
         if warp == 0:
             if lane == 0:
-                self.produce(sm, maps, full, empty, scal, total)
+                self.produce(sm, maps, full, empty, posted, scal, jobs)
         elif warp == 1:
-            self.issue(sm, tmem, full, empty, acc_full, acc_empty, scal, total)
+            self.issue(sm, tmem, full, empty, acc_full, acc_empty)
         elif warp < EPILOGUE:
             self.gather(
-                sm, full, empty, scal, total, plan_x, hidden, hscale, unit_ready, lane,
+                sm, full, empty, posted, plan_x, hidden, hscale, unit_ready, lane,
                 w13_scale, w2_scale, s13_scale, s2_scale, warp - 2,
             )  # fmt: skip
         else:
             self.epilogue(
                 sm, tmem, warp, lane, cta, tid - EPILOGUE * 32, acc_full, acc_empty,
-                scal, total, w13_scale, w2_scale, s13_scale, s2_scale, plan_s, rows1,
-                rows2, out, shared_out, hidden, hscale, partial, pair_count,
-                unit_ready,
+                scal, rows1, rows2, out, shared_out, hidden, hscale, partial,
+                pair_count, unit_ready,
             )  # fmt: skip
         release_tmem(tmem, TMEM_COLUMNS, warp, 1)
         if cutlass.const_expr(self.finalize):
@@ -637,7 +638,8 @@ class _GroupedKernel:
 
     @cute.jit
     def ranges(self, scal, units, cta):
-        """This CTA's FC1 stage and FC2 job ranges of halves A and B."""
+        """This CTA's FC1 stage ranges of halves A and B, and their FC2 job
+        counts (claimed at run time)."""
         split = units
         if units > SPLIT_UNITS:
             split = (units + 1) // 2
@@ -651,72 +653,46 @@ class _GroupedKernel:
         scal[S_S1B] = s1b
         lo1a = cta * s1a // self.grid
         lo1b = cta * s1b // self.grid
-        lo2a = cta * j2a // self.grid
-        lo2b = cta * j2b // self.grid
         scal[S_LO1A] = lo1a
         scal[S_LO1B] = lo1b
-        scal[S_LO2A] = lo2a
-        scal[S_LO2B] = lo2b
+        scal[S_J2A] = j2a
+        scal[S_J2B] = j2b
         scal[S_N1A] = (cta + 1) * s1a // self.grid - lo1a
         scal[S_N1B] = (cta + 1) * s1b // self.grid - lo1b
-        scal[S_N2A] = ((cta + 1) * j2a // self.grid - lo2a) * self.job
-        scal[S_N2B] = ((cta + 1) * j2b // self.grid - lo2b) * self.job
 
     @cute.jit
     def locate(self, scal, n):
-        """(is FC2, half, unit, row tile, K block, FC1 stage index in its half)
-        of this CTA's n-th stage. A unit's FC1 stage r is K block (r % 64) // 2
-        of pair r // 64, up tile then gate tile."""
+        """(half, unit, row tile, K block, stage index in its half) of this
+        CTA's n-th FC1 stage. A unit's FC1 stage r holds K blocks
+        DEPTH * ((r % span) // 2) on of pair r // span, up tile then gate tile."""
         n1a = scal[S_N1A]
-        n1 = n1a + scal[S_N1B]
         half = Int32(0)
         unit = Int32(0)
-        tile = Int32(0)
-        kb = Int32(0)
         s = Int32(0)
-        if n < n1:
-            if n < n1a:
-                s = scal[S_LO1A] + n
-                unit = s // self.unit1
-            else:
-                half = Int32(1)
-                s = scal[S_LO1B] + n - n1a
-                unit = scal[S_SPLIT] + s // self.unit1
-            r = s % self.unit1
-            tile = r // self.span + self.pairs * (r % 2)
-            kb = DEPTH * ((r % self.span) // 2)
+        if n < n1a:
+            s = scal[S_LO1A] + n
+            unit = s // self.unit1
         else:
-            m = n - n1
-            n2a = scal[S_N2A]
-            job = Int32(0)
-            if m < n2a:
-                job = scal[S_LO2A] + m // self.job
-                unit = job // self.tiles2
-            else:
-                half = Int32(1)
-                job = scal[S_LO2B] + (m - n2a) // self.job
-                unit = scal[S_SPLIT] + job // self.tiles2
-            tile = job % self.tiles2
-            kb = DEPTH * (m % self.job)
-        return n >= n1, half, unit, tile, kb, s
+            half = Int32(1)
+            s = scal[S_LO1B] + n - n1a
+            unit = scal[S_SPLIT] + s // self.unit1
+        r = s % self.unit1
+        tile = r // self.span + self.pairs * (r % 2)
+        kb = DEPTH * ((r % self.span) // 2)
+        return half, unit, tile, kb, s
 
     @cute.jit
     def describe(self, scal, n):
-        """Stage n packed: unit (bits 0-9), row tile (10-15), K block (16-21),
-        FC2 (22), half (23), first (24) and last (25) stage of a pair piece or
-        an FC2 job."""
-        fc2, half, unit, tile, kb, s = self.locate(scal, n)
+        """FC1 stage n packed: unit (bits 0-9), row tile (10-15), K block
+        (16-21), FC2 (22), half (23), first (24) and last (25) stage of a pair
+        piece or an FC2 job; END marks the end of the stages."""
+        half, unit, tile, kb, s = self.locate(scal, n)
         n1a = scal[S_N1A]
         n1 = n1a + scal[S_N1B]
-        opens = kb == 0
-        closes = kb == self.nk2 - DEPTH
-        if not fc2:
-            opens = (n == 0) | (n == n1a) | (s % self.span == 0)
-            closes = (
-                (n == n1a - 1) | (n == n1 - 1) | (s % self.span == self.span - 1)
-            )  # fmt: skip
+        opens = (n == 0) | (n == n1a) | (s % self.span == 0)
+        closes = (n == n1a - 1) | (n == n1 - 1) | (s % self.span == self.span - 1)
         word = Uint32(unit) | (Uint32(tile) << 10) | (Uint32(kb) << 16)
-        word = word | (Uint32(fc2) << 22) | (Uint32(half) << 23)
+        word = word | (Uint32(half) << 23)
         return word | (Uint32(opens) << 24) | (Uint32(closes) << 25)
 
     @cute.jit
@@ -733,22 +709,60 @@ class _GroupedKernel:
         )
 
     @cute.jit
-    def produce(self, sm, maps, full, empty, scal, total):
-        uexp = view(sm.iterator, self.off_uexp, Int32, self.max_units)
-        desc = view(sm.iterator, self.off_desc, Uint32, self.max_stages)
-        for n in cutlass.range(total, unroll=1):
-            slot = n % self.stages
-            if n >= self.stages:
-                wait(empty + slot, ((n // self.stages) - 1) % 2, scope="cta")
-            fc2, _, unit, tile, kb, _, _ = self.unpack(desc[n])
-            expert = uexp[unit]
-            index = Int32(fc2)
-            if expert < 0:  # the shared expert's maps
-                index = index + 2
-                expert = Int32(0)
-            chunk = expert * self.nk1 + kb
-            if fc2:
-                chunk = expert * self.nk2 + kb
+    def produce(self, sm, maps, full, empty, posted, scal, jobs):
+        """Weights of this CTA's FC1 stages, then of the FC2 jobs it claims from
+        the per-half job counters (FC2 balances FC1's uneven finish), then one
+        END stage per gatherer."""
+        n1 = scal[S_N1A] + scal[S_N1B]
+        for n in cutlass.range(n1, unroll=1):
+            self.post(sm, maps, full, empty, posted, n, self.describe(scal, n))
+        n = n1
+        half = Int32(0)
+        claim = Int32(_atomic_add(jobs, Uint32(self.chunk)))
+        while half < 2:
+            count = scal[S_J2A]
+            first = Int32(0)
+            if half == 1:
+                count = scal[S_J2B]
+                first = scal[S_SPLIT]
+            if claim < count:
+                start = claim
+                # The next claim is in flight while these jobs' stages load.
+                claim = Int32(_atomic_add(jobs + half, Uint32(self.chunk)))
+                for job in cutlass.range(
+                    start, cutlass.min(start + self.chunk, count), unroll=1
+                ):
+                    unit = first + job // self.tiles2
+                    tile = job % self.tiles2
+                    for k in cutlass.range_constexpr(self.job):
+                        word = Uint32(unit) | (Uint32(tile) << 10)
+                        word = word | (Uint32(DEPTH * k) << 16) | (Uint32(1) << 22)
+                        if cutlass.const_expr(k == 0):
+                            word = word | (Uint32(1) << 24)
+                        if cutlass.const_expr(k == self.job - 1):
+                            word = word | (Uint32(1) << 25)
+                        self.post(sm, maps, full, empty, posted, n, word)
+                        n = n + 1
+            else:
+                half = half + 1
+                if half < 2:
+                    claim = Int32(_atomic_add(jobs + half, Uint32(self.chunk)))
+        for g in cutlass.range_constexpr(GATHERERS):
+            self.post(sm, maps, full, empty, posted, n + g, Uint32(END))
+
+    @cute.jit
+    def post(self, sm, maps, full, empty, posted, n, word):
+        """Post stage n's descriptor, then load its weights (END: arrive only)."""
+        desc = view(sm.iterator, self.off_desc, Uint32, self.posts)
+        slot = n % self.stages
+        if n >= self.stages:
+            wait(empty + slot, ((n // self.stages) - 1) % 2, scope="cta")
+        desc[n % self.posts] = word
+        cute.arch.mbarrier_arrive(posted + n % self.posts)
+        if word == Uint32(END):
+            cute.arch.mbarrier_arrive(full + slot)
+        else:
+            index, tile, chunk = self.weight_box(sm, word)
             cute.arch.mbarrier_arrive_and_expect_tx(full + slot, self.a_bytes)
             for d in cutlass.range_constexpr(DEPTH):
                 load_tma3(
@@ -758,11 +772,25 @@ class _GroupedKernel:
                 )  # fmt: skip
 
     @cute.jit
-    def weight_scale(self, sm, n, d, w13_scale, w2_scale, s13_scale, s2_scale):
-        """The FP32 weight block scale of K block d of this CTA's n-th stage."""
+    def weight_box(self, sm, word):
+        """(tensor map, row tile, first K block chunk) of a stage's weights."""
         uexp = view(sm.iterator, self.off_uexp, Int32, self.max_units)
-        desc = view(sm.iterator, self.off_desc, Uint32, self.max_stages)
-        fc2, _, unit, tile, kb, _, _ = self.unpack(desc[n])
+        fc2, _, unit, tile, kb, _, _ = self.unpack(word)
+        expert = uexp[unit]
+        index = Int32(fc2)
+        if expert < 0:  # the shared expert's maps
+            index = index + 2
+            expert = Int32(0)
+        chunk = expert * self.nk1 + kb
+        if fc2:
+            chunk = expert * self.nk2 + kb
+        return index, tile, chunk
+
+    @cute.jit
+    def weight_scale(self, sm, word, d, w13_scale, w2_scale, s13_scale, s2_scale):
+        """The FP32 weight block scale of K block d of a stage."""
+        uexp = view(sm.iterator, self.off_uexp, Int32, self.max_units)
+        fc2, _, unit, tile, kb, _, _ = self.unpack(word)
         expert = uexp[unit]
         safe = cutlass.max(expert, Int32(0))
         value = Float32(0.0)
@@ -782,13 +810,13 @@ class _GroupedKernel:
 
     @cute.jit
     def gather(
-        self, sm, full, empty, scal, total, plan_x, hidden, hscale, unit_ready, lane,
+        self, sm, full, empty, posted, plan_x, hidden, hscale, unit_ready, lane,
         w13_scale, w2_scale, s13_scale, s2_scale, gatherer,
     ):  # fmt: skip
-        """Stages ``gatherer``, ``gatherer + GATHERERS``, ...: each stage's B
-        tile, the unit's token rows of K block kb (FC1: the quantized tokens,
-        FC2: the unit's hidden), 128B-swizzled (16B chunk c of row j at
-        c ^ (j % 8)); and its column scales (weight block scale times
+        """Stages ``gatherer``, ``gatherer + GATHERERS``, ... up to END: each
+        stage's B tile, the unit's token rows of K blocks kb.. (FC1: the
+        quantized tokens, FC2: the unit's hidden), 128B-swizzled (16B chunk c of
+        row j at c ^ (j % 8)); and its column scales (weight block scale times
         the token's activation or hidden scale) into the scale ring, which the
         epilogue reads at most ``stages + slots`` stages later."""
         uoff = view(sm.iterator, self.off_uoff, Int32, self.max_units + 1)
@@ -800,8 +828,7 @@ class _GroupedKernel:
             self.width * self.nk2,
         )  # fmt: skip
         ring = view(sm.iterator, self.off_ring, Float32, self.ring * self.columns)
-        desc = view(sm.iterator, self.off_desc, Uint32, self.max_stages)
-        wsc = view(sm.iterator, self.off_wsc, Float32, self.max_stages * DEPTH)
+        desc = view(sm.iterator, self.off_desc, Uint32, self.posts)
         # Per unit: the global row of this lane's 16-byte chunks lane + 32 k (row
         # (lane + 32 k) // 8 of the unit, -1 past its tokens) and the token of
         # its column ``lane`` (scales).
@@ -810,121 +837,124 @@ class _GroupedKernel:
         current = Int32(-1)  # unit (FC2: + max_units) of ``rows``
         token_scales = Int32(0)
         count = Int32(0)
-        # Weight block scales of this warp's stages, read while the first
-        # weight stages load.
-        mine = (total - gatherer + GATHERERS - 1) // GATHERERS * DEPTH
-        for i in cutlass.range(lane, mine, 4 * 32, unroll=1):
-            values = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
-            for k in cutlass.range_constexpr(4):
-                values[k] = Float32(0.0)
-                q = i + 32 * k
-                if q < mine:
-                    values[k] = self.weight_scale(
-                        sm, gatherer + GATHERERS * (q // DEPTH), q % DEPTH, w13_scale,
-                        w2_scale, s13_scale, s2_scale,
-                    )  # fmt: skip
-            for k in cutlass.range_constexpr(4):
-                q = i + 32 * k
-                if q < mine:
-                    n = gatherer + GATHERERS * (q // DEPTH)
-                    wsc[n * DEPTH + q % DEPTH] = values[k]
-        cute.arch.sync_warp()
-        for n in cutlass.range(gatherer, total, GATHERERS, unroll=1):
+        n = Int32(gatherer)
+        word = Uint32(0)
+        while word != Uint32(END):
             slot = n % self.stages
             if n >= self.stages:
                 wait(empty + slot, ((n // self.stages) - 1) % 2, scope="cta")
-            fc2, _, unit, _, kb, _, _ = self.unpack(desc[n])
-            key = unit
-            if fc2:
-                key = unit + self.max_units
-            if key != current:
-                count = ucnt[unit]
-                first = uoff[unit]
+            wait(posted + n % self.posts, (n // self.posts) % 2, scope="cta")
+            word = Uint32(desc[n % self.posts])
+            if word != Uint32(END):
+                fc2, _, unit, _, kb, _, _ = self.unpack(word)
+                # Lane d < DEPTH: the weight block scale of K block kb + d.
+                ws = Float32(0.0)
+                if lane < DEPTH:
+                    ws = self.weight_scale(
+                        sm, word, lane, w13_scale, w2_scale, s13_scale, s2_scale
+                    )  # fmt: skip
+                key = unit
                 if fc2:
-                    if lane == 0:
-                        while _load_acquire(unit_ready + unit) < Uint32(self.pairs):
-                            pass
-                    cute.arch.sync_warp()
-                    _fence()
-                    for i in cutlass.range(lane, count * self.nk2, 32, unroll=1):
-                        hs[i] = _load_l2(
-                            hscale.iterator + Int64(unit) * self.width * self.nk2 + i
-                        )
-                    cute.arch.sync_warp()
-                for k in cutlass.range_constexpr(chunks):
-                    j = (lane + 32 * k) // 8
-                    rows[k] = Int64(-1)
-                    if j < count:
-                        rows[k] = (Int64(unit) * self.width + j) * self.inter
-                        if not fc2:
-                            token = flat[first + j]
-                            if unit >= self.shared_units:
-                                token = token // self.top_k
-                            rows[k] = Int64(token) * self.hidden
-                if lane < count:
-                    token = flat[first + lane]
-                    if unit >= self.shared_units:
-                        token = token // self.top_k
-                    token_scales = token * self.nk1
-                current = key
-            dst = sm.iterator + self.off_b + slot * self.b_bytes
-            base = plan_x.iterator
-            if fc2:
-                base = hidden.iterator
-            for k in cutlass.range_constexpr(chunks):
-                if rows[k] >= 0:
-                    i = lane + 32 * k
-                    j = i // 8
-                    c = i % 8
-                    for d in cutlass.range_constexpr(DEPTH):
-                        copy_g2s(
-                            dst + (d * self.width + j) * TILE + (c ^ (j % 8)) * 16,
-                            base + rows[k] + (kb + d) * TILE + c * 16,
-                        )
-            cute.arch.cp_async_mbarrier_arrive_noinc(full + slot)
-            if lane < count:
-                for d in cutlass.range_constexpr(DEPTH):
-                    scale = Float32(0.0)
+                    key = unit + self.max_units
+                if key != current:
+                    count = ucnt[unit]
+                    first = uoff[unit]
                     if fc2:
-                        scale = hs[lane * self.nk2 + kb + d]
-                    else:
-                        scale = xall[token_scales + kb + d]
-                    ring[(n % self.ring) * self.columns + d * self.width + lane] = (
-                        wsc[n * DEPTH + d] * scale
-                    )
+                        if lane == 0:
+                            while _load_acquire(unit_ready + unit) < Uint32(
+                                self.pairs
+                            ):  # fmt: skip
+                                pass
+                        cute.arch.sync_warp()
+                        _fence()
+                        for i in cutlass.range(lane, count * self.nk2, 32, unroll=1):
+                            hs[i] = _load_l2(
+                                hscale.iterator
+                                + Int64(unit) * self.width * self.nk2 + i
+                            )  # fmt: skip
+                        cute.arch.sync_warp()
+                    for k in cutlass.range_constexpr(chunks):
+                        j = (lane + 32 * k) // 8
+                        rows[k] = Int64(-1)
+                        if j < count:
+                            rows[k] = (Int64(unit) * self.width + j) * self.inter
+                            if not fc2:
+                                token = flat[first + j]
+                                if unit >= self.shared_units:
+                                    token = token // self.top_k
+                                rows[k] = Int64(token) * self.hidden
+                    if lane < count:
+                        token = flat[first + lane]
+                        if unit >= self.shared_units:
+                            token = token // self.top_k
+                        token_scales = token * self.nk1
+                    current = key
+                dst = sm.iterator + self.off_b + slot * self.b_bytes
+                base = plan_x.iterator
+                if fc2:
+                    base = hidden.iterator
+                for k in cutlass.range_constexpr(chunks):
+                    if rows[k] >= 0:
+                        i = lane + 32 * k
+                        j = i // 8
+                        c = i % 8
+                        for d in cutlass.range_constexpr(DEPTH):
+                            copy_g2s(
+                                dst + (d * self.width + j) * TILE + (c ^ (j % 8)) * 16,
+                                base + rows[k] + (kb + d) * TILE + c * 16,
+                            )
+                for d in cutlass.range_constexpr(DEPTH):
+                    w_d = cute.arch.shuffle_sync(ws, d)
+                    if lane < count:
+                        scale = Float32(0.0)
+                        if fc2:
+                            scale = hs[lane * self.nk2 + kb + d]
+                        else:
+                            scale = xall[token_scales + kb + d]
+                        index = (n % self.ring) * self.columns + d * self.width + lane
+                        ring[index] = w_d * scale
+            cute.arch.cp_async_mbarrier_arrive_noinc(full + slot)
             cute.arch.sync_warp()
             if lane == 0:
                 cute.arch.mbarrier_arrive(full + slot)
+            n = n + GATHERERS
 
     @cute.jit
-    def issue(self, sm, tmem, full, empty, acc_full, acc_empty, scal, total):
+    def issue(self, sm, tmem, full, empty, acc_full, acc_empty):
+        desc = view(sm.iterator, self.off_desc, Uint32, self.posts)
         adesc = smem_desc(sm.iterator + self.off_w, True)
         bdesc = smem_desc(sm.iterator + self.off_b, True)
-        for n in cutlass.range(total, unroll=1):
+        n = Int32(0)
+        word = Uint32(0)
+        while word != Uint32(END):
             slot = n % self.stages
             acc = n % self.slots
             wait_tmem(full + slot, (n // self.stages) % 2, scope="cta")
-            # The gathered B rows are generic-proxy writes.
-            cute.arch.fence_proxy("async.shared", space="cta")
+            word = Uint32(desc[n % self.posts])
             if n >= self.slots:
                 wait_tmem(acc_empty + acc, ((n // self.slots) - 1) % 2, scope="cta")
-            instruction = Uint32(IDESC)
-            for d in cutlass.range_constexpr(DEPTH):
-                _umma(
-                    tmem + acc * self.columns + d * self.width,
-                    adesc + ((slot * self.a_bytes + d * STAGE_BYTES) >> 4),
-                    bdesc + ((slot * self.b_bytes + d * self.width * TILE) >> 4),
-                    instruction,
-                )  # fmt: skip
-            _commit(empty + slot)
-            cute.arch.sync_warp()
-            _commit(acc_full + acc)
+            if word == Uint32(END):
+                if cute.arch.lane_idx() == 0:
+                    cute.arch.mbarrier_arrive(acc_full + acc)
+            else:
+                # The gathered B rows are generic-proxy writes.
+                cute.arch.fence_proxy("async.shared", space="cta")
+                for d in cutlass.range_constexpr(DEPTH):
+                    _umma(
+                        tmem + acc * self.columns + d * self.width,
+                        adesc + ((slot * self.a_bytes + d * STAGE_BYTES) >> 4),
+                        bdesc + ((slot * self.b_bytes + d * self.width * TILE) >> 4),
+                        Uint32(IDESC),
+                    )  # fmt: skip
+                _commit(empty + slot)
+                cute.arch.sync_warp()
+                _commit(acc_full + acc)
+            n = n + 1
 
     @cute.jit
     def epilogue(
-        self, sm, tmem, warp, lane, cta, e, acc_full, acc_empty, scal, total,
-        w13_scale, w2_scale, s13_scale, s2_scale, plan_s, rows1, rows2, out,
-        shared_out, hidden, hscale, partial, pair_count, unit_ready,
+        self, sm, tmem, warp, lane, cta, e, acc_full, acc_empty, scal, rows1, rows2,
+        out, shared_out, hidden, hscale, partial, pair_count, unit_ready,
     ):  # fmt: skip
         w = self.width
         quadrant = warp % 4
@@ -935,57 +965,64 @@ class _GroupedKernel:
         ucnt = view(sm.iterator, self.off_ucnt, Int32, self.max_units)
         flat = view(sm.iterator, self.off_flat, Int32, self.routes + self.tokens)
         ring = view(sm.iterator, self.off_ring, Float32, self.ring * self.columns)
-        desc = view(sm.iterator, self.off_desc, Uint32, self.max_stages)
+        desc = view(sm.iterator, self.off_desc, Uint32, self.posts)
         up = cute.make_rmem_tensor(cute.make_layout((w,)), Float32)
         gate = cute.make_rmem_tensor(cute.make_layout((w,)), Float32)
         start = Int32(0)  # first FC1 stage of the current piece
-        for n in cutlass.range(total, unroll=1):
-            fc2, half, unit, tile, kb, opens, closes = self.unpack(desc[n])
-            count = ucnt[unit]
-            groups = (count + GROUP - 1) // GROUP
-            expert = uexp[unit]
-            shared = expert < 0
-            first = uoff[unit]
-            into_gate = tile >= self.pairs
-            if fc2:
-                into_gate = tile < 0
-            if opens:
-                start = n
-                for j in cutlass.range_constexpr(w):
-                    up[j] = Float32(0.0)
-                    gate[j] = Float32(0.0)
+        n = Int32(0)
+        word = Uint32(0)
+        while word != Uint32(END):
             acc = n % self.slots
             wait_tmem(acc_full + acc, (n // self.slots) % 2, scope="cta")
-            parts = load_tmem(lanes + acc * self.columns, count=self.columns)
-            scales = ring.iterator + (n % self.ring) * self.columns
-            if into_gate:
-                for c in cutlass.range_constexpr(self.columns):
-                    gate[c % w] = gate[c % w] + parts[c] * scales[c]
-            else:
-                for c in cutlass.range_constexpr(self.columns):
-                    up[c % w] = up[c % w] + parts[c] * scales[c]
-            fence_tmem(before=True)
-            cute.arch.sync_warp()
-            if lane == 0:
-                cute.arch.mbarrier_arrive(acc_empty + acc)
-            if closes:
+            word = Uint32(desc[n % self.posts])
+            if word != Uint32(END):
+                fc2, half, unit, tile, kb, opens, closes = self.unpack(word)
+                count = ucnt[unit]
+                groups = (count + GROUP - 1) // GROUP
+                expert = uexp[unit]
+                shared = expert < 0
+                first = uoff[unit]
+                into_gate = tile >= self.pairs
                 if fc2:
-                    logical = rows2[tile * TILE + row]
+                    into_gate = tile < 0
+                if opens:
+                    start = n
                     for j in cutlass.range_constexpr(w):
-                        if j < count:
-                            target = out.iterator
-                            if shared:
-                                target = shared_out.iterator
-                            _store_bf16(
-                                target + Int64(flat[first + j]) * self.hidden + logical,
-                                up[j],
-                            )
+                        up[j] = Float32(0.0)
+                        gate[j] = Float32(0.0)
+                parts = load_tmem(lanes + acc * self.columns, count=self.columns)
+                scales = ring.iterator + (n % self.ring) * self.columns
+                if into_gate:
+                    for c in cutlass.range_constexpr(self.columns):
+                        gate[c % w] = gate[c % w] + parts[c] * scales[c]
                 else:
-                    self.close_pair(
-                        sm, cta, e, row, lane, quadrant, half, unit, n, start, count,
-                        groups, up, gate, scal, rows1, hidden, hscale, partial,
-                        pair_count, unit_ready,
-                    )  # fmt: skip
+                    for c in cutlass.range_constexpr(self.columns):
+                        up[c % w] = up[c % w] + parts[c] * scales[c]
+                fence_tmem(before=True)
+                cute.arch.sync_warp()
+                if lane == 0:
+                    cute.arch.mbarrier_arrive(acc_empty + acc)
+                if closes:
+                    if fc2:
+                        logical = rows2[tile * TILE + row]
+                        for j in cutlass.range_constexpr(w):
+                            if j < count:
+                                target = out.iterator
+                                if shared:
+                                    target = shared_out.iterator
+                                _store_bf16(
+                                    target
+                                    + Int64(flat[first + j]) * self.hidden
+                                    + logical,
+                                    up[j],
+                                )
+                    else:
+                        self.close_pair(
+                            sm, cta, e, row, lane, quadrant, half, unit, n, start,
+                            count, groups, up, gate, scal, rows1, hidden, hscale,
+                            partial, pair_count, unit_ready,
+                        )  # fmt: skip
+            n = n + 1
 
     @cute.jit
     def owner(self, s, size):
@@ -1001,7 +1038,7 @@ class _GroupedKernel:
         the pair, or publish the partial and finish the pair if it is the pair's
         last piece."""
         w = self.width
-        _, _, _, _, _, s = self.locate(scal, n)
+        _, _, _, _, s = self.locate(scal, n)
         start = s - (n - opened)
         base = s - s % self.span  # the pair's first stage in its half
         pair = s % self.unit1 // self.span

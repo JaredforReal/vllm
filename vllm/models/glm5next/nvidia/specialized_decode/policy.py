@@ -21,8 +21,8 @@ DEFAULT = {
     # Routed experts: one 16-CTA cluster per route (two CTAs per SM) up to 4
     # tokens, where TRTLLM-Gen overtakes it (42 vs 49 us at 4 tokens, 73 vs 66
     # at 8). From 8 tokens the persistent expert-grouped kernel ("grouped",
-    # with the shared expert) wins: MoE layer 177 vs 183 us at 64 tokens, 135
-    # vs 147 at 32, 93 vs 100 at 16, a tie at 8 (step 5112 vs 5148 us).
+    # with the shared expert) wins or ties: MoE layer 74 vs 76 us at 8 tokens,
+    # 94 vs 98 at 16, 126 vs 140 at 32, 171 vs 170 at 64 (164 vs 179 with MTP3).
     "moe": "1-4:per_route,8-64:grouped",
     # Shared expert GEMVs beside the per-route clusters. At four tokens they slow
     # the clusters more than DeepGEMM does (B4 step 4.56 vs 4.37 ms).
