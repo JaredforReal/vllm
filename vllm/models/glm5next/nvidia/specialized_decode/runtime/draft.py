@@ -72,6 +72,7 @@ class SpecializedDraft(LayerStages):
         self.mega: dict[int, Any] = {}
         if "mega_moe" in config.stages:
             self.mega = self._build_mega()
+        self.dense: dict[int, Any] = {}
         self.ar_norm = None
         self.deferred: set[int] = set()
         if "ar_mhc" in config.stages:

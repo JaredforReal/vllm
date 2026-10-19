@@ -40,6 +40,9 @@ MEGA_MAX_TOKENS = max(PER_ROUTE_MAX_TOKENS, GROUPED_MAX_TOKENS)
 # At four tokens the shared expert GEMVs slow the per-route clusters more than
 # DeepGEMM does (B4 step 4.56 vs 4.37 ms): it keeps the shared expert there.
 SHARED_MAX_TOKENS = 2
+# Token counts the dense layers' CuTe MLP serves (B1/B2/B4 steps 10-21 us
+# faster; at 8 tokens it only ties stock in isolation).
+DENSE_TOKENS = (1, 2, 4)
 # BF16 projections of the DSA layer and its indexer that dsa_gemm routes.
 DSA_PROJECTIONS = ("fused_qkv_a_proj", "q_b_proj", "o_proj")
 INDEXER_PROJECTIONS = ("wq_b", "wk_weights_proj")
@@ -111,6 +114,8 @@ class LayerStages:
     kda: dict[int, Any]
     mega: dict[int, Any]
     deferred: set[int]
+    # Dense layers whose MLP runs as the CuTe GEMVs.
+    dense: dict[int, Any]
 
     def _build_mega(self) -> dict[int, Any]:
         from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
@@ -186,6 +191,34 @@ class LayerStages:
             self.shared_stream = torch.cuda.Stream(device)
         logger.info("Specialized decode runs %d MoE layers as one kernel", len(mega))
         return mega
+
+    def _build_dense(self) -> dict[int, Any]:
+        from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
+        from ..dense_mlp import DenseMlp
+
+        tokens = [b for b in self.batches if b in DENSE_TOKENS]
+        dense: dict[int, Any] = {}
+        if not tokens:
+            return dense
+        for layer in self.layers:
+            if layer._mlp_is_moe:
+                continue
+            gate_up, down = layer.mlp.gate_up_proj, layer.mlp.down_proj
+            if getattr(gate_up, "weight_scale_inv", None) is None:
+                continue
+            mlp = DenseMlp(
+                gate_up.weight,
+                gate_up.weight_scale_inv,
+                down.weight,
+                down.weight_scale_inv,
+                layer.mlp.swiglu_limit,
+                is_deep_gemm_e8m0_used(),
+            )
+            mlp.prepare(tokens)
+            dense[layer.layer_idx] = mlp
+        logger.info("Specialized decode runs %d dense MLPs as GEMVs", len(dense))
+        return dense
 
     def _mega_moe(self, layer, x):
         """Routed experts as one kernel, left unfinalized for the boundary."""
@@ -272,6 +305,12 @@ class LayerStages:
     def mlp(self, layer, x):
         """The FFN output and whether it is still TP-partial."""
         partial = self.partial(x.shape[0])
+        dense = self.dense.get(layer.layer_idx)
+        if dense is not None and x.shape[0] in DENSE_TOKENS:
+            out = dense(x)
+            if not partial:
+                out = tensor_model_parallel_all_reduce(out)
+            return out, partial
         if partial and layer.layer_idx in self.mega and x.shape[0] <= MEGA_MAX_TOKENS:
             return self._mega_moe(layer, x), True
         if partial and layer.layer_idx in self.deferred:
@@ -361,6 +400,9 @@ class SpecializedDecode(LayerStages):
         self.mega: dict[int, Any] = {}
         if "mega_moe" in config.stages:
             self.mega = self._build_mega()
+        self.dense: dict[int, Any] = {}
+        if "dense_mlp" in config.stages:
+            self.dense = self._build_dense()
         self.ar_mhc: AllReduceMhcBoundary | None = None
         # MoE layers whose routed top-k reduction the fused boundary takes.
         self.deferred: set[int] = set()
