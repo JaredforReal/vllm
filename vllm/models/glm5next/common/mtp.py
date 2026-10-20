@@ -214,8 +214,6 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
         decode = self._specialized_draft()
         if decode is not None:
@@ -224,10 +222,13 @@ class Glm5NextMultiTokenPredictor(nn.Module):
                 return decode.run(
                     self._mtp_layers[current_step_idx],
                     step,
+                    input_ids,
                     inputs_embeds,
                     previous_hidden_states,
                     self.prefill_rows,
                 )
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
         return self._mtp_layers[current_step_idx](
             input_ids,
             positions,

@@ -5,7 +5,8 @@ draft's FULL-graph steps, and a vocab-parallel argmax for greedy drafts.
 
 The MTP layer has no mHC streams, so its boundaries are a fused all-reduce,
 residual add and RMSNorm (``AllReduceNorm``) where the main model fuses the
-all-reduce with mHC.
+all-reduce with mHC. The vocab-parallel embedding's all-reduce takes the same
+mailbox, fused with the enorm / hnorm of the eh_proj input.
 """
 
 from typing import Any
@@ -80,8 +81,33 @@ class SpecializedDraft(LayerStages):
             self.ar_norm = self._build_ar_norm()
             if self.ar_norm is not None:
                 self.deferred = self._defer_moe_finalize()
+        self.embed_tokens = predictor.embed_tokens
+        self.fused_embedding = self.ar_norm is not None and self._build_embedding()
         self.head: Any = None
         self.argmax = self._build_argmax() if greedy else None
+
+    def _build_embedding(self) -> bool:
+        """Whether the embedding's all-reduce can take the boundary mailbox."""
+        assert self.ar_norm is not None
+        weight, shard = self.embed_tokens.weight, self.embed_tokens.shard_indices
+        norms = {
+            n.variance_epsilon for m in self.mtp_layers for n in (m.enorm, m.hnorm)
+        }
+        if (
+            weight.dtype != torch.bfloat16
+            or not weight.is_contiguous()
+            or shard.num_added_elements
+            or len(norms) != 1
+        ):
+            logger.warning("Specialized draft: stock embedding all-reduce")
+            return False
+        self.ar_norm.prepare_embedding(
+            weight,
+            shard.org_vocab_start_index,
+            shard.org_vocab_end_index - shard.org_vocab_start_index,
+            norms.pop(),
+        )
+        return True
 
     def _build_ar_norm(self):
         from ..all_reduce_norm import AllReduceNorm
@@ -160,7 +186,9 @@ class SpecializedDraft(LayerStages):
             return self.ar_norm(x, residual, norm.weight.data)
         return norm(x, residual)
 
-    def run(self, mtp, step: Step, inputs_embeds, previous_hidden_states, rows):
+    def run(
+        self, mtp, step: Step, input_ids, inputs_embeds, previous_hidden_states, rows
+    ):
         """``Glm5NextMultiTokenPredictorLayer.forward`` of a planned step.
 
         ``rows``: the speculator's per-request last-token rows. A draft prefill
@@ -168,16 +196,34 @@ class SpecializedDraft(LayerStages):
         (which writes every token's KV) only they run on; the other output rows
         are left unset."""
         layer = mtp.mtp_block
-        x = fused_eh_norm(
-            step.positions,
-            inputs_embeds,
-            previous_hidden_states,
-            mtp.enorm.weight,
-            mtp.hnorm.weight,
-            mtp.enorm.variance_epsilon,
-        )
+        tokens = step.positions.shape[0]
+        if (
+            inputs_embeds is None
+            and self.fused_embedding
+            and self.partial(tokens)
+            and input_ids.dtype == torch.int32
+        ):
+            assert self.ar_norm is not None
+            x = self.ar_norm.embed_norm(
+                input_ids,
+                step.positions,
+                previous_hidden_states,
+                self.embed_tokens.weight,
+                mtp.enorm.weight,
+                mtp.hnorm.weight,
+            )
+        else:
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            x = fused_eh_norm(
+                step.positions,
+                inputs_embeds,
+                previous_hidden_states,
+                mtp.enorm.weight,
+                mtp.hnorm.weight,
+                mtp.enorm.variance_epsilon,
+            )
         projection = self.eh_proj.get(layer.layer_idx)
-        tokens = x.shape[0]
         with planned_step():
             if (
                 projection is not None

@@ -7,9 +7,15 @@ partial output (or its MoE output, top-k reduction still open) is multicast
 into a Lamport mailbox by ``all_reduce_mhc``'s publish kernels, then one CTA
 per token polls every rank's contribution, sums it, adds the residual and
 RMS-normalizes the sum.
+
+The draft's input takes the same mailbox: each rank publishes its vocabulary
+shard's embedding rows (zeros for tokens it does not own), and the norm kernel
+applies the MTP layer's enorm / hnorm and writes the eh_proj input.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import cutlass
 import cutlass.cute as cute
@@ -37,6 +43,8 @@ from vllm.models.deepseek_v41.nvidia.ops.cute_dsl.primitives import (
     load_volatile_u32,
     make_fake_dynamic_compact_tensor,
     packed_u32x4_to_bf16x8,
+    sanitize_negative_zero_u32x4,
+    stmc_bf16x8,
     store_global_u32,
     store_global_u32x4,
     store_lamport_sentinel_u32x4,
@@ -45,6 +53,214 @@ from vllm.models.deepseek_v41.nvidia.ops.cute_dsl.primitives import (
 )
 
 from .all_reduce_mhc import _gmem_ptr, _PublishDeviceKernel
+
+
+class _EmbedPublishDeviceKernel:
+    """Multicasts this rank's embedding rows of ``ids`` (zeros for ids outside
+    its ``[start, start + rows)`` shard) into the Lamport mailbox."""
+
+    def __init__(
+        self, *, hidden: int, tp: int, rank: int, capacity_m: int, start: int, rows: int
+    ):
+        self.hidden = hidden
+        self.tp = tp
+        self.rank = rank
+        self.capacity_m = capacity_m
+        self.start = start
+        self.rows = rows
+        self.threads = 128
+        self.ctas_per_token = hidden // VEC_BF16 // self.threads
+
+    @cute.jit
+    def __call__(
+        self,
+        ids: cute.Tensor,
+        weight: cute.Tensor,
+        stage_state: cute.Tensor,
+        multicast: Int64,
+        m: Int32,
+        stream,
+    ) -> None:
+        self.kernel(ids, weight, stage_state, multicast).launch(
+            grid=(m * self.ctas_per_token, 1, 1),
+            block=(self.threads, 1, 1),
+            stream=stream,
+            use_pdl=True,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        ids: cute.Tensor,
+        weight: cute.Tensor,
+        stage_state: cute.Tensor,
+        multicast: Int64,
+    ):
+        block, _, _ = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        token = block // self.ctas_per_token
+        column = Int64((block % self.ctas_per_token) * self.threads + tidx) * VEC_BF16
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+        row = Int64(ids[token]) - self.start
+        words = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
+        words.fill(Uint32(0))
+        if (row >= 0) & (row < self.rows):
+            words.store(
+                sanitize_negative_zero_u32x4(
+                    load_global_u32x4(_gmem_ptr(weight, row * self.hidden + column, 16))
+                )
+            )
+        stage = load_volatile_u32(stage_state.iterator + NEXT_STAGE)
+        slot = (
+            (Int64(stage) * self.tp + self.rank) * self.capacity_m + Int64(token)
+        ) * self.hidden + column
+        stmc_bf16x8(multicast + slot * 2, words.load())
+        if block == 0 and tidx == 0:
+            store_global_u32(stage_state.iterator + ACTIVE_STAGE, stage)
+
+
+class _EmbedNormDeviceKernel:
+    """One CTA per token: sums the published embedding, zeroes it at position
+    0, and writes ``[enorm(embedding), hnorm(previous)]``."""
+
+    def __init__(self, *, hidden: int, tp: int, capacity_m: int, eps: float):
+        self.hidden = hidden
+        self.tp = tp
+        self.capacity_m = capacity_m
+        self.eps = eps
+        self.threads = hidden // VEC_BF16
+        if self.threads % WARP_SIZE or self.threads > 1024:
+            raise ValueError("unsupported hidden size")
+        self.warps = self.threads // WARP_SIZE
+
+    @cute.jit
+    def __call__(
+        self,
+        mailbox: cute.Tensor,
+        positions: cute.Tensor,
+        previous: cute.Tensor,
+        enorm: cute.Tensor,
+        hnorm: cute.Tensor,
+        output: cute.Tensor,
+        stage_state: cute.Tensor,
+        m: Int32,
+        stream,
+    ) -> None:
+        self.kernel(
+            mailbox, positions, previous, enorm, hnorm, output, stage_state
+        ).launch(
+            grid=(m, 1, 1),
+            block=(self.threads, 1, 1),
+            smem=self.warps * 8,
+            stream=stream,
+            use_pdl=True,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mailbox: cute.Tensor,
+        positions: cute.Tensor,
+        previous: cute.Tensor,
+        enorm: cute.Tensor,
+        hnorm: cute.Tensor,
+        output: cute.Tensor,
+        stage_state: cute.Tensor,
+    ) -> None:
+        hidden = self.hidden
+        tidx, _, _ = cute.arch.thread_idx()
+        token, _, _ = cute.arch.block_idx()
+        lane = cute.arch.lane_idx()
+        warp = cute.arch.warp_idx()
+        column = Int64(tidx) * VEC_BF16
+        element = Int64(token) * hidden + column
+        enorm_values = packed_u32x4_to_bf16x8(
+            load_global_u32x4(_gmem_ptr(enorm, column, 16))
+        ).to(Float32)
+        hnorm_values = packed_u32x4_to_bf16x8(
+            load_global_u32x4(_gmem_ptr(hnorm, column, 16))
+        ).to(Float32)
+
+        cute.arch.griddepcontrol_wait()
+
+        previous_values = packed_u32x4_to_bf16x8(
+            load_global_u32x4(_gmem_ptr(previous, element, 16))
+        ).to(Float32)
+        active_stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
+        reduced = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
+        reduced.fill(0.0)
+        packed = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
+        for source in cutlass.range_constexpr(self.tp):
+            slot = (
+                (Int64(active_stage) * self.tp + source) * self.capacity_m
+                + Int64(token)
+            ) * hidden + column
+            dirty = True
+            while dirty:
+                loaded = load_global_u32x4(_gmem_ptr(mailbox, slot, 16), volatile=True)
+                dirty = fragment_has_negative_zero(loaded)
+                packed.store(loaded)
+            reduced.store(
+                reduced.load() + packed_u32x4_to_bf16x8(packed.load()).to(Float32)
+            )
+
+        if token == 0 and tidx == 0:
+            store_global_u32(
+                stage_state.iterator + NEXT_STAGE,
+                (active_stage + Uint32(1)) % Uint32(LAMPORT_GENERATIONS),
+            )
+        cute.arch.griddepcontrol_launch_dependents()
+        for source in cutlass.range_constexpr(self.tp):
+            slot = (
+                (Int64(active_stage) * self.tp + source) * self.capacity_m
+                + Int64(token)
+            ) * hidden + column
+            store_lamport_sentinel_u32x4(Int64((mailbox.iterator + slot).toint()))
+
+        # Exactly one rank owns each row, so the sum is the BF16 row itself.
+        keep = Float32(1.0)
+        if positions[token] == 0:
+            keep = Float32(0.0)
+        embedding = reduced.load().to(BFloat16).to(Float32) * keep
+        squares = cute.make_rmem_tensor(cute.make_layout((2,)), Float32)
+        squares[0] = (embedding * embedding).reduce(
+            cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
+        )
+        squares[1] = (previous_values * previous_values).reduce(
+            cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
+        )
+        for i in cutlass.range_constexpr(2):
+            for offset in cutlass.range_constexpr(5):
+                squares[i] = squares[i] + cute.arch.shuffle_sync_bfly(
+                    squares[i], offset=1 << offset, mask=-1, mask_and_clamp=31
+                )
+        smem = cutlass.utils.SmemAllocator()
+        warp_sums = smem.allocate_array(Float32, 2 * self.warps)
+        if lane == 0:
+            cute.arch.store((warp_sums + 2 * warp).llvm_ptr, squares[0])
+            cute.arch.store((warp_sums + 2 * warp + 1).llvm_ptr, squares[1])
+        cute.arch.barrier()
+        total_e = Float32(0.0)
+        total_h = Float32(0.0)
+        for w in cutlass.range_constexpr(self.warps):
+            total_e = total_e + cute.arch.load((warp_sums + 2 * w).llvm_ptr, Float32)
+            total_h = total_h + cute.arch.load(
+                (warp_sums + 2 * w + 1).llvm_ptr, Float32
+            )
+        inv_e = cute.math.rsqrt(total_e / Float32(hidden) + Float32(self.eps))
+        inv_h = cute.math.rsqrt(total_h / Float32(hidden) + Float32(self.eps))
+        row = Int64(token) * (2 * hidden) + column
+        store_global_u32x4(
+            Int64((output.iterator + row).toint()),
+            bf16x8_to_packed_u32x4((embedding * inv_e * enorm_values).to(BFloat16)),
+        )
+        store_global_u32x4(
+            Int64((output.iterator + row + hidden).toint()),
+            bf16x8_to_packed_u32x4(
+                (previous_values * inv_h * hnorm_values).to(BFloat16)
+            ),
+        )
 
 
 class _NormDeviceKernel:
@@ -276,9 +492,103 @@ class AllReduceNorm:
             self._stage_state = torch.zeros(2, dtype=torch.int32, device=device)
             torch.accelerator.synchronize()
         dist.barrier(group=group)
+        self.tp, self.rank, self.device = tp, rank, device
+        self._embed: dict[int, Any] = {}
 
     def supports(self, tokens: int) -> bool:
         return 1 <= tokens <= self.capacity
+
+    def prepare_embedding(
+        self, weight: torch.Tensor, start: int, rows: int, eps: float
+    ):
+        """Compiles ``embed_norm`` for the vocabulary shard ``weight`` whose
+        first ``rows`` rows hold token ids ``[start, start + rows)``."""
+        hidden, capacity = self.hidden_size, self.capacity
+        assert weight.dtype == torch.bfloat16 and weight.is_contiguous()
+        assert weight.shape[1] == hidden
+        key = weight.data_ptr()
+        if key in self._embed:
+            return
+
+        def dynamic(dtype, alignment, divisibility):
+            return make_fake_dynamic_compact_tensor(
+                dtype, alignment=alignment, divisibility=divisibility
+            )
+
+        with torch.accelerator.device_index(self.device.index):
+            publish = cute.compile(
+                _EmbedPublishDeviceKernel(
+                    hidden=hidden,
+                    tp=self.tp,
+                    rank=self.rank,
+                    capacity_m=capacity,
+                    start=start,
+                    rows=rows,
+                ),
+                dynamic(Int32, 4, 1),
+                make_fake_compact_tensor(BFloat16, (weight.numel(),), assumed_align=16),
+                make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+                Int64(0),
+                Int32(capacity),
+                current_cu_stream(),
+            )
+            norm = cute.compile(
+                _EmbedNormDeviceKernel(
+                    hidden=hidden, tp=self.tp, capacity_m=capacity, eps=eps
+                ),
+                make_fake_compact_tensor(
+                    BFloat16,
+                    (LAMPORT_GENERATIONS * self.tp * capacity * hidden,),
+                    assumed_align=16,
+                ),
+                dynamic(Int64, 8, 1),
+                dynamic(BFloat16, 16, hidden),
+                make_fake_compact_tensor(BFloat16, (hidden,), assumed_align=16),
+                make_fake_compact_tensor(BFloat16, (hidden,), assumed_align=16),
+                dynamic(BFloat16, 16, 2 * hidden),
+                make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+                Int32(capacity),
+                current_cu_stream(),
+            )
+        self._embed[key] = (publish, norm, weight)
+
+    def embed_norm(
+        self,
+        ids: torch.Tensor,
+        positions: torch.Tensor,
+        previous: torch.Tensor,
+        weight: torch.Tensor,
+        enorm: torch.Tensor,
+        hnorm: torch.Tensor,
+    ) -> torch.Tensor:
+        """``fused_eh_norm`` of the vocab-parallel embedding of ``ids``:
+        ``[M, 2 * hidden]`` = ``[enorm(embedding), hnorm(previous)]``, the
+        embedding zeroed at position 0."""
+        publish, norm, _ = self._embed[weight.data_ptr()]
+        hidden = self.hidden_size
+        m = ids.shape[0]
+        state = to_cute(self._stage_state, 4)
+        publish(
+            to_cute_dynamic(ids, 4, divisibility=1),
+            to_cute(weight.flatten(), 16),
+            state,
+            Int64(self._multicast),
+            Int32(m),
+            current_cu_stream(),
+        )
+        output = torch.empty((m, 2 * hidden), dtype=previous.dtype, device=ids.device)
+        norm(
+            to_cute(self._mailbox.flatten(), 16),
+            to_cute_dynamic(positions, 8, divisibility=1),
+            to_cute_dynamic(previous.flatten(), 16, divisibility=hidden),
+            to_cute(enorm, 16),
+            to_cute(hnorm, 16),
+            to_cute_dynamic(output.flatten(), 16, divisibility=2 * hidden),
+            state,
+            Int32(m),
+            current_cu_stream(),
+        )
+        return output
 
     def __call__(
         self,
