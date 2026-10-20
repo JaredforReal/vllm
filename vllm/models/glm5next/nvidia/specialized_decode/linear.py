@@ -7,7 +7,8 @@ projections through ``quant_method.apply``; ``route`` wraps that call so a plann
 step's 1 or 2 token counts take the skinny projection, and every other call
 (prefills, stock steps, larger counts) the stock GEMM. At 4 tokens the DSA layer
 measured slower with it in place (124.6 -> 128.8 us per layer at B4), although
-the projections alone are faster.
+the projections alone are faster. The MTP draft also routes its larger token
+counts to the split-K GEMM (``route(module, split_k_tokens)``).
 """
 
 from contextlib import contextmanager
@@ -35,17 +36,17 @@ def planned_step():
 
 
 class _RoutedApply:
-    def __init__(self, inner, projection):
-        self.inner, self.projection = inner, projection
+    def __init__(self, inner, projection, tokens):
+        self.inner, self.projection, self.tokens = inner, projection, tokens
 
     def apply(self, layer, x, bias=None):
         if (
             _active[0]
             and bias is None
             and x.dim() == 2
-            and x.shape[0] <= MAX_TOKENS
-            and self.projection.supports(x.shape[0])
+            and x.shape[0] in self.tokens
             and x.stride(-1) == 1
+            and x.stride(0) % 8 == 0
         ):
             return self.projection(x)
         return self.inner.apply(layer, x, bias)
@@ -54,8 +55,9 @@ class _RoutedApply:
         return getattr(self.inner, name)
 
 
-def route(module) -> bool:
-    """Routes a BF16 linear module's decode GEMMs; False if it cannot."""
+def route(module, split_k_tokens=()) -> bool:
+    """Routes a BF16 linear module's decode GEMMs; False if it cannot.
+    ``split_k_tokens``: token counts above ``MAX_TOKENS`` to route to split-K."""
     weight = getattr(module, "weight", None)
     if weight is None or weight.dtype != torch.bfloat16 or weight.dim() != 2:
         return False
@@ -64,10 +66,12 @@ def route(module) -> bool:
     if isinstance(module.quant_method, _RoutedApply):
         return True
     try:
-        projection = Projection(weight)
+        projection = Projection(weight, split_k_tokens)
     except ValueError:
         return False
-    if not projection.configs:  # no tactic splits this K
+    tokens = {m for m in projection.configs if m <= MAX_TOKENS}
+    tokens |= {m for m in split_k_tokens if projection.supports(m)}
+    if not tokens:  # no tactic splits this K
         return False
-    module.quant_method = _RoutedApply(module.quant_method, projection)
+    module.quant_method = _RoutedApply(module.quant_method, projection, tokens)
     return True

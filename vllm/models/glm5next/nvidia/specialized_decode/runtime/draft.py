@@ -6,7 +6,8 @@ draft's FULL-graph steps, and a vocab-parallel argmax for greedy drafts.
 The MTP layer has no mHC streams, so its boundaries are a fused all-reduce,
 residual add and RMSNorm (``AllReduceNorm``) where the main model fuses the
 all-reduce with mHC. The vocab-parallel embedding's all-reduce takes the same
-mailbox, fused with the enorm / hnorm of the eh_proj input.
+mailbox, fused with the enorm / hnorm of the eh_proj input. The draft's BF16
+projections and LM head shard run the split-K GEMM above two tokens.
 """
 
 from typing import Any
@@ -51,6 +52,8 @@ class SpecializedDraft(LayerStages):
         self.moe_layers = self.layers
         # Draft decode steps run one token per request; draft prefills run q.
         self.batches = sorted(b for b in config.capture_sizes if b <= MAX_TOKENS)
+        # Token counts whose BF16 projections take the split-K GEMM.
+        self.split_k_tokens = [b for b in self.batches if b > PROJECTION_MAX_TOKENS]
         self.kda: dict[int, Any] = {}
         self.eh_proj: dict[int, Any] = {}
         if "dsa_gemm" in config.stages:
@@ -61,16 +64,30 @@ class SpecializedDraft(LayerStages):
             for mtp, layer in zip(self.mtp_layers, self.layers):
                 attn = layer.self_attn
                 modules = [getattr(attn, n, None) for n in DSA_PROJECTIONS]
+                routed += sum(
+                    m is not None and route(m, self.split_k_tokens) for m in modules
+                )
                 indexer = getattr(attn, "indexer", None)
-                modules += [getattr(indexer, n, None) for n in INDEXER_PROJECTIONS]
+                modules = [getattr(indexer, n, None) for n in INDEXER_PROJECTIONS]
                 routed += sum(m is not None and route(m) for m in modules)
-                self.eh_proj[layer.layer_idx] = Projection(mtp.eh_proj.weight)
+                self.eh_proj[layer.layer_idx] = Projection(
+                    mtp.eh_proj.weight, self.split_k_tokens
+                )
             logger.info("Specialized draft routes %d DSA GEMMs", routed)
         if "dsa_indexer" in config.stages:
             from ..indexer import IndexerStage
 
             for layer in self.layers:
                 IndexerStage(layer.self_attn.indexer)
+        if "dsa_attn" in config.stages:
+            from ..dsa_attention import DsaAttentionStage
+
+            for layer in self.layers:
+                DsaAttentionStage(
+                    layer.self_attn,
+                    MAX_TOKENS,
+                    self.policy.tokens("dsa_value_up", "cute"),
+                )
         self.mega: dict[int, Any] = {}
         if "mega_moe" in config.stages:
             self.mega = self._build_mega()
@@ -144,7 +161,7 @@ class SpecializedDraft(LayerStages):
         if "dsa_gemm" in self.config.stages:
             from ..gemm import Projection
 
-            self.head = Projection(weight)
+            self.head = Projection(weight, self.split_k_tokens)
         return DraftArgmax(
             columns=columns,
             valid=columns - shard.num_org_vocab_padding,
@@ -225,11 +242,7 @@ class SpecializedDraft(LayerStages):
             )
         projection = self.eh_proj.get(layer.layer_idx)
         with planned_step():
-            if (
-                projection is not None
-                and tokens <= PROJECTION_MAX_TOKENS
-                and projection.supports(tokens)
-            ):
+            if projection is not None and projection.supports(tokens):
                 x = projection(x)
             else:
                 x = mtp.eh_proj(x)
@@ -248,7 +261,7 @@ class SpecializedDraft(LayerStages):
             x, _ = self.reduced_norm(x, partial, residual, mtp.shared_head.norm)
         if rows is not None:
             out = x.new_empty((tokens, x.shape[1]))
-            out[rows] = x
+            out.index_copy_(0, rows, x)
             x = out
         return x, x
 
@@ -262,7 +275,6 @@ class SpecializedDraft(LayerStages):
         if (
             self.head is not None
             and torch.cuda.is_current_stream_capturing()
-            and tokens <= PROJECTION_MAX_TOKENS
             and self.head.supports(tokens)
             and head.weight is self.head.weight
             and hidden_states.is_contiguous()

@@ -508,7 +508,8 @@ class DsaAttentionStage:
         )
         cache = (kv_c, mla.kv_cache, context.slot_mapping[mla.layer_name], mla._k_scale)
         head_gemv(q, self.w_uk, q_fp8, mla._q_scale, cache)
-        w.indexer(hidden_states, q_c, positions, w.indexer_rope_emb)
+        if not w.skip_topk:  # MTP draft steps 1+ reuse step 0's top-k
+            w.indexer(hidden_states, q_c, positions, w.indexer_rope_emb)
         self.impl.record_logical_topk_ready()
         kv_cache = mla.kv_cache.view(current_platform.fp8_dtype())
         latent, _ = self.impl.forward_mqa(q_fp8, kv_cache, md, mla)
