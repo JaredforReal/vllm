@@ -53,6 +53,7 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives imp
     load_bf16x8,
     load_tma3,
     load_tmem,
+    named_barrier,
     pack_fp8,
     prefetch_bytes,
     redux,
@@ -172,21 +173,6 @@ def _popc(value):
     return "popc.b32 $0,$1;", "=r,r", (Uint32(value),)
 
 
-@cute.jit
-def _gather_l2(dst, src, count, first, step):
-    """``dst[i] = src[i]`` (L2 loads) for i = first, first + step, ... < count,
-    four loads in flight per thread."""
-    for i in cutlass.range(first, count, 4 * step, unroll=1):
-        values = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
-        for k in cutlass.range_constexpr(4):
-            values[k] = Float32(0.0)
-            if i + k * step < count:
-                values[k] = _load_l2(src + i + k * step)
-        for k in cutlass.range_constexpr(4):
-            if i + k * step < count:
-                dst[i + k * step] = values[k]
-
-
 def unit_capacity(experts: int, top_k: int, tokens: int = MAX_TOKENS) -> int:
     """Most units of a call: the shared expert's, then one per started GROUP of
     each routed expert's tokens."""
@@ -256,7 +242,6 @@ class _GroupedKernel:
         self.off_w = take(stages * self.a_bytes, 1024)
         self.off_b = take(stages * self.b_bytes, 1024)
         self.off_ring = take(self.ring * self.columns * 4)
-        self.off_xall = take(tokens * self.nk1 * 4)
         self.off_hs = take(GATHERERS * w * self.nk2 * 4)
         self.off_amax = take(4 * w * 4)
         self.off_picks = take(self.routes * 4)
@@ -278,7 +263,7 @@ class _GroupedKernel:
         self, maps: cute.Tensor, w13_scale: cute.Tensor, w2_scale: cute.Tensor,
         s13_scale: cute.Tensor, s2_scale: cute.Tensor, s13: cute.Tensor,
         s2: cute.Tensor, x: cute.Tensor, logits: cute.Tensor, bias: cute.Tensor,
-        rows1: cute.Tensor, rows2: cute.Tensor, out: cute.Tensor,
+        rows: cute.Tensor, out: cute.Tensor,
         shared_out: cute.Tensor, final: cute.Tensor, ids: cute.Tensor,
         weights: cute.Tensor, plan_x: cute.Tensor, plan_s: cute.Tensor,
         hidden: cute.Tensor, hscale: cute.Tensor, partial: cute.Tensor,
@@ -295,8 +280,7 @@ class _GroupedKernel:
             x,
             logits,
             bias,
-            rows1,
-            rows2,
+            rows,
             out,
             shared_out,
             final,
@@ -321,7 +305,7 @@ class _GroupedKernel:
         self, maps: cute.Tensor, w13_scale: cute.Tensor, w2_scale: cute.Tensor,
         s13_scale: cute.Tensor, s2_scale: cute.Tensor, s13: cute.Tensor,
         s2: cute.Tensor, x: cute.Tensor, logits: cute.Tensor, bias: cute.Tensor,
-        rows1: cute.Tensor, rows2: cute.Tensor, out: cute.Tensor,
+        rows: cute.Tensor, out: cute.Tensor,
         shared_out: cute.Tensor, final: cute.Tensor, ids: cute.Tensor,
         weights: cute.Tensor, plan_x: cute.Tensor, plan_s: cute.Tensor,
         hidden: cute.Tensor, hscale: cute.Tensor, partial: cute.Tensor,
@@ -366,6 +350,18 @@ class _GroupedKernel:
                 for k in cutlass.range_constexpr(piece // 4096):
                     if cta * piece + k * 4096 < size:
                         prefetch_bytes(weight.iterator + cta * piece + k * 4096, 4096)
+        if tid == 96:
+            # And the routed experts' block scales, which the B gatherers load
+            # on their critical path.
+            for which in cutlass.range_constexpr(2):
+                scales = w13_scale if which == 0 else w2_scale
+                size = cute.size(scales.layout)
+                piece = (size // self.grid + 63) // 64 * 64
+                if cta * piece < size:
+                    prefetch_bytes(
+                        scales.iterator + cta * piece,
+                        cutlass.min(piece, size - cta * piece) * 4,
+                    )  # fmt: skip
         if warp == 1:
             cute.arch.alloc_tmem(TMEM_COLUMNS, tmem_base.iterator)
             cute.arch.relinquish_tmem_alloc_permit()
@@ -403,10 +399,7 @@ class _GroupedKernel:
                 pass
         cute.arch.sync_threads()
         _fence()
-        xall = view(sm.iterator, self.off_xall, Float32, self.tokens * self.nk1)
-        _gather_l2(xall, plan_s.iterator, self.tokens * self.nk1, tid, THREADS)
         self.number_units(sm, ids, scal, tid, warp, lane, cta)
-        cute.arch.sync_threads()
         pair_count = mine + 1
         unit_ready = pair_count + unit_capacity(self.experts, self.top_k) * self.pairs
         jobs = mine + words - 3  # next FC2 job of halves A and B
@@ -418,14 +411,14 @@ class _GroupedKernel:
             self.issue(sm, tmem, full, empty, acc_full, acc_empty)
         elif warp < EPILOGUE:
             self.gather(
-                sm, full, empty, posted, plan_x, hidden, hscale, unit_ready, lane,
-                w13_scale, w2_scale, s13_scale, s2_scale, warp - 2,
+                sm, full, empty, posted, plan_x, plan_s, hidden, hscale, unit_ready,
+                lane, w13_scale, w2_scale, s13_scale, s2_scale, warp - 2,
             )  # fmt: skip
         else:
             self.epilogue(
                 sm, tmem, warp, lane, cta, tid - EPILOGUE * 32, acc_full, acc_empty,
-                scal, rows1, rows2, out, shared_out, hidden, hscale, partial,
-                pair_count, unit_ready,
+                scal, rows, out, shared_out, hidden, hscale, partial, pair_count,
+                unit_ready,
             )  # fmt: skip
         release_tmem(tmem, TMEM_COLUMNS, warp, 1)
         if cutlass.const_expr(self.finalize):
@@ -623,8 +616,20 @@ class _GroupedKernel:
                 self.ranges(scal, units + shared, cta)
         for t in cutlass.range(tid, self.tokens, THREADS, unroll=1):
             flat[t] = t
-        cute.arch.sync_threads()
-        for r in cutlass.range(tid, routes, THREADS, unroll=1):
+        # The weight producer (warp 0) starts on the unit tables; the other
+        # warps rank the routes.
+        if warp == 0:
+            cute.arch.sync_warp()
+            named_barrier(2, THREADS, arrive=True)
+        else:
+            named_barrier(2, THREADS)
+            self.rank_routes(picks, mask, eoff, flat, tid - 32)
+            named_barrier(3, THREADS - 32)
+
+    @cute.jit
+    def rank_routes(self, picks, mask, eoff, flat, i):
+        """``flat``: each expert's routes in token order (rows ``eoff[e]``..)."""
+        for r in cutlass.range(i, self.routes, THREADS - 32, unroll=1):
             e = picks[r]
             token = r // self.top_k
             low = mask[2 * e]
@@ -810,8 +815,8 @@ class _GroupedKernel:
 
     @cute.jit
     def gather(
-        self, sm, full, empty, posted, plan_x, hidden, hscale, unit_ready, lane,
-        w13_scale, w2_scale, s13_scale, s2_scale, gatherer,
+        self, sm, full, empty, posted, plan_x, plan_s, hidden, hscale, unit_ready,
+        lane, w13_scale, w2_scale, s13_scale, s2_scale, gatherer,
     ):  # fmt: skip
         """Stages ``gatherer``, ``gatherer + GATHERERS``, ... up to END: each
         stage's B tile, the unit's token rows of K blocks kb.. (FC1: the
@@ -822,7 +827,6 @@ class _GroupedKernel:
         uoff = view(sm.iterator, self.off_uoff, Int32, self.max_units + 1)
         ucnt = view(sm.iterator, self.off_ucnt, Int32, self.max_units)
         flat = view(sm.iterator, self.off_flat, Int32, self.routes + self.tokens)
-        xall = view(sm.iterator, self.off_xall, Float32, self.tokens * self.nk1)
         hs = view(
             sm.iterator, self.off_hs + gatherer * self.width * self.nk2 * 4, Float32,
             self.width * self.nk2,
@@ -889,6 +893,12 @@ class _GroupedKernel:
                             token = token // self.top_k
                         token_scales = token * self.nk1
                     current = key
+                # The tokens' activation scales (FC1), in flight with ``ws``.
+                xs = cute.make_rmem_tensor(cute.make_layout((DEPTH,)), Float32)
+                for d in cutlass.range_constexpr(DEPTH):
+                    xs[d] = Float32(0.0)
+                    if not fc2 and lane < count:
+                        xs[d] = _load_l2(plan_s.iterator + token_scales + kb + d)
                 dst = sm.iterator + self.off_b + slot * self.b_bytes
                 base = plan_x.iterator
                 if fc2:
@@ -906,11 +916,9 @@ class _GroupedKernel:
                 for d in cutlass.range_constexpr(DEPTH):
                     w_d = cute.arch.shuffle_sync(ws, d)
                     if lane < count:
-                        scale = Float32(0.0)
+                        scale = xs[d]
                         if fc2:
                             scale = hs[lane * self.nk2 + kb + d]
-                        else:
-                            scale = xall[token_scales + kb + d]
                         index = (n % self.ring) * self.columns + d * self.width + lane
                         ring[index] = w_d * scale
             cute.arch.cp_async_mbarrier_arrive_noinc(full + slot)
@@ -953,12 +961,13 @@ class _GroupedKernel:
 
     @cute.jit
     def epilogue(
-        self, sm, tmem, warp, lane, cta, e, acc_full, acc_empty, scal, rows1, rows2,
-        out, shared_out, hidden, hscale, partial, pair_count, unit_ready,
+        self, sm, tmem, warp, lane, cta, e, acc_full, acc_empty, scal, rows, out,
+        shared_out, hidden, hscale, partial, pair_count, unit_ready,
     ):  # fmt: skip
         w = self.width
         quadrant = warp % 4
         row = quadrant * 32 + lane
+        logical = rows[row]  # this thread's output row of every row tile
         lanes = tmem + (Uint32(quadrant * 32) << 16)
         uexp = view(sm.iterator, self.off_uexp, Int32, self.max_units)
         uoff = view(sm.iterator, self.off_uoff, Int32, self.max_units + 1)
@@ -978,7 +987,6 @@ class _GroupedKernel:
             if word != Uint32(END):
                 fc2, half, unit, tile, kb, opens, closes = self.unpack(word)
                 count = ucnt[unit]
-                groups = (count + GROUP - 1) // GROUP
                 expert = uexp[unit]
                 shared = expert < 0
                 first = uoff[unit]
@@ -1004,22 +1012,19 @@ class _GroupedKernel:
                     cute.arch.mbarrier_arrive(acc_empty + acc)
                 if closes:
                     if fc2:
-                        logical = rows2[tile * TILE + row]
+                        target = out.iterator + tile * TILE + logical
+                        if shared:
+                            target = shared_out.iterator + tile * TILE + logical
                         for j in cutlass.range_constexpr(w):
                             if j < count:
-                                target = out.iterator
-                                if shared:
-                                    target = shared_out.iterator
                                 _store_bf16(
-                                    target
-                                    + Int64(flat[first + j]) * self.hidden
-                                    + logical,
+                                    target + Int64(flat[first + j]) * self.hidden,
                                     up[j],
                                 )
                     else:
                         self.close_pair(
                             sm, cta, e, row, lane, quadrant, half, unit, n, start,
-                            count, groups, up, gate, scal, rows1, hidden, hscale,
+                            count, up, gate, scal, logical, hidden, hscale,
                             partial, pair_count, unit_ready,
                         )  # fmt: skip
             n = n + 1
@@ -1031,8 +1036,8 @@ class _GroupedKernel:
 
     @cute.jit
     def close_pair(
-        self, sm, cta, e, row, lane, quadrant, half, unit, n, opened, count, groups,
-        up, gate, scal, rows1, hidden, hscale, partial, pair_count, unit_ready,
+        self, sm, cta, e, row, lane, quadrant, half, unit, n, opened, count, up,
+        gate, scal, logical, hidden, hscale, partial, pair_count, unit_ready,
     ):  # fmt: skip
         """End of this CTA's piece (stages ``opened``..``n``) of a pair: finish
         the pair, or publish the partial and finish the pair if it is the pair's
@@ -1043,8 +1048,8 @@ class _GroupedKernel:
         base = s - s % self.span  # the pair's first stage in its half
         pair = s % self.unit1 // self.span
         if start == base and s == base + self.span - 1:
-            self.finish(sm, e, row, lane, quadrant, unit, pair, count, groups, up,
-                        gate, rows1, hidden, hscale, unit_ready)  # fmt: skip
+            self.finish(sm, e, row, lane, quadrant, unit, pair, count, up, gate,
+                        logical, hidden, hscale, unit_ready)  # fmt: skip
         else:
             size = scal[S_S1A]
             if half == 1:
@@ -1082,28 +1087,29 @@ class _GroupedKernel:
                         if j < count:
                             up[j] = up[j] + _load_l2(peer + j * TILE + row)
                             gate[j] = gate[j] + _load_l2(peer + (w + j) * TILE + row)
-                self.finish(sm, e, row, lane, quadrant, unit, pair, count, groups, up,
-                            gate, rows1, hidden, hscale, unit_ready)  # fmt: skip
+                self.finish(sm, e, row, lane, quadrant, unit, pair, count, up, gate,
+                            logical, hidden, hscale, unit_ready)  # fmt: skip
 
     @cute.jit
-    def finish(self, sm, e, row, lane, quadrant, unit, pair, count, groups, up, gate,
-               rows1, hidden, hscale, unit_ready):  # fmt: skip
+    def finish(self, sm, e, row, lane, quadrant, unit, pair, count, up, gate,
+               logical, hidden, hscale, unit_ready):  # fmt: skip
         """Clamped SwiGLU of hidden block ``pair``, FP8 per 128 per token (scale
         amax / 448), published for FC2."""
         w = self.width
         amax_buf = view(sm.iterator, self.off_amax, Float32, 4 * w)
-        # Up and gate tiles share the in-tile row shuffle.
-        logical = rows1[pair * TILE + row] - pair * TILE
         limit = Float32(self.limit)
+        # Every column (past ``count``: computed, never stored), so the
+        # tokens' chains interleave.
         for j in cutlass.range_constexpr(w):
-            if j < groups * GROUP:
-                g = cute.arch.fmin(gate[j], limit)
-                u = cute.arch.fmax(cute.arch.fmin(up[j], limit), -limit)
-                up[j] = g / (Float32(1.0) + cute.math.exp(-g)) * u
-                amax = redux(float_bits(cute.arch.fmax(up[j], -up[j])), "max")
-                if lane == 0:
-                    amax_buf[quadrant * w + j] = bits_float(amax)
+            g = cute.arch.fmin(gate[j], limit)
+            u = cute.arch.fmax(cute.arch.fmin(up[j], limit), -limit)
+            up[j] = g / (Float32(1.0) + cute.math.exp(-g)) * u
+            bits = redux(float_bits(cute.arch.fmax(up[j], -up[j])), "max")
+            if lane == 0:
+                amax_buf[quadrant * w + j] = bits_float(bits)
         cute.arch.barrier(barrier_id=1, number_of_threads=128)
+        rows = hidden.iterator + Int64(unit) * w * self.inter + pair * TILE + logical
+        scales = hscale.iterator + Int64(unit) * w * self.nk2 + pair
         for j in cutlass.range_constexpr(w):
             if j < count:
                 amax = cute.arch.fmax(
@@ -1114,15 +1120,9 @@ class _GroupedKernel:
                 byte = pack_fp8(
                     (up[j] / scale, Float32(0.0), Float32(0.0), Float32(0.0))
                 )
-                _store_u8(
-                    hidden.iterator + (Int64(unit) * w + j) * self.inter + pair * TILE
-                    + logical,
-                    byte & Uint32(0xFF),
-                )  # fmt: skip
+                _store_u8(rows + j * self.inter, byte & Uint32(0xFF))
                 if e == 0:
-                    _store_f32(
-                        hscale.iterator + (Int64(unit) * w + j) * self.nk2 + pair, scale
-                    )
+                    _store_f32(scales + j * self.nk2, scale)
         cute.arch.barrier(barrier_id=1, number_of_threads=128)
         if e == 0:
             _fence()
@@ -1185,12 +1185,12 @@ class GroupedExperts:
         )
         self.shared_scales = (shared[1].contiguous(), shared[3].contiguous())
         self.shared_bytes = tuple(shared[i].view(torch.uint8).view(-1) for i in (0, 2))
-        self.rows1 = _logical_rows(n1, w13.device)
-        self.rows2 = _logical_rows(w2.shape[2], w13.device)
-        within = self.rows1.view(2, -1) - torch.tensor(
-            [[0], [n1 // 2]], device=w13.device, dtype=torch.int32
-        )
-        assert torch.equal(within[0], within[1]), "up and gate shuffles differ"
+        # Every row tile of both GEMMs shares one in-tile row shuffle.
+        self.rows = _logical_rows(TILE, w13.device)
+        for n in (n1, w2.shape[2]):
+            tiles = _logical_rows(n, w13.device).view(-1, TILE)
+            offsets = torch.arange(0, n, TILE, device=w13.device, dtype=torch.int32)
+            assert torch.equal(tiles - offsets[:, None], self.rows.expand_as(tiles))
         self.grid = torch.cuda.get_device_properties(w13.device).multi_processor_count
         self.compiled = _compiled.setdefault(
             (self.hidden, self.inter, experts, top_k, limit, scale, ue8m0, self.grid),
@@ -1242,7 +1242,7 @@ class GroupedExperts:
         final = torch.empty_like(shared) if finalize else shared
         args = (
             self.maps, self.w13_scale, self.w2_scale, *self.shared_scales,
-            *self.shared_bytes, x, logits, bias, self.rows1, self.rows2, out, shared,
+            *self.shared_bytes, x, logits, bias, self.rows, out, shared,
             final, ids.view(-1), weights.view(-1), ws["plan_x"],
             ws["plan_s"].view(torch.float32), ws["hidden"],
             ws["hscale"].view(torch.float32), ws["partial"].view(torch.float32),
