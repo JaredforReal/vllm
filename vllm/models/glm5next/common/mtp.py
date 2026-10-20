@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -183,6 +184,16 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
         for mla_attn in self._mtp_mla_attns:
             mla_attn.skip_topk = skip
+
+    def topk_cache_layers(self) -> set[str]:
+        """Indexer cache layers, which no step that reuses the top-k reads."""
+        return {
+            module.prefix
+            for mla_attn in self._mtp_mla_attns
+            if mla_attn.indexer is not None
+            for module in mla_attn.indexer.modules()
+            if isinstance(module, AttentionLayerBase)
+        }
 
     def compact_topk_indices(self, slot_ids: torch.Tensor):
         """Gather the top-k index rows at ``slot_ids`` to the front of the buffer."""
