@@ -296,7 +296,7 @@ class LayerStages:
         """The attention output and whether it is still TP-partial."""
         partial = self.partial(x.shape[0])
         stage = self.kda.get(layer.layer_idx)
-        if stage is not None:
+        if stage is not None and self.policy("kda", x.shape[0]):
             md = step.metadata[layer.self_attn.prefix]
             return stage.run(x, md, step.q, reduce=not partial), partial
         o_proj = layer.self_attn.o_proj
@@ -355,7 +355,7 @@ class SpecializedDecode(LayerStages):
                 if layer.layer_kind == "kda":
                     stage = KdaStage(
                         layer.self_attn,
-                        self.batches,
+                        [b for b in self.batches if self.policy("kda", b)],
                         self.q,
                         gemm="gemm" in config.stages,
                         gate_tokens=self.policy.tokens("kda_gate", "cute")

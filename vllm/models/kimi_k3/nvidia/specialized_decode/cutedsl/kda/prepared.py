@@ -15,16 +15,21 @@ from ..common.policy import batch_table
 from .kernel import KdaSplit
 
 # KdaSplit schedule "early.lanes.occupancy.cluster.evict" per batch by heads (TP8 12,
-# TP16 6), from GB300 sweeps: early predecessor-independent loads (MMA gate modes only;
-# 2 also stages the state rows in shared memory, 3 also the F_B operands), lanes per
-# state row, minimum CTAs per SM, CTAs per head (0: defaults) and L2 evict-first state
-# traffic (staged only).
-SCHEDULE = {12: "16-32:3.16.3.2.1,64:3.16.4.2.1", 6: "16:1.0.0,32-64:3.16.3.2"}
+# TP16 6, GLM-5.3-Flash TP4 16), from GB300 sweeps: early predecessor-independent
+# loads (MMA gate modes only; 2 also stages the state rows in shared memory, 3 also
+# the F_B operands), lanes per state row, minimum CTAs per SM, CTAs per head (0:
+# defaults) and L2 evict-first state traffic (staged only).
+SCHEDULE = {
+    12: "16-32:3.16.3.2.1,64:3.16.4.2.1",
+    6: "16:1.0.0,32-64:3.16.3.2",
+    16: "32-64:3.16.4.2.1",
+}
 # Verify (q > 1) schedules by request count B, from GB300
 # sweeps over q 4-8: no staging; eight-CTA clusters, then fewer as B grows.
 SPEC_SCHEDULE = {
     12: "1:1.8.2.8,2-4:1.8.3.8,5-12:1.8.3.4,13-16:1.8.3.2",
     6: "1:1.8.2.8,2:1.8.0.8,3-12:1.8.3.8,13-16:1.8.3.4",
+    16: "8-16:1.8.4.4",
 }
 
 

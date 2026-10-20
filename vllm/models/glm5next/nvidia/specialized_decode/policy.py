@@ -30,6 +30,9 @@ DEFAULT = {
     # Dense layers' MLP: 7.5 / 8.4 / 11.0 us per layer in situ at 1 / 4 / 8
     # tokens, stock ~20.
     "dense_mlp": "1-2:cute,4:cute,8:cute",
+    # KDA core: Kimi K3's fused KdaSplit (conv, F_B, decay, delta rule, gated
+    # norm) in place of stock's conv / F_B GEMM / recurrence / norm kernels.
+    "kda": "1-64:split",
     # KDA output gate g_b_proj; cuBLAS wins at 8 (1.7 vs 2.0 us with the
     # weights out of L2).
     "kda_gate": "1-4:cute",
