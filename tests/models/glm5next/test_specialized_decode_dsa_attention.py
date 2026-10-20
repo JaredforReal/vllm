@@ -170,3 +170,38 @@ def test_kda_gate_matches_linear(tokens):
     stock = torch.nn.functional.linear(g_a, weight)
     ours, theirs = _errors(gate, reference), _errors(stock, reference)
     assert ours[0] <= theirs[0] and ours[1] <= theirs[1] * 1.02, (ours, theirs)
+
+
+@pytest.mark.parametrize(
+    "shape,tokens",
+    [((2048, 4096), 4), ((2048, 4096), 64), ((4096, 1536), 16), ((4096, 4096), 32)],
+)
+def test_split_k_projection_matches_linear(shape, tokens):
+    """A routed DSA projection inside a planned step runs the split-K GEMM on a
+    strided input (q_b reads q_c out of the q/kv a output) with no larger error
+    than cuBLAS's against the FP64 product."""
+    from types import SimpleNamespace
+
+    from vllm.models.glm5next.nvidia.specialized_decode.linear import (
+        planned_step,
+        route,
+    )
+
+    class Linear:
+        def apply(self, layer, x, bias=None):
+            return torch.nn.functional.linear(x, layer.weight)
+
+    g = torch.Generator(device="cuda").manual_seed(tokens)
+    n, k = shape
+    weight = torch.randn(n, k, generator=g, device="cuda") * k**-0.5
+    module = SimpleNamespace(weight=weight.bfloat16(), quant_method=Linear())
+    assert route(module, [tokens])
+    assert tokens in module.quant_method.projection.split_k.kernels
+    x = torch.randn(tokens, k + 512, generator=g, device="cuda").bfloat16()[:, :k]
+    with planned_step():
+        out = module.quant_method.apply(module, x)
+
+    reference = x.double() @ module.weight.double().t()
+    stock = torch.nn.functional.linear(x, module.weight)
+    ours, theirs = _errors(out, reference), _errors(stock, reference)
+    assert ours[0] <= theirs[0] and ours[1] <= theirs[1] * 1.02, (ours, theirs)

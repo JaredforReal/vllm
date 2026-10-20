@@ -368,6 +368,7 @@ class SpecializedDecode(LayerStages):
         if "dsa_gemm" in config.stages:
             from ..linear import route
 
+            split = [b for b in self.batches if self.policy("dsa_proj", b)]
             for layer in self.layers:
                 if layer.layer_kind != "mla":
                     continue
@@ -376,7 +377,7 @@ class SpecializedDecode(LayerStages):
                 indexer = getattr(attn, "indexer", None)
                 modules += [getattr(indexer, n, None) for n in INDEXER_PROJECTIONS]
                 for m in modules:
-                    if m is not None and route(m):
+                    if m is not None and route(m, split):
                         self.routed.append(m.prefix)
             logger.info("Specialized decode routes %d DSA GEMMs", len(self.routed))
         if "dsa_indexer" in config.stages:

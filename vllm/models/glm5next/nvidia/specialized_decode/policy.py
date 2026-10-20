@@ -40,6 +40,10 @@ DEFAULT = {
     "kda_gate": "1-4:cute",
     # DSA W_UV value up-projection; cuBLAS's bmm wins at 8 (2.5 vs 3.0 us).
     "dsa_value_up": "1-4:cute",
+    # DSA BF16 projections (q/kv a, q_b, o_proj, indexer wq_b) as Kimi K3's
+    # split-K GEMM, where gemm.SPLIT_K has a tactic for the shape (cuBLAS
+    # elsewhere); 1-2 tokens take the skinny GEMM.
+    "dsa_proj": "4-64:split_k",
 }
 
 

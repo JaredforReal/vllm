@@ -4,11 +4,11 @@
 
 Stages that still call stock modules (the DSA attention) reach their BF16
 projections through ``quant_method.apply``; ``route`` wraps that call so a planned
-step's 1 or 2 token counts take the skinny projection, and every other call
-(prefills, stock steps, larger counts) the stock GEMM. At 4 tokens the DSA layer
-measured slower with it in place (124.6 -> 128.8 us per layer at B4), although
-the projections alone are faster. The MTP draft also routes its larger token
-counts to the split-K GEMM (``route(module, split_k_tokens)``).
+step's 1 or 2 token counts take the skinny projection, the counts given to
+``route`` the split-K GEMM (DSA layers and the MTP draft), and every other call
+(prefills, stock steps, other counts) the stock GEMM. At 4 tokens the DSA layer
+measured slower with the skinny projection in place (124.6 -> 128.8 us per
+layer at B4), although the projections alone are faster.
 """
 
 from contextlib import contextmanager
