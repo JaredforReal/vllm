@@ -34,7 +34,9 @@ SPEC_SCHEDULE = {
 
 
 @cache
-def executable(specs, heads, gate_mode, has_bias, device, tokens=1):
+def executable(
+    specs, heads, gate_mode, has_bias, device, tokens=1, low_rank_gate=False
+):
     args = tuple(fake(shape, stride, dtype) for shape, stride, dtype in specs)
     batch = specs[0][0][0]
     table = SCHEDULE if tokens == 1 else SPEC_SCHEDULE
@@ -43,7 +45,9 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1):
     if schedule[0] >= 2 and specs[9][1][-2:] != (128, 1):  # staging needs whole rows
         schedule = (1, *schedule[1:4])  # no evict hint without staging
     requests = batch // tokens
-    kernel = KdaSplit(heads, requests, gate_mode, has_bias, schedule, tokens)
+    kernel = KdaSplit(
+        heads, requests, gate_mode, has_bias, schedule, tokens, low_rank_gate
+    )
     scalars = (cutlass.Float32(v) for v in (-5, 128**-0.5, 1e-6))
     with torch.accelerator.device_index(device):
         return cute.compile(

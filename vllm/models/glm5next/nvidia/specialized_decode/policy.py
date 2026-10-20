@@ -31,8 +31,10 @@ DEFAULT = {
     # tokens, stock ~20.
     "dense_mlp": "1-2:cute,4:cute,8:cute",
     # KDA core: Kimi K3's fused KdaSplit (conv, F_B, decay, delta rule, gated
-    # norm) in place of stock's conv / F_B GEMM / recurrence / norm kernels.
-    "kda": "1-64:split",
+    # norm) in place of stock's conv / F_B GEMM / recurrence / norm kernels;
+    # "split_gate" also folds in g_b_proj: KDA layer -1.3 / -0.7 us in situ at
+    # 32 / 64 tokens (-1.9 / -1.1 with MTP3).
+    "kda": "1-16:split,32-64:split_gate",
     # KDA output gate g_b_proj; cuBLAS wins at 8 (1.7 vs 2.0 us with the
     # weights out of L2).
     "kda_gate": "1-4:cute",

@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KDA decode stage: the stock input projection and low-rank output-gate GEMMs,
 then one fused kernel (conv update, L2 norm, F_B projection and decay, delta-rule
-update, gated RMSNorm) in place of four, then the stock o_proj.
+update, gated RMSNorm) in place of four, then the stock o_proj. At ``fold_tokens``
+the fused kernel also runs g_b_proj (its gate warp, during the state update).
 
 The fused kernel is Kimi K3's ``KdaSplit``; GLM-5.3-Flash has the same KDA math
 (bounded sigmoid gate, sigmoid beta, conv width 4, head dim 128, BF16 conv and
@@ -32,7 +33,15 @@ HEAD_DIM = 128
 
 
 class KdaStage:
-    def __init__(self, attention, batches, q, gemm=False, gate_tokens=frozenset()):
+    def __init__(
+        self,
+        attention,
+        batches,
+        q,
+        gemm=False,
+        gate_tokens=frozenset(),
+        fold_tokens=frozenset(),
+    ):
         self.attention = a = attention
         # Skinny (in_proj, o_proj) GEMMs.
         self.projections: tuple[Projection, Projection] | None = None
@@ -49,6 +58,9 @@ class KdaStage:
         if gate_tokens and a.g_b_proj.weight.dtype == torch.bfloat16:
             self.g_b = a.g_b_proj.weight.detach().t().contiguous().unsqueeze(0)
         self.dim = self.heads * HEAD_DIM
+        self.fold_tokens = frozenset()
+        if a.g_b_proj.weight.dtype == torch.bfloat16:
+            self.fold_tokens = frozenset(fold_tokens)
         conv = torch.cat(
             [m.weight.detach() for m in (a.q_conv1d, a.k_conv1d, a.v_conv1d)]
         )
@@ -71,7 +83,7 @@ class KdaStage:
         self.keys += [(b // q, q) for b in batches if q > 1 and b % q == 0]
         self.kernels: dict = {}
 
-    def _operands(self, caches, projected, gate, slots, out, accepted=None):
+    def _operands(self, caches, projected, gate, slots, out, accepted=None, g_b=None):
         conv, state = caches[:2]
         conv = conv if self.conv_dim_first else conv.transpose(-1, -2)
         w, a_log, dt, norm, fb = self.weights
@@ -80,6 +92,7 @@ class KdaStage:
         # The kernel needs a bias tensor; dt_bias stands in (has_bias=False).
         ops = (p(0, 3 * d), w, dt, conv, p(3 * d + h, HEAD_DIM), p(3 * d, h), a_log)
         tail = (fb,) if accepted is None else (fb, accepted)
+        tail += () if g_b is None else (g_b,)
         return ops + (dt, slots, state, out, gate, norm) + tail
 
     def prepare_caches(self, caches):
@@ -95,7 +108,13 @@ class KdaStage:
             shape = (requests, tokens) if tokens > 1 else (batch,)
             slots = torch.empty(shape, dtype=torch.int32, **meta)
             accepted = accepted if tokens > 1 else None
-            operands = self._operands(caches, projected, gate, slots, out, accepted)
+            fold = batch in self.fold_tokens
+            g_b = self.attention.g_b_proj.weight if fold else None
+            if fold:
+                gate = self._g_a(projected)
+            operands = self._operands(
+                caches, projected, gate, slots, out, accepted, g_b
+            )
             self.kernels[key] = executable(
                 tuple(map(layout, operands)),
                 self.heads,
@@ -103,7 +122,12 @@ class KdaStage:
                 False,
                 self.device.index,
                 tokens,
+                fold,
             )
+
+    def _g_a(self, projected):
+        start = 3 * self.dim + self.heads + HEAD_DIM
+        return projected[:, start : start + HEAD_DIM]
 
     def run(self, x, metadata, q, reduce=True):
         """The attention output, TP-reduced unless ``reduce`` is False."""
@@ -112,9 +136,11 @@ class KdaStage:
         if skinny is not None and not skinny[0].supports(x.shape[0]):
             skinny = None
         projected = skinny[0](x) if skinny is not None else a.in_proj_qkvbfg_a(x)[0]
-        d, h = self.dim, self.heads
-        g_a = projected[:, 3 * d + h + HEAD_DIM : 3 * d + h + 2 * HEAD_DIM]
-        if self.g_b is not None and x.shape[0] in self.gate_tokens:
+        d = self.dim
+        g_a, g_b = self._g_a(projected), None
+        if x.shape[0] in self.fold_tokens:
+            gate, g_b = g_a, a.g_b_proj.weight
+        elif self.g_b is not None and x.shape[0] in self.gate_tokens:
             gate = torch.empty((x.shape[0], d), dtype=x.dtype, device=x.device)
             head_gemv(g_a.unsqueeze(1), self.g_b, gate.unsqueeze(1))
         else:
@@ -130,7 +156,7 @@ class KdaStage:
         else:
             slots = metadata.non_spec_state_indices_tensor[:batch]
             key, accepted = batch, None
-        tensors = self._operands(a.kv_cache, projected, gate, slots, out, accepted)
+        tensors = self._operands(a.kv_cache, projected, gate, slots, out, accepted, g_b)
         views = tuple(to_cute(t, 16) for t in tensors)
         self.kernels[key](*views[:13], *self.scalars, *views[13:], stream(self.device))
         if skinny is not None:

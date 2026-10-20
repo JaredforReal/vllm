@@ -3,7 +3,8 @@
 """The specialized decode's fused KDA core (``KdaStage`` on Kimi K3's KdaSplit) at
 32 and 64 tokens, plain decode and q = 4 verify, against an FP64 reference: its
 output and recurrent-state error must not exceed the stock kernels' (conv update,
-F_B GEMM, fused recurrence, gated RMSNorm), and its conv rows must match."""
+F_B GEMM, fused recurrence, gated RMSNorm), and its conv rows must match. With
+g_b_proj folded in, the reference takes the FP64 gate and stock its BF16 GEMM."""
 
 from types import SimpleNamespace
 
@@ -48,12 +49,17 @@ class _Case:
             1, q + 1, (requests,), generator=g, device="cuda", dtype=torch.int32
         )
         self.projected = rand(self.tokens, PITCH).bfloat16()
-        self.gate = rand(self.tokens, DIM).bfloat16()
+        self.g_b = rand(DIM, HEAD_DIM, scale=HEAD_DIM**-0.5).bfloat16()
+        self.gate = F.linear(self.g_a(), self.g_b)
+
+    def g_a(self):
+        start = 3 * DIM + HEADS + HEAD_DIM
+        return self.projected[:, start : start + HEAD_DIM]
 
     def clone_caches(self):
         return tuple(c.clone() for c in self.caches)
 
-    def specialized(self, caches):
+    def specialized(self, caches, fold):
         from vllm.models.glm5next.nvidia.specialized_decode.kda import KdaStage
 
         conv = lambda w: SimpleNamespace(weight=w)
@@ -70,10 +76,11 @@ class _Case:
             kv_cache=caches,
             # Projection stand-ins: the stage's core output passes through o_proj.
             in_proj_qkvbfg_a=_Module(torch.empty(PITCH, 1), lambda x: self.projected),
-            g_b_proj=_Module(None, lambda g_a: self.gate),
+            g_b_proj=_Module(self.g_b, lambda g_a: self.gate),
             o_proj=_Module(None, lambda out: out),
         )
-        stage = KdaStage(attention, [self.tokens], self.q)
+        fold_tokens = {self.tokens} if fold else ()
+        stage = KdaStage(attention, [self.tokens], self.q, fold_tokens=fold_tokens)
         stage.prepare_caches(caches)
         x = torch.empty(self.tokens, 1, device="cuda", dtype=torch.bfloat16)
         metadata = SimpleNamespace(
@@ -152,8 +159,12 @@ class _Case:
             eps=EPS,
         ).view(tokens, DIM)
 
-    def reference(self):
-        """FP64 outputs, the states written per slot and the conv rows per slot."""
+    def reference(self, exact_gate=False):
+        """FP64 outputs, the states written per slot and the conv rows per slot;
+        ``exact_gate``: from the FP64 g_b_proj instead of the BF16 one."""
+        gates = self.gate.double()
+        if exact_gate:
+            gates = self.g_a().double() @ self.g_b.double().T
         conv0, state0 = (c.double() for c in self.caches)
         x = self.projected.double()
         weight = torch.cat(self.conv_weight).double().view(3 * DIM, 4)
@@ -184,7 +195,7 @@ class _Case:
                 state = state + (delta * beta)[..., None] * key[:, None]
                 o = torch.einsum("hvk,hk->hv", state, query)
                 o = o / ((o * o).mean(-1, keepdim=True) + EPS).sqrt()
-                gate_out = torch.sigmoid(self.gate[n].double().view(HEADS, -1))
+                gate_out = torch.sigmoid(gates[n].view(HEADS, -1))
                 out[n] = (o * self.norm.double() * gate_out).view(-1)
                 states[slots[t]] = state
             rows = x[r * self.q : (r + 1) * self.q, : 3 * DIM]
@@ -213,12 +224,13 @@ def _errors(out, caches, reference):
     return [float(v) for v in quantiles] + [state]
 
 
+@pytest.mark.parametrize("fold", [False, True], ids=["gate", "fold_g_b"])
 @pytest.mark.parametrize(("requests", "q"), [(32, 1), (64, 1), (8, 4), (16, 4)])
-def test_kda_core_no_worse_than_stock(requests, q):
+def test_kda_core_no_worse_than_stock(requests, q, fold):
     case = _Case(requests, q)
-    reference = case.reference()
+    reference = case.reference(exact_gate=fold)
     ours_caches, stock_caches = case.clone_caches(), case.clone_caches()
-    ours = _errors(case.specialized(ours_caches), ours_caches, reference)
+    ours = _errors(case.specialized(ours_caches, fold), ours_caches, reference)
     stock = _errors(case.stock(stock_caches), stock_caches, reference)
     # Median, p99 and max output error and the max state error.
     assert all(a <= b for a, b in zip(ours, stock)), (ours, stock)

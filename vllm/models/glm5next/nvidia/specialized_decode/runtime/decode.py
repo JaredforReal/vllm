@@ -361,6 +361,7 @@ class SpecializedDecode(LayerStages):
                         gate_tokens=self.policy.tokens("kda_gate", "cute")
                         if "kda_gate" in config.stages
                         else frozenset(),
+                        fold_tokens=self.policy.tokens("kda", "split_gate"),
                     )
                     self.kda[layer.layer_idx] = stage
         self.routed: list[str] = []
