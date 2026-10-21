@@ -25,6 +25,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# ll_bf16 split-K kernel (splits, stages, output) of the router at 32-64 tokens:
+# 3.3 vs 5.1 us for cuBLAS's split-K GEMM + reduce at 64 tokens (288 x 4096).
+ROUTER_SPLIT_K = (4, 4, torch.float32)
+
 # Token counts (requests x tokens per request) with a planned decode path.
 MAX_TOKENS = 64
 # BF16 projections of the DSA layer and its indexer that dsa_gemm routes.
@@ -171,6 +175,17 @@ class LayerStages:
                 [m for m in per_route_tokens if self.policy("shared_expert", m)]
             )
             device = routed.w13_weight.device
+        if any(self.policy("router", m) for m in tokens):
+            from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+                ll_bf16_gemm_kernel,
+            )
+
+            split_k, stages, _ = ROUTER_SPLIT_K
+            ll_bf16_gemm_kernel.compile(
+                ll_bf16_gemm_kernel.CompileKey(
+                    backend="splitk", split_k=split_k, num_stages=stages
+                )
+            )
         if mega:
             top_k = self.text_config.num_experts_per_tok
             self.route_order = torch.arange(
@@ -217,7 +232,7 @@ class LayerStages:
         bias = moe.gate.e_score_correction_bias
         if self.policy("moe", x.shape[0]) == "grouped":
             # The grouped kernel runs the shared expert as one more expert.
-            logits, _ = moe.experts.gate(x)
+            logits = self._router(moe, x)
             rows, ids, weights, shared = grouped(x, logits, bias)
         else:
             main = torch.cuda.current_stream()
@@ -238,12 +253,33 @@ class LayerStages:
         )
         return MoEOutput(routed=routed, shared_output=shared)
 
+    def _router(self, moe, x):
+        """Router logits; the CuTe split-K GEMM where the policy picks it."""
+        gate = moe.experts.gate
+        if (
+            self.policy("router", x.shape[0])
+            and gate.weight.dtype == torch.bfloat16
+            and gate.out_dtype == torch.float32
+        ):
+            from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+                current_cuda_stream,
+                ll_bf16_gemm_kernel,
+            )
+
+            kernel = ll_bf16_gemm_kernel._splitk_cache[ROUTER_SPLIT_K]
+            out = torch.empty(
+                x.shape[0], gate.weight.shape[0], dtype=torch.float32, device=x.device
+            )
+            kernel(x, gate.weight, out, current_cuda_stream(), 1.0)
+            return out
+        return gate(x)[0]
+
     def _grouped_moe(self, layer, x):
         """Routed and shared experts as the grouped kernel, finalized and
         all-reduced (token counts without a fused boundary)."""
         moe = layer.mlp
         _, grouped = self.mega[layer.layer_idx]
-        logits, _ = moe.experts.gate(x)
+        logits = self._router(moe, x)
         bias = moe.gate.e_score_correction_bias
         return tensor_model_parallel_all_reduce(grouped(x, logits, bias, finalize=True))
 

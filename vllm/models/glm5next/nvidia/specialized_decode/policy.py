@@ -24,6 +24,9 @@ DEFAULT = {
     # with the shared expert) wins or ties: MoE layer 74 vs 76 us at 8 tokens,
     # 94 vs 98 at 16, 126 vs 140 at 32, 171 vs 170 at 64 (164 vs 179 with MTP3).
     "moe": "1-4:per_route,8-64:grouped",
+    # Router logits at 32-64 tokens as the ll_bf16 split-K GEMM (stock: cuBLAS
+    # split-K + reduce, ~2 us longer on the critical path).
+    "router": "32-64:split_k",
     # Shared expert GEMVs beside the per-route clusters. At four tokens they slow
     # the clusters more than DeepGEMM does (B4 step 4.56 vs 4.37 ms).
     "shared_expert": "1-2:cute",
