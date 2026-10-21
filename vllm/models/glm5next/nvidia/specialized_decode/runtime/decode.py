@@ -430,6 +430,61 @@ class SpecializedDecode(LayerStages):
                 for layer in self.layers
                 for fn in (layer.hc_attn_fn, layer.hc_ffn_fn)
             }
+        self.logits_gather: Any = None
+        self.logits_tokens: set[int] = set()
+        self.head: Any = None
+        self.head_tokens: set[int] = set()
+
+    def build_logits(self, logits_processor, lm_head) -> None:
+        """The LM head GEMM and logits all-gather at the row counts the policy
+        gives them."""
+        weight = lm_head.weight
+        if (
+            weight.dtype != torch.bfloat16
+            or logits_processor.logits_as_input
+            or logits_processor.head_dtype not in (None, torch.bfloat16)
+        ):
+            return
+        self.logits_tokens = self.policy.tokens("logits_gather", "nvlink")
+        if self.logits_tokens:
+            from ..logits_gather import LogitsGather
+
+            self.logits_gather = LogitsGather(
+                columns=weight.shape[0],
+                capacity=max(self.logits_tokens),
+                device=weight.device,
+            )
+        tokens = self.policy.tokens("logits_head", "cute")
+        if (
+            tokens
+            and logits_processor.soft_cap is None
+            and logits_processor.scale == 1.0
+        ):
+            from ..gemm import Projection
+            from ..linear import MAX_TOKENS as SKINNY_MAX_TOKENS
+
+            # Verify steps sample every token of the planned batches.
+            split_k = [m for m in self.batches if m in tokens and m > SKINNY_MAX_TOKENS]
+            head = Projection(weight, split_k)
+            self.head_tokens = {m for m in tokens if head.supports(m)}
+            self.head = head
+
+    def compute_logits(self, logits_processor, lm_head, hidden_states):
+        """``logits_processor(lm_head, hidden_states)`` on the CuTe head GEMM and
+        NVLink gather, or None for the stock ones."""
+        rows = hidden_states.shape[0]
+        if (
+            self.logits_gather is None
+            or rows not in self.logits_tokens
+            or hidden_states.dtype != torch.bfloat16
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        if rows in self.head_tokens and hidden_states.is_contiguous():
+            logits = self.head(hidden_states)
+        else:
+            logits = logits_processor(lm_head, hidden_states, skip_gather=True)
+        return self.logits_gather(logits)[:, : logits_processor.org_vocab_size]
 
     def _build_ar_mhc(self):
         from ..all_reduce_mhc import AllReduceMhcBoundary

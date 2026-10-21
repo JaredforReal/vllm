@@ -1086,6 +1086,7 @@ class Glm5NextForCausalLM(
         self.specialized_decode = SpecializedDecode(
             self.model, self.specialized_decode_config
         )
+        self.specialized_decode.build_logits(self.logits_processor, self.lm_head)
 
     def get_model_state_cls(self) -> "type[ModelState]":
         from ..nvidia.model_state import Glm5NextModelState
@@ -1156,6 +1157,13 @@ class Glm5NextForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        decode = self.specialized_decode
+        if decode is not None:
+            logits = decode.compute_logits(
+                self.logits_processor, self.lm_head, hidden_states
+            )
+            if logits is not None:
+                return logits
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 

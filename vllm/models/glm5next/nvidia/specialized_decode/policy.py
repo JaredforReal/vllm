@@ -44,6 +44,13 @@ DEFAULT = {
     # split-K GEMM, where gemm.SPLIT_K has a tactic for the shape (cuBLAS
     # elsewhere); 1-2 tokens take the skinny GEMM.
     "dsa_proj": "4-64:split_k",
+    # The LM head's logits all-gather as one NVLink kernel straight into the
+    # [rows, vocab] layout: in situ 31 / 42 us at 32 / 64 rows, NCCL all-gather
+    # + permute copy 63 / 79.
+    "logits_gather": "1-64:nvlink",
+    # The LM head shard GEMM: the skinny GEMM at 1-2 rows, the split-K GEMM from
+    # 4 rows (the MTP head's tactics; in situ 55 -> 51.6 us at 64 rows).
+    "logits_head": "1-64:cute",
 }
 
 
