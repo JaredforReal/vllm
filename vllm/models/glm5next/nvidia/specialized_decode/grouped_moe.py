@@ -579,13 +579,14 @@ class _GroupedKernel:
         cute.arch.sync_threads()
         if warp == 0:
             per = experts // 32
+            tokens = cute.make_rmem_tensor(cute.make_layout((per,)), Int32)
             distinct = Int32(0)
             count = Int32(0)
             for j in cutlass.range_constexpr(per):
                 e = lane * per + j
-                n = Int32(_popc(mask[2 * e]) + _popc(mask[2 * e + 1]))
-                count = count + n
-                distinct = distinct + (n + GROUP - 1) // GROUP
+                tokens[j] = Int32(_popc(mask[2 * e]) + _popc(mask[2 * e + 1]))
+                count = count + tokens[j]
+                distinct = distinct + (tokens[j] + GROUP - 1) // GROUP
             units = distinct
             routed = count
             for shift in cutlass.range_constexpr(5):
@@ -599,9 +600,15 @@ class _GroupedKernel:
             start = routed - count + self.tokens
             for j in cutlass.range_constexpr(per):
                 e = lane * per + j
-                n = Int32(_popc(mask[2 * e]) + _popc(mask[2 * e + 1]))
+                n = tokens[j]
                 eoff[e] = start
-                for i in cutlass.range(0, n, GROUP, unroll=1):
+                if n > 0:
+                    uexp[unit] = e
+                    uoff[unit] = start
+                    ucnt[unit] = cutlass.min(n, GROUP)
+                    unit = unit + 1
+                # Experts of more than GROUP tokens run as several units.
+                for i in cutlass.range(GROUP, n, GROUP, unroll=1):
                     uexp[unit] = e
                     uoff[unit] = start + i
                     ucnt[unit] = cutlass.min(n - i, GROUP)
