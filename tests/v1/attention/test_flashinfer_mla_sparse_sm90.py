@@ -15,6 +15,7 @@ import pytest
 import torch
 
 # isort: off
+import vllm.utils.gpu_sync_debug as gsd
 import vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 as sm90_mod
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import (
     FlashInferMLASparseSM90Backend,
@@ -534,6 +535,24 @@ def test_upper_bound_plan_reused_across_steps(monkeypatch):
             state.pack_indices(slots)
             outs.append(state.wrapper.run(q, q[..., :0], kv, kv[..., :0]))
         torch.testing.assert_close(outs[0], outs[1], atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not _sm90_flashinfer_available(), reason="Requires SM90 FlashInfer MLA"
+)
+def test_plan_does_not_force_gpu_sync(monkeypatch):
+    """The wrapper copies the host indptrs and lengths to the GPU with
+    non_blocking=True; pageable sources make that copy silently synchronous,
+    which VLLM_GPU_SYNC_CHECK=error turns into a failure on the first
+    prefill."""
+    rows = 8
+    state = _real_state(rows)
+    monkeypatch.setattr(gsd, "_SYNC_CHECK_MODE", "error")
+    monkeypatch.setattr(gsd, "_sync_check_enabled", True)
+    gsd._install_copy_checkers()
+    kv_lens = torch.randint(1, 3000, (rows,), dtype=torch.int32)
+    gsd.with_gpu_sync_check(state.plan)(rows, kv_lens, None, None)
+    assert state._lens_cpu.tolist() == kv_lens.tolist()
 
 
 def test_supports_combination_gates(monkeypatch, default_vllm_config):
