@@ -838,6 +838,18 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             None
         )
         self._checkpoint_exporter: FlashKDAPrefillCheckpointExporter | None = None
+        if kda_prefill_checkpoint_alignment(self.kda_prefill_backend) is not None:
+            self._checkpoint_exporter = FlashKDAPrefillCheckpointExporter()
+        # Workspace for the Triton path's checkpoint states, one per sequence.
+        self._triton_checkpoint_buffer_spec = (
+            (
+                vllm_config.scheduler_config.max_num_seqs,
+                self.local_num_heads,
+                self.head_dim,
+                self.head_dim,
+            ),
+            self.get_state_dtype()[1],
+        )
         if self.kda_prefill_backend == "flashkda":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             N = vllm_config.scheduler_config.max_num_seqs
@@ -851,7 +863,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 ((N, H, D, D), self.get_state_dtype()[1]),
                 ((workspace_size,), torch.uint8),
             )
-            self._checkpoint_exporter = FlashKDAPrefillCheckpointExporter()
         elif self.kda_prefill_backend == "flashinfer":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             H, D = self.local_num_heads, self.head_dim
@@ -870,6 +881,13 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             elif self._flashinfer_kda_output_spec is not None:
                 current_workspace_manager().get_simultaneous(
                     self._flashinfer_kda_output_spec
+                )
+            elif (
+                self.kda_prefill_backend == "triton"
+                and vllm_config.cache_config.mamba_cache_mode == "align"
+            ):
+                current_workspace_manager().get_simultaneous(
+                    self._triton_checkpoint_buffer_spec
                 )
 
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
@@ -1448,6 +1466,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         seq_order=m.flashinfer_prefill_seq_order,
                     )
                 else:
+                    checkpoint_state = None
+                    if checkpoint is not None:
+                        (checkpoint_state,) = (
+                            current_workspace_manager().get_simultaneous(
+                                self._triton_checkpoint_buffer_spec
+                            )
+                        )
+                        checkpoint_state = checkpoint_state[: initial_state.shape[0]]
                     (
                         core_attn_out_non_spec,
                         last_recurrent_state,
@@ -1465,7 +1491,23 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         use_qk_l2norm_in_kernel=True,
                         cu_seqlens=non_spec_query_start_loc,
                         out=non_spec_out,
+                        checkpoint_state=checkpoint_state,
+                        checkpoint_offsets=(
+                            checkpoint.checkpoint_offsets
+                            if checkpoint is not None
+                            else None
+                        ),
                     )
+                    if checkpoint is not None:
+                        assert self._checkpoint_exporter is not None
+                        self._checkpoint_exporter.export(
+                            checkpoint,
+                            raw_qkv=mixed_qkv_ns,
+                            conv_state=conv_state,
+                            recurrent_checkpoint=checkpoint_state,
+                            recurrent_state=recurrent_state,
+                            cu_seqlens=non_spec_query_start_loc,
+                        )
                 recurrent_state[non_spec_state_indices_tensor] = (
                     last_recurrent_state.to(recurrent_state.dtype)
                 )
