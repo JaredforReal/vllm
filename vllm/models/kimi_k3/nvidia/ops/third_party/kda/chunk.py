@@ -501,6 +501,8 @@ def _chunk_kda_fwd_with_cumulative_g(
     chunk_size: int = FLA_CHUNK_SIZE,
     safe_gate: bool = False,
     out: torch.Tensor | None = None,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
 ):
     # `g` must already be chunk-local cumulatively-summed AND scaled by
     # RCP_LN2 (so the downstream exp2-based kernels reproduce exp(g)).
@@ -537,6 +539,8 @@ def _chunk_kda_fwd_with_cumulative_g(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_exp2=True,
+        checkpoint_state=checkpoint_state,
+        checkpoint_offsets=checkpoint_offsets,
     )
     del w, u, kg
     o = chunk_gla_fwd_o_gk(
@@ -610,6 +614,8 @@ def chunk_kda_with_fused_gate_fwd(
     lower_bound: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -641,6 +647,8 @@ def chunk_kda_with_fused_gate_fwd(
         chunk_size=chunk_size,
         safe_gate=lower_bound is not None,
         out=out,
+        checkpoint_state=checkpoint_state,
+        checkpoint_offsets=checkpoint_offsets,
     )
 
 
@@ -693,9 +701,16 @@ def chunk_kda_with_fused_gate(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
     **kwargs,
 ):
-    """Run chunk KDA from raw gate and beta projections."""
+    """Run chunk KDA from raw gate and beta projections.
+
+    ``checkpoint_state[i]`` receives row ``i``'s state after
+    ``checkpoint_offsets[i]`` tokens, a multiple of the 64-token chunk; rows
+    with offset 0 are left untouched.
+    """
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
@@ -717,6 +732,8 @@ def chunk_kda_with_fused_gate(
         lower_bound=lower_bound,
         cu_seqlens=cu_seqlens,
         out=out,
+        checkpoint_state=checkpoint_state,
+        checkpoint_offsets=checkpoint_offsets,
     )
     return o, final_state
 
