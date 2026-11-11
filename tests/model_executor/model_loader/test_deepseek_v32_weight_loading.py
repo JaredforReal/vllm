@@ -18,6 +18,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.quantization.w4afp8 import W4AFP8Config
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.platforms import current_platform
 
@@ -45,6 +46,7 @@ MODEL_WP = "model.layers.1.self_attn.indexer.weights_proj.weight"
 MTP_WK = "model.layers.2.self_attn.indexer.wk.weight"
 MTP_SCALE = "model.layers.2.self_attn.indexer.wk.weight_scale_inv"
 MTP_WP = "model.layers.2.self_attn.indexer.weights_proj.weight"
+MTP_W2_PACKED = "model.layers.2.mtp_block.mlp.experts.routed_experts.w2_weight_packed"
 
 
 def _fused_weight_loader(param, loaded_weight, shard_id):
@@ -84,6 +86,7 @@ if current_platform.is_cuda():
                 n_routed_experts=0, num_hidden_layers=2, num_nextn_predict_layers=1
             )
             self.model = SimpleNamespace(mtp_start_layer_idx=2, num_mtp_layers=1)
+            self.quant_config = None
             self.weight = nn.Parameter(
                 torch.zeros(WK_ROWS + WP_ROWS, IN_FEATURES, dtype=torch.bfloat16),
                 requires_grad=False,
@@ -95,6 +98,29 @@ if current_platform.is_cuda():
                 "model.layers.2.mtp_block.self_attn.indexer.wk_weights_proj.weight",
                 self.weight,
             )
+
+    class _StubW4AFP8MTP(deepseek_v32_mtp.DeepseekV32MTP):
+        """MTP loader over one routed-expert `w2_weight_packed` param."""
+
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = SimpleNamespace(
+                n_routed_experts=1, num_hidden_layers=2, num_nextn_predict_layers=1
+            )
+            self.model = SimpleNamespace(mtp_start_layer_idx=2, num_mtp_layers=1)
+            self.quant_config = W4AFP8Config.from_config(
+                {"quant_method": "w4afp8", "group_size": 128}
+            )
+            self.w2 = nn.Parameter(torch.empty(0), requires_grad=False)
+            self.w2.weight_loader = self._record
+            self.loads = []
+
+        def _record(self, param, loaded_weight, name, **kwargs):
+            self.loads.append((name, loaded_weight, kwargs["expert_id"]))
+            return True
+
+        def named_parameters(self, *, remove_duplicate=True, **kwargs):
+            yield MTP_W2_PACKED, self.w2
 
 
 class _StubLMHead(nn.Module):
@@ -230,3 +256,33 @@ def test_auto_weights_loader_lm_head_split_does_not_drop_wk_pair():
     torch.testing.assert_close(causal.model.weight.data[:WK_ROWS], expected)
     torch.testing.assert_close(causal.model.weight.data[WK_ROWS:], wp)
     torch.testing.assert_close(causal.lm_head.weight.data, lm_head)
+
+
+def _uint4b8_reference(packed: torch.Tensor) -> torch.Tensor:
+    """Re-encode each signed INT4 nibble `q` as the unsigned `q + 8`."""
+    as_int = packed.to(torch.int32) & 0xFF
+    lo, hi = as_int & 0xF, as_int >> 4
+    lo, hi = (torch.where(n >= 8, n - 16, n) + 8 for n in (lo, hi))
+    return (lo | (hi << 4)).to(torch.uint8).view(torch.int32)
+
+
+def test_mtp_applies_quant_checkpoint_weight_mapper():
+    """The MTP loader bypasses AutoWeightsLoader, so it must apply the quant
+    config's checkpoint mapper itself. Without it, w4afp8 MTP experts (signed
+    INT4 `weight` plus static `input_scale`) raise KeyError."""
+    model = _StubW4AFP8MTP()
+    packed = torch.randint(-128, 128, (4, 8), dtype=torch.int8)
+    model.load_weights(
+        iter(
+            [
+                ("model.layers.2.mlp.experts.0.down_proj.weight", packed),
+                ("model.layers.2.mlp.experts.0.w2.input_scale", torch.ones(1)),
+                # Target-model layer: skipped, never reaches the mapper.
+                ("model.layers.1.mlp.experts.0.down_proj.weight", packed),
+            ]
+        )
+    )
+
+    [(name, loaded, expert_id)] = model.loads
+    assert (name, expert_id) == (MTP_W2_PACKED, 0)
+    torch.testing.assert_close(loaded, _uint4b8_reference(packed), rtol=0, atol=0)

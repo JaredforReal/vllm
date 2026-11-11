@@ -384,8 +384,13 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         _pending_wk_fp8 = getattr(self, "_pending_indexer_wk_fp8", None)
         if _pending_wk_fp8 is None:
             self._pending_indexer_wk_fp8 = _pending_wk_fp8 = {}
+        weights = (w for w in weights if not self.is_unused_checkpoint_weight(w[0]))
+        if self.quant_config is not None:
+            # AutoWeightsLoader applies this for the target model; this
+            # hand-rolled loader has to do it itself.
+            weights = self.quant_config.get_checkpoint_weight_mapper().apply(weights)
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name or self.is_unused_checkpoint_weight(name):
+            if "rotary_emb.inv_freq" in name:
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
