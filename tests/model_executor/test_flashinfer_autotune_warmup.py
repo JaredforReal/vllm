@@ -187,6 +187,7 @@ def _make_runner(modules, *, max_tokens: int = 8192):
                 enable_elastic_ep=False,
                 nnodes=1,
                 pipeline_parallel_size=1,
+                data_parallel_size=1,
                 data_parallel_rank=0,
             ),
         ),
@@ -636,6 +637,8 @@ class _AutotuneRun:
         self.tuners = {}
         self.saves = []
         self.profile_groups = defaultdict(list)
+        # Cache hits of the other DP replicas of each rank's stage.
+        self.dp_peer_hits: list[bool] = []
 
     def cache_path(self, rank):
         return self.cache_dir / f"autotune_configs_dp0_rank{rank}.json"
@@ -649,6 +652,15 @@ class _AutotuneRun:
 
     def pipeline_group(self):
         return SimpleNamespace(world_size=self.pp)
+
+    def dp_group(self):
+        group = SimpleNamespace(world_size=1 + len(self.dp_peer_hits))
+
+        def all_gather_object(out, obj):
+            out[:] = [obj, *self.dp_peer_hits]
+
+        group.cpu_group = SimpleNamespace(all_gather_object=all_gather_object)
+        return group
 
     def set_group(self, group):
         self.tuning_group = group
@@ -664,6 +676,9 @@ class _AutotuneRun:
             self.tuners[rank] = _AutotuneTuner(self)
             runner = _make_runner([])
             runner.vllm_config.parallel_config.pipeline_parallel_size = self.pp
+            runner.vllm_config.parallel_config.data_parallel_size = 1 + len(
+                self.dp_peer_hits
+            )
             flashinfer_autotune(runner)
         return self
 
@@ -697,6 +712,7 @@ def autotune_run(monkeypatch, tmp_path):
         monkeypatch.setattr(parallel_state, "get_world_group", run.world)
         monkeypatch.setattr(parallel_state, "get_tp_group", run.tensor_group)
         monkeypatch.setattr(parallel_state, "get_pp_group", run.pipeline_group)
+        monkeypatch.setattr(parallel_state, "get_dp_group", run.dp_group)
         monkeypatch.setattr(fi_utils, "autotune", lambda **kwargs: nullcontext())
         monkeypatch.setattr(
             "torch.distributed.all_gather_object",
@@ -754,6 +770,18 @@ def test_pp_stage_cache_roundtrip_isolated_and_asymmetric_hits_safe(
     assert set(mixed.profile_groups) == {4, 5, 6, 7}
     assert all(mixed.tuners[rank].loaded is not None for rank in range(4))
     assert all(mixed.tuners[rank].loaded is None for rank in range(4, 8))
+
+
+@pytest.mark.parametrize("peer_hit", [True, False])
+def test_pp_stage_cache_hit_is_unanimous_across_dp_replicas(autotune_run, peer_hit):
+    """With PP the dummy runs sync DP padding: a replica that hits while a peer
+    replica of its stage tunes would block that peer forever."""
+    autotune_run(tp=1).execute()
+    rerun = autotune_run(tp=1)
+    rerun.dp_peer_hits = [peer_hit]
+    rerun.execute()
+    # Every rank of this replica had a matching file; only the peer differs.
+    assert set(rerun.profile_groups) == (set() if peer_hit else {0, 1})
 
 
 def test_pp1_tunes_world_group_and_saves_per_rank(autotune_run):

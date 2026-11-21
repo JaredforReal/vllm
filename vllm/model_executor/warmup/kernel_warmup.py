@@ -625,13 +625,16 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
     (`MoERunner.get_cache_key_extras`), so one rank's file only hits on that
     rank. A rank with a cache hit skips the per-tactic reduce the others block
     in, so ranks keep loaded configs only if every rank in the tuning group
-    has a matching file and successfully loads it.
+    has a matching file and successfully loads it. With PP > 1 and DP > 1 the
+    dummy runs also sync across the stage's DP replicas, so the hit must be
+    unanimous over the DP group as well.
 
     """
     from flashinfer.autotuner import AutoTuner, set_autotune_process_group
 
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import (
+        get_dp_group,
         get_pp_group,
         get_tp_group,
         get_world_group,
@@ -677,6 +680,16 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
             )
 
         cache_hit = _load_shared_autotune_cache(cache_path, tuner, tune_group)
+        if pp_size > 1 and runner.vllm_config.parallel_config.data_parallel_size > 1:
+            # The dummy runs sync DP padding across this stage's replicas.
+            dp_group = get_dp_group()
+            hits: list[bool | None] = [None] * dp_group.world_size
+            torch.distributed.all_gather_object(
+                hits, cache_hit, group=dp_group.cpu_group
+            )
+            if cache_hit and not all(hits):
+                tuner.clear_cache()
+            cache_hit = all(hits)
         autotune_context = fi_utils.autotune(tune_mode=True, **autotune_kwargs)
 
     group = tune_group.cpu_group if tune_group.world_size > 1 else None
